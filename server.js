@@ -1291,28 +1291,99 @@ async function runAutoScan() {
         continue;
       }
 
-      // ── Pure calculation engine — no API, instant, deterministic ────
+      // ── STEP 1: Calc engine — instant rule-based scoring ─────────────
       const dp = instr==='XAU_USD' ? 2 : 5;
       const setup = calcTradeSetup({
         direction: aiDirection, price,
         h4: indH4, h2: indH2, m30: indM30, m5: indM5,
         scored, session,
       });
-      const analysis = setup.analysis;
-      const parsed   = {
+      console.log(`[SCAN] ${label}: Calc Engine → ${aiDirection} ${setup.confidence}%`);
+
+      let analysis  = setup.analysis;
+      let parsed    = {
         direction:  setup.direction,
         confidence: setup.confidence,
         stopLoss:   setup.stopLoss,
         takeProfit: setup.takeProfit,
       };
-      console.log(`[SCAN] ${label}: Calc Engine → ${parsed.direction} ${parsed.confidence}%`);
 
-      // Only signal if confidence meets threshold
+      // ── STEP 2: GPT-4o final validation — only if calc passed ────────
       const aiThreshold = parseInt(settings.threshold || 80);
-      if (parsed.confidence < aiThreshold) {
-        console.log(`[SCAN] ${label}: Confidence ${parsed.confidence}% < threshold ${aiThreshold}% — skipped`);
+      if (keys.openai_key && setup.confidence >= aiThreshold) {
+        try {
+          const openai = new OpenAI({ apiKey: keys.openai_key });
+          const promptCtx =
+`PAIR: ${label} | PRICE: ${price.toFixed(dp)} | SESSION: ${session}
+PRECISION SCORE: ${scored.score}/${scored.maxScore} checks | CALC CONFIDENCE: ${setup.confidence}%
+
+H4 (MASTER): EMA9=${indH4.ema9.toFixed(dp)} EMA21=${indH4.ema21.toFixed(dp)} EMA50=${indH4.ema50.toFixed(dp)} RSI=${indH4.rsi14} ADX=${indH4.adx} ATR=${indH4.atr14.toFixed(dp)} Trend=${indH4.trend}
+H2 (CONFIRM): EMA9=${indH2.ema9.toFixed(dp)} EMA21=${indH2.ema21.toFixed(dp)} RSI=${indH2.rsi14} Trend=${indH2.trend}
+M30 (ENTRY):  EMA9=${indM30.ema9.toFixed(dp)} EMA21=${indM30.ema21.toFixed(dp)} RSI=${indM30.rsi14} MACD=${indM30.macd} Pattern=${indM30.pattern}
+M5 (TRIGGER): RSI=${indM5.rsi14} Pattern=${indM5.pattern}
+H4 Strong Support: ${indH4.strongSupport.toFixed(dp)} | H4 Strong Resistance: ${indH4.strongResist.toFixed(dp)}
+H4 Support: ${indH4.support.toFixed(dp)} | H4 Resistance: ${indH4.resistance.toFixed(dp)}
+Calc Engine SL: ${setup.stopLoss.toFixed(dp)} | Calc Engine TP: ${setup.takeProfit.toFixed(dp)}
+Checks PASSED: ${scored.checks.filter(c=>c.pass).map(c=>c.name).join(', ')}
+Checks FAILED: ${scored.checks.filter(c=>!c.pass).map(c=>c.name).join(', ')||'NONE'}`;
+
+          const completion = await openai.chat.completions.create({
+            model: 'gpt-4o', max_tokens: 300,
+            messages: [
+              { role: 'system', content:
+`You are a professional forex risk manager verifying a trade signal.
+A rule-based engine already passed this setup through 12 strict checks.
+Your job: validate the direction, then set PRECISE SL/TP at actual S/R levels.
+RULES:
+- Only BULLISH if H4+H2+M30 all bullish. Only BEARISH if all bearish. Otherwise NEUTRAL.
+- RSI > 75 on M30 = reject BUY. RSI < 25 on M30 = reject SELL.
+- ADX on H4 must be >= 20.
+- SL must be at a real H4 support/resistance level (use the levels provided).
+- TP minimum 1:2 R:R. Target the next S/R level.
+- If the calc engine SL/TP look correct, you may keep them.
+- Confidence 90%+ only if ALL 4 timeframes perfectly aligned.` },
+              { role: 'user', content:
+`${promptCtx}
+
+Return EXACTLY 6 lines, no other text:
+1. Market Bias: BULLISH / BEARISH / NEUTRAL
+2. Confidence Score: X%
+3. Entry Zone: ${price.toFixed(dp)}
+4. Stop Loss: price
+5. Take Profit: price
+6. Risk/Reward: 1:X` },
+            ],
+          });
+
+          const gptText   = completion.choices[0].message.content;
+          const gptParsed = parseAIResponse(gptText);
+          console.log(`[SCAN] ${label}: GPT-4o → ${gptParsed.direction} ${gptParsed.confidence}%`);
+
+          // Use GPT-4o result if it agrees with direction and gave valid levels
+          if (gptParsed.direction === aiDirection &&
+              gptParsed.stopLoss && gptParsed.takeProfit &&
+              gptParsed.confidence >= aiThreshold) {
+            parsed.confidence = gptParsed.confidence;
+            parsed.stopLoss   = gptParsed.stopLoss;
+            parsed.takeProfit = gptParsed.takeProfit;
+            analysis = `${gptText}\n\n[Rule Engine] ${setup.analysis.split('\n').slice(1).join('\n')}`;
+            console.log(`[SCAN] ${label}: GPT-4o validated ✓ — using GPT SL/TP`);
+          } else if (gptParsed.direction === 'NEUTRAL' || gptParsed.direction !== aiDirection) {
+            console.log(`[SCAN] ${label}: GPT-4o REJECTED — direction mismatch or NEUTRAL`);
+            continue;
+          } else if (gptParsed.confidence < aiThreshold) {
+            console.log(`[SCAN] ${label}: GPT-4o confidence ${gptParsed.confidence}% too low — skipped`);
+            continue;
+          }
+        } catch(e) {
+          console.log(`[SCAN] ${label}: GPT-4o error — using calc engine: ${e.message}`);
+          // Fall through: use calc engine result
+        }
+      } else if (setup.confidence < aiThreshold) {
+        console.log(`[SCAN] ${label}: Calc confidence ${setup.confidence}% < ${aiThreshold}% — skipped`);
         continue;
       }
+
       if (!parsed.stopLoss || !parsed.takeProfit) continue;
 
       // Validate R:R >= 1.5
@@ -1534,7 +1605,7 @@ app.get('/api/health', (req, res) => {
       twelve:   !!keys.twelve_key,
       telegram: !!keys.tg_token,
     },
-    ai_engine: 'Rule-Based Calc Engine (no API needed)',
+    ai_engine: keys.openai_key ? 'Calc Engine → GPT-4o validation' : 'Rule-Based Calc Engine only',
   });
 });
 

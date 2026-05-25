@@ -1572,14 +1572,21 @@ function Settings({ keys, setKeys, aiReady }) {
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
         <div style={{ ...S.card, gridColumn:"1/-1", borderLeft:"3px solid #00ff88", background:"#001a0e" }}>
-          <div style={{ ...S.title, color:"#00ff88" }}>🧠 AI Engine — Rule-Based Calculation</div>
+          <div style={{ ...S.title, color:"#00ff88" }}>🧠 Dual AI Engine — Calc + GPT-4o</div>
           <div style={{ fontSize:12, color:"#aaa", lineHeight:1.7 }}>
-            No API key required. The scanner uses a built-in institutional-grade calculation engine:<br/>
-            • Multi-timeframe confluence (H4 → H2 → M30 → M5)<br/>
-            • Smart S/R level detection for SL/TP placement<br/>
-            • Weighted confidence scoring with 15+ market factors<br/>
-            • EMA stack, ADX strength, RSI zone, MACD momentum, pattern recognition<br/>
-            <span style={{ color:"#00ff88" }}>✓ Active — 100% calculation-based, zero latency, zero cost</span>
+            Two-layer signal validation for maximum precision:<br/>
+            <span style={{ color:"#00ccff" }}>① Rule Engine</span> — 12-check score (H4→H2→M30→M5), instant, no API. Blocks bad setups before spending credits.<br/>
+            <span style={{ color:"#ffcc00" }}>② GPT-4o</span> — only called if Rule Engine passes. Validates direction, refines SL/TP at real S/R levels, sets final confidence.<br/>
+            Signal fires only if <strong>both layers agree</strong>.<br/>
+            <span style={{ color:"#00ff88" }}>If no OpenAI key → Rule Engine alone decides.</span>
+          </div>
+        </div>
+        <div style={S.card}>
+          <div style={S.title}>OpenAI — GPT-4o Validator</div>
+          <label style={S.lbl}>API Key</label>
+          <input {...field("openai_key")} />
+          <div style={{ fontSize:10, color:"#2a2a4a", marginTop:5, lineHeight:1.6 }}>
+            Used as the 2nd validation layer. Get at platform.openai.com
           </div>
         </div>
         <div style={S.card}>

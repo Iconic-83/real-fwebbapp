@@ -652,29 +652,46 @@ app.post('/api/telegram/setup', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// AUTO-TRADE ENGINE ⚡
-// Scans all pairs every 5 min. If AI confidence >= threshold → auto-place order
+// SIGNAL ENGINE — Scan → Telegram alert with APPROVE/REJECT → Execute
+// Flow: AI scan every 5 min → send signal to Telegram with buttons
+//       User taps ✅ APPROVE → trade placed on OANDA automatically
+//       User taps ❌ REJECT  → signal logged as rejected, not traded
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Create auto_trades log table
+// signals table — every signal (pending, approved, rejected, executed, failed)
 db.exec(`
-  CREATE TABLE IF NOT EXISTS auto_trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    pair TEXT NOT NULL,
-    direction TEXT NOT NULL,
-    confidence INTEGER NOT NULL,
-    units INTEGER NOT NULL,
-    entry_price REAL,
-    stop_loss REAL,
-    take_profit REAL,
+  CREATE TABLE IF NOT EXISTS signals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+    actioned_at   DATETIME,
+    pair          TEXT NOT NULL,
+    direction     TEXT NOT NULL,
+    confidence    INTEGER NOT NULL,
+    entry_price   REAL,
+    stop_loss     REAL,
+    take_profit   REAL,
+    sl_pips       REAL,
+    tp_pips       REAL,
+    units         INTEGER,
+    risk_pct      REAL,
+    risk_amount   REAL,
+    lots          TEXT,
+    status        TEXT DEFAULT 'PENDING',
     oanda_order_id TEXT,
-    status TEXT DEFAULT 'PLACED',
-    pl REAL DEFAULT 0,
-    notes TEXT
+    filled_price  REAL,
+    realized_pl   REAL,
+    analysis      TEXT,
+    ema_align     TEXT,
+    rsi           REAL,
+    h4_trend      TEXT,
+    tg_message_id INTEGER
   );
 `);
 
+// Keep old table for compat (ignore if already exists)
+db.exec(`CREATE TABLE IF NOT EXISTS auto_trades (id INTEGER PRIMARY KEY, timestamp DATETIME, pair TEXT, direction TEXT, confidence INTEGER, units INTEGER, entry_price REAL, stop_loss REAL, take_profit REAL, oanda_order_id TEXT, status TEXT, pl REAL, notes TEXT);`);
+
+// ── Parse AI response ────────────────────────────────────────────────────────
 function parseAIResponse(analysis) {
   const lines = analysis.split('\n').map(l => l.trim()).filter(Boolean);
   const result = { direction:'NEUTRAL', confidence:0, stopLoss:null, takeProfit:null };
@@ -686,162 +703,304 @@ function parseAIResponse(analysis) {
       else result.direction = 'NEUTRAL';
     }
     if (lo.includes('confidence score')) {
-      const m = line.match(/(\d+)%/);
-      if (m) result.confidence = parseInt(m[1]);
+      const m = line.match(/(\d+)%/); if (m) result.confidence = parseInt(m[1]);
     }
     if (lo.startsWith('4') && lo.includes('stop loss')) {
-      const m = line.match(/[\d]{1,4}\.[\d]{2,6}/g);
-      if (m) result.stopLoss = parseFloat(m[0]);
+      const m = line.match(/[\d]{1,5}\.[\d]{2,6}/g); if (m) result.stopLoss = parseFloat(m[0]);
     }
     if (lo.startsWith('5') && lo.includes('take profit')) {
-      const m = line.match(/[\d]{1,4}\.[\d]{2,6}/g);
-      if (m) result.takeProfit = parseFloat(m[0]);
+      const m = line.match(/[\d]{1,5}\.[\d]{2,6}/g); if (m) result.takeProfit = parseFloat(m[0]);
     }
   }
   return result;
 }
 
+// ── Generic Telegram API call (IPv4, JSON body) ──────────────────────────────
+function tgCall(endpoint, body) {
+  const keys = getApiKeys();
+  if (!keys.tg_token) return Promise.resolve({ ok:false });
+  return new Promise((resolve) => {
+    const bodyStr = JSON.stringify(body);
+    const opts = {
+      hostname:'api.telegram.org', method:'POST', family:4, timeout:10000,
+      path:`/bot${keys.tg_token}/${endpoint}`,
+      headers:{ 'Content-Type':'application/json', 'Content-Length':Buffer.byteLength(bodyStr) },
+    };
+    const req = https.request(opts, res => {
+      let d=''; res.on('data',c=>d+=c);
+      res.on('end',()=>{ try{ resolve(JSON.parse(d)); }catch{ resolve({ok:false}); } });
+    });
+    req.on('error',()=>resolve({ok:false}));
+    req.on('timeout',()=>{ req.destroy(); resolve({ok:false}); });
+    req.write(bodyStr); req.end();
+  });
+}
+
+// Helpers
+const tgAnswerCbq = (id, text) => tgCall('answerCallbackQuery', { callback_query_id:id, text });
+const tgEditMsg   = (msgId, text) => {
+  const keys = getApiKeys();
+  return tgCall('editMessageText', { chat_id:keys.tg_chat, message_id:msgId, text });
+};
+const tgSendButtons = (text, buttons) => {
+  const keys = getApiKeys();
+  return tgCall('sendMessage', { chat_id:keys.tg_chat, text, reply_markup:{ inline_keyboard:buttons } });
+};
+
+// ── Execute an approved signal on OANDA ──────────────────────────────────────
+async function executeSignal(signal) {
+  const keys = getApiKeys();
+  const oandaInstr = LABEL_TO_OANDA[signal.pair] || signal.pair.replace('/','_');
+  const dp = oandaInstr==='XAU_USD' ? 2 : 5;
+  try {
+    const tradeUnits = signal.direction==='BUY' ? signal.units : -signal.units;
+    const orderResult = await oandaRequest(`/v3/accounts/${keys.oanda_account}/orders`, 'POST', {
+      order: {
+        type:'MARKET', instrument:oandaInstr, units:String(tradeUnits),
+        stopLossOnFill:  { price: signal.stop_loss.toFixed(dp) },
+        takeProfitOnFill:{ price: signal.take_profit.toFixed(dp) },
+      }
+    });
+    const filled    = orderResult?.orderFillTransaction;
+    const orderId   = filled?.id || 'unknown';
+    const filledPx  = parseFloat(filled?.price || signal.entry_price);
+
+    db.prepare(`UPDATE signals SET status='EXECUTED', oanda_order_id=?, filled_price=?, actioned_at=CURRENT_TIMESTAMP WHERE id=?`)
+      .run(orderId, filledPx, signal.id);
+    recordTradePL(0);
+
+    const msg =
+`✅ TRADE EXECUTED — Signal #${signal.id}
+
+Pair:       ${signal.pair}
+Direction:  ${signal.direction} ${signal.direction==='BUY'?'▲':'▼'}
+Confidence: ${signal.confidence}%
+Entry:      ${filledPx.toFixed(dp)}
+Stop Loss:  ${signal.stop_loss.toFixed(dp)} (${signal.sl_pips} pips)
+Take Profit:${signal.take_profit.toFixed(dp)} (${signal.tp_pips} pips)
+Size:       ${signal.lots} lots (${signal.units?.toLocaleString()} units)
+Risk:       ${signal.risk_pct}% = $${signal.risk_amount?.toFixed(0)}
+OANDA ID:   ${orderId}`;
+    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, msg);
+    console.log(`[SIGNAL] ✅ Executed #${signal.id} ${signal.pair} ${signal.direction}`);
+  } catch(e) {
+    db.prepare(`UPDATE signals SET status='FAILED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(signal.id);
+    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id,
+      `❌ EXECUTION FAILED — Signal #${signal.id}\n${signal.pair} ${signal.direction}\nError: ${e.message}`);
+    console.error(`[SIGNAL] Execute failed #${signal.id}:`, e.message);
+  }
+}
+
+// ── Telegram callback poller — listens for button taps ───────────────────────
+let tgOffset = 0;
+async function pollTgCallbacks() {
+  const keys = getApiKeys();
+  if (!keys.tg_token || !keys.tg_chat) return;
+  return new Promise((resolve) => {
+    const qs = `offset=${tgOffset}&timeout=0&allowed_updates=%5B%22callback_query%22%5D`;
+    const opts = {
+      hostname:'api.telegram.org', method:'GET', family:4, timeout:12000,
+      path:`/bot${keys.tg_token}/getUpdates?${qs}`,
+    };
+    const req = https.request(opts, res => {
+      let d=''; res.on('data',c=>d+=c);
+      res.on('end', async () => {
+        try {
+          const data = JSON.parse(d);
+          if (!data.ok || !data.result?.length) { resolve(); return; }
+          for (const upd of data.result) {
+            tgOffset = Math.max(tgOffset, upd.update_id+1);
+            const cbq = upd.callback_query;
+            if (!cbq?.data) continue;
+            const parts    = cbq.data.split('_');
+            const action   = parts[0];              // 'approve' or 'reject'
+            const signalId = parseInt(parts[1]);
+            if (!signalId) continue;
+            const sig = db.prepare('SELECT * FROM signals WHERE id=?').get(signalId);
+            if (!sig || sig.status !== 'PENDING') {
+              await tgAnswerCbq(cbq.id, 'Signal already processed');
+              continue;
+            }
+            if (action === 'approve') {
+              await tgAnswerCbq(cbq.id, '✅ Executing trade...');
+              await executeSignal(sig);
+            } else if (action === 'reject') {
+              await tgAnswerCbq(cbq.id, '❌ Signal rejected');
+              db.prepare(`UPDATE signals SET status='REJECTED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(sig.id);
+              if (sig.tg_message_id) await tgEditMsg(sig.tg_message_id,
+`❌ REJECTED — Signal #${sig.id}
+
+Pair:       ${sig.pair}
+Direction:  ${sig.direction}
+Confidence: ${sig.confidence}%
+Entry:      ${sig.entry_price?.toFixed(5)}
+Stop Loss:  ${sig.stop_loss?.toFixed(5)}
+Take Profit:${sig.take_profit?.toFixed(5)}
+
+You rejected this trade.`);
+              console.log(`[SIGNAL] ❌ Rejected #${sig.id} ${sig.pair}`);
+            }
+          }
+        } catch(e) { console.error('[TG POLL]', e.message); }
+        resolve();
+      });
+    });
+    req.on('error', ()=>resolve());
+    req.on('timeout',()=>{ req.destroy(); resolve(); });
+    req.end();
+  });
+}
+// Poll for button taps every 4 seconds
+setInterval(()=>{ pollTgCallbacks().catch(()=>{}); }, 4000);
+
+// ── AI Scanner — finds high-confidence setups every 5 min ────────────────────
 let autoScanning = false;
 
 async function runAutoScan() {
-  if (autoScanning) return; // prevent overlap
+  if (autoScanning) return;
   const settings = getStorageValue('autotrade_settings');
   if (!settings?.enabled) return;
 
-  const threshold  = parseInt(settings.threshold  || 80);
-  const riskPct    = parseFloat(settings.risk_pct || 1);
-  const maxPerDay  = parseInt(settings.max_per_day || 3);
-  const todayLog   = getDailyPL();
-  if (todayLog.trade_count >= maxPerDay) return; // daily trade cap
+  const threshold = parseInt(settings.threshold  || 80);
+  const riskPct   = parseFloat(settings.risk_pct || 1);
+  const maxPerDay = parseInt(settings.max_per_day || 3);
+
+  // How many signals sent today (pending or executed)
+  const todaySent = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now') AND status IN ('PENDING','EXECUTED','APPROVED')`).get();
+  if (todaySent.c >= maxPerDay) return;
 
   const keys = getApiKeys();
   if (!keys.oanda_key || !keys.oanda_account || !keys.openai_key) return;
 
   autoScanning = true;
-  const scanPairs = ['EUR_USD','GBP_USD','USD_JPY','XAU_USD','AUD_USD','USD_CAD'];
+  console.log('[SCAN] Starting market scan...');
 
+  const scanPairs = ['EUR_USD','GBP_USD','USD_JPY','XAU_USD','AUD_USD','USD_CAD'];
   for (const instr of scanPairs) {
     try {
-      // Re-check daily cap per pair
-      const fresh = getDailyPL();
-      if (fresh.trade_count >= maxPerDay) break;
+      // Re-check daily cap
+      const fresh = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now') AND status IN ('PENDING','EXECUTED','APPROVED')`).get();
+      if (fresh.c >= maxPerDay) break;
 
-      // Check daily loss limit
-      const acctData = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
-      const balance  = parseFloat(acctData?.account?.balance || 0);
-      const maxLoss  = balance * 0.03;
-      if (Math.abs(Math.min(0, fresh.realized_pl)) >= maxLoss && maxLoss > 0) {
-        await sendTelegramMsg(`⛔ Auto-Trade PAUSED\nDaily 3% loss limit reached. Trading stopped for today.`);
-        break;
-      }
+      // Skip if there is already a PENDING signal for this pair
+      const existPending = db.prepare(`SELECT id FROM signals WHERE pair=? AND status='PENDING'`).get(instr.replace('_','/'));
+      if (existPending) continue;
 
-      const label = instr.replace('_', '/'); // EUR/USD
+      const label = instr.replace('_', '/');
       const price = priceCache[label];
       if (!price) continue;
 
-      // Run AI analysis
-      const oandaInstr = instr;
-      let indicators = null, analysis = '';
+      // Fetch candles + build indicators
       const [h1Res, h4Res] = await Promise.allSettled([
-        oandaRequest(`/v3/instruments/${oandaInstr}/candles?count=50&granularity=H1&price=M`),
-        oandaRequest(`/v3/instruments/${oandaInstr}/candles?count=20&granularity=H4&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=H1&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=20&granularity=H4&price=M`),
       ]);
-      const h1 = h1Res.status==='fulfilled' ? h1Res.value?.candles || [] : [];
-      const h4 = h4Res.status==='fulfilled' ? h4Res.value?.candles || [] : [];
+      const h1 = h1Res.status==='fulfilled' ? h1Res.value?.candles||[] : [];
+      const h4 = h4Res.status==='fulfilled' ? h4Res.value?.candles||[] : [];
       if (h1.length < 10) continue;
-      indicators = buildIndicators(h1, h4);
-      const dp = instr === 'XAU_USD' ? 2 : 5;
-      const indCtx = `
-REAL OANDA DATA: ${label} @ ${price}
-EMA9=${indicators.ema9.toFixed(dp)} EMA21=${indicators.ema21.toFixed(dp)} EMA50=${indicators.ema50.toFixed(dp)}
-RSI14=${indicators.rsi14} ATR14=${indicators.atr14.toFixed(dp)} MACD=${indicators.macd}
-Trend: ${indicators.trend} | H4: ${indicators.h4Trend}
-Support=${indicators.support.toFixed(dp)} Resistance=${indicators.resistance.toFixed(dp)}`;
+      const ind = buildIndicators(h1, h4);
+      const dp  = instr==='XAU_USD' ? 2 : 5;
 
-      const openai = new OpenAI({ apiKey: keys.openai_key });
+      // GPT-4o analysis
+      const openai = new OpenAI({ apiKey:keys.openai_key });
       const completion = await openai.chat.completions.create({
-        model:'gpt-4o', max_tokens:500,
+        model:'gpt-4o', max_tokens:350,
         messages:[
-          { role:'system', content:'You are a forex analyst. Respond with EXACTLY 6 lines only. Be strict about risk.' },
-          { role:'user', content:`Analyze ${label} at ${price}.${indCtx}\n\nReturn EXACTLY:\n1. Market Bias: BULLISH / BEARISH / NEUTRAL\n2. Confidence Score: X%\n3. Entry Zone: price\n4. Stop Loss: price (ATR x1.5)\n5. Take Profit: price (1:2 RR)\n6. Risk/Reward: 1:X` },
+          { role:'system', content:'Forex analyst. Only flag HIGH confidence signals. Return exactly 6 lines.' },
+          { role:'user', content:
+`Analyze ${label} at ${price}.
+EMA9=${ind.ema9.toFixed(dp)} EMA21=${ind.ema21.toFixed(dp)} EMA50=${ind.ema50.toFixed(dp)}
+RSI14=${ind.rsi14} ATR=${ind.atr14.toFixed(dp)} MACD=${ind.macd}
+Trend: ${ind.trend} | H4: ${ind.h4Trend}
+Support=${ind.support.toFixed(dp)} Resistance=${ind.resistance.toFixed(dp)}
+
+Return EXACTLY:
+1. Market Bias: BULLISH / BEARISH / NEUTRAL
+2. Confidence Score: X%
+3. Entry Zone: price
+4. Stop Loss: price
+5. Take Profit: price
+6. Risk/Reward: 1:X` },
         ],
       });
-      analysis = completion.choices[0].message.content;
-      const parsed = parseAIResponse(analysis);
+      const analysis = completion.choices[0].message.content;
+      const parsed   = parseAIResponse(analysis);
 
-      console.log(`[AUTO] ${label}: ${parsed.direction} ${parsed.confidence}% (threshold: ${threshold}%)`);
-
-      if (parsed.confidence < threshold || parsed.direction === 'NEUTRAL') continue;
+      console.log(`[SCAN] ${label}: ${parsed.direction} ${parsed.confidence}% (min: ${threshold}%)`);
+      if (parsed.confidence < threshold || parsed.direction==='NEUTRAL') continue;
       if (!parsed.stopLoss || !parsed.takeProfit) continue;
 
-      // Calculate position size
-      const pipSize = PIP[instr] || 0.0001;
-      const slPips  = Math.abs(parseFloat(price) - parsed.stopLoss) / pipSize;
-      if (slPips < 2) continue; // safety: reject if SL too tight
-      const riskAmt = balance * (riskPct / 100);
-      let pipValPerUnit = pipSize;
-      if (instr === 'USD_JPY') pipValPerUnit = 0.01 / parseFloat(price);
-      if (instr === 'USD_CAD') pipValPerUnit = 0.0001 / parseFloat(price);
-      if (instr === 'XAU_USD') pipValPerUnit = 0.1;
-      const units = Math.floor(riskAmt / (slPips * pipValPerUnit));
+      // Position sizing
+      const acctData = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
+      const balance  = parseFloat(acctData?.account?.balance || 0);
+      const pipSize  = PIP[instr] || 0.0001;
+      const slPips   = Math.abs(parseFloat(price) - parsed.stopLoss) / pipSize;
+      const tpPips   = Math.abs(parseFloat(price) - parsed.takeProfit) / pipSize;
+      if (slPips < 2) continue;
+      const riskAmt  = balance * (riskPct / 100);
+      let pipVal     = pipSize;
+      if (instr==='USD_JPY') pipVal = 0.01 / parseFloat(price);
+      if (instr==='USD_CAD') pipVal = 0.0001 / parseFloat(price);
+      if (instr==='XAU_USD') pipVal = 0.1;
+      const units = Math.floor(riskAmt / (slPips * pipVal));
       if (units < 100) continue;
+      const lots = (units / 100000).toFixed(2);
 
-      const tradeUnits = parsed.direction === 'BUY' ? units : -units;
+      // Save signal
+      const signalId = db.prepare(`
+        INSERT INTO signals (pair,direction,confidence,entry_price,stop_loss,take_profit,sl_pips,tp_pips,units,risk_pct,risk_amount,lots,analysis,ema_align,rsi,h4_trend)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        label, parsed.direction, parsed.confidence, parseFloat(price),
+        parsed.stopLoss, parsed.takeProfit, slPips.toFixed(1), tpPips.toFixed(1),
+        units, riskPct, riskAmt, lots, analysis,
+        ind.emaAlignment.split(' ')[0], ind.rsi14, ind.h4Trend.split(' ')[0]
+      ).lastInsertRowid;
 
-      // Place OANDA market order
-      const orderBody = {
-        order: {
-          type: 'MARKET',
-          instrument: instr,
-          units: String(tradeUnits),
-          stopLossOnFill:   { price: parsed.stopLoss.toFixed(dp) },
-          takeProfitOnFill: { price: parsed.takeProfit.toFixed(dp) },
-        }
-      };
-      const orderResult = await oandaRequest(
-        `/v3/accounts/${keys.oanda_account}/orders`, 'POST', orderBody
-      );
+      // Telegram message with APPROVE / REJECT buttons
+      const dirArrow = parsed.direction==='BUY' ? '▲' : '▼';
+      const tgText =
+`🔔 TRADE SIGNAL #${signalId}
 
-      const filled = orderResult?.orderFillTransaction;
-      const orderId = filled?.id || orderResult?.relatedTransactionIDs?.[0] || 'unknown';
-      const filledPrice = parseFloat(filled?.price || price);
-
-      // Log to SQLite
-      db.prepare(`
-        INSERT INTO auto_trades (pair, direction, confidence, units, entry_price, stop_loss, take_profit, oanda_order_id, status, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(label, parsed.direction, parsed.confidence, Math.abs(tradeUnits), filledPrice,
-             parsed.stopLoss, parsed.takeProfit, orderId, filled ? 'FILLED' : 'SUBMITTED', analysis);
-
-      // Record in daily P&L counter
-      recordTradePL(0); // 0 P&L until trade closes
-
-      // Send Telegram alert
-      const tgMsg = `⚡ AUTO-TRADE EXECUTED
-Pair: ${label}
-Direction: ${parsed.direction}
+Pair:       ${label}
+Direction:  ${parsed.direction} ${dirArrow}
 Confidence: ${parsed.confidence}%
-Entry: ${filledPrice.toFixed(dp)}
-Stop Loss: ${parsed.stopLoss.toFixed(dp)}
-Take Profit: ${parsed.takeProfit.toFixed(dp)}
-Size: ${Math.abs(tradeUnits).toLocaleString()} units (${riskPct}% risk)
-Status: ${filled ? 'FILLED' : 'SUBMITTED'}`;
-      await sendTelegramMsg(tgMsg);
-      console.log(`[AUTO] ✅ Trade placed: ${label} ${parsed.direction} ${Math.abs(tradeUnits)} units`);
+Entry:      ${parseFloat(price).toFixed(dp)}
+Stop Loss:  ${parsed.stopLoss.toFixed(dp)}  (-${slPips.toFixed(1)} pips)
+Take Profit:${parsed.takeProfit.toFixed(dp)} (+${tpPips.toFixed(1)} pips)
+Risk:       ${riskPct}% = $${riskAmt.toFixed(0)}
+Size:       ${lots} lots
+
+📊 EMA: ${ind.emaAlignment.split(' ')[0]}
+📈 H4: ${ind.h4Trend.split(' ')[0]}
+⚡ RSI: ${ind.rsi14}
+
+Tap to decide:`;
+
+      const r = await tgSendButtons(tgText, [[
+        { text:'✅ APPROVE', callback_data:`approve_${signalId}` },
+        { text:'❌ REJECT',  callback_data:`reject_${signalId}`  },
+      ]]);
+      if (r?.result?.message_id) {
+        db.prepare(`UPDATE signals SET tg_message_id=? WHERE id=?`).run(r.result.message_id, signalId);
+      }
+      console.log(`[SCAN] ✅ Signal #${signalId} sent to Telegram: ${label} ${parsed.direction} ${parsed.confidence}%`);
 
     } catch(e) {
-      console.error(`[AUTO] Error scanning ${instr}:`, e.message);
+      console.error(`[SCAN] Error ${instr}:`, e.message);
     }
-    await new Promise(r => setTimeout(r, 2000)); // 2s gap between pairs
+    await new Promise(r => setTimeout(r, 2500));
   }
   autoScanning = false;
+  console.log('[SCAN] Scan complete.');
 }
 
-// Auto-scan every 5 minutes
+// Scan every 5 minutes
 setInterval(runAutoScan, 5 * 60 * 1000);
-// Also run once at startup if enabled
-setTimeout(runAutoScan, 15000);
+// Run once 20s after startup if enabled
+setTimeout(runAutoScan, 20000);
 
+// ── Signal API endpoints ──────────────────────────────────────────────────────
 app.get('/api/autotrade/settings', (req, res) => {
   const s = getStorageValue('autotrade_settings') || { enabled:false, threshold:80, risk_pct:1, max_per_day:3 };
   res.json(s);
@@ -851,28 +1010,46 @@ app.post('/api/autotrade/settings', (req, res) => {
   const { enabled, threshold, risk_pct, max_per_day } = req.body;
   const s = { enabled:!!enabled, threshold:parseInt(threshold||80), risk_pct:parseFloat(risk_pct||1), max_per_day:parseInt(max_per_day||3) };
   setStorageValue('autotrade_settings', s);
-  if (enabled) {
-    sendTelegramMsg(`⚡ Auto-Trade Engine: ON\nConfidence threshold: ${s.threshold}%\nRisk per trade: ${s.risk_pct}%\nMax trades/day: ${s.max_per_day}`);
-  }
+  const onOff = s.enabled ? 'ON ✅' : 'OFF ⛔';
+  sendTelegramMsg(`⚡ Signal Scanner: ${onOff}\nThreshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax signals/day: ${s.max_per_day}\n\nYou will receive Telegram alerts with APPROVE/REJECT buttons.`);
   res.json({ ok:true, settings:s });
 });
 
-app.post('/api/autotrade/scan', async (req, res) => {
-  // Manual scan trigger
+app.post('/api/autotrade/scan', (req, res) => {
   runAutoScan().catch(console.error);
-  res.json({ ok:true, msg:'Scan started' });
+  res.json({ ok:true, msg:'Scan started — check Telegram for signals' });
 });
 
 app.get('/api/autotrade/log', (req, res) => {
-  const rows = db.prepare('SELECT * FROM auto_trades ORDER BY timestamp DESC LIMIT 50').all();
+  const rows = db.prepare('SELECT * FROM signals ORDER BY created_at DESC LIMIT 100').all();
   res.json(rows);
 });
 
 app.get('/api/autotrade/status', (req, res) => {
-  const settings = getStorageValue('autotrade_settings') || { enabled:false };
-  const total = db.prepare('SELECT COUNT(*) as c FROM auto_trades').get();
-  const today = db.prepare("SELECT COUNT(*) as c FROM auto_trades WHERE date(timestamp)=date('now')").get();
-  res.json({ enabled:settings.enabled, threshold:settings.threshold||80, risk_pct:settings.risk_pct||1, max_per_day:settings.max_per_day||3, total_trades:total.c, today_trades:today.c, scanning:autoScanning });
+  const s = getStorageValue('autotrade_settings') || { enabled:false };
+  const pending = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='PENDING'`).get();
+  const today   = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now')`).get();
+  const total   = db.prepare(`SELECT COUNT(*) as c FROM signals`).get();
+  res.json({ enabled:s.enabled, threshold:s.threshold||80, risk_pct:s.risk_pct||1, max_per_day:s.max_per_day||3,
+    pending_signals:pending.c, today_signals:today.c, total_signals:total.c, scanning:autoScanning });
+});
+
+// Approve/reject from web UI (fallback if Telegram not available)
+app.post('/api/autotrade/approve/:id', async (req, res) => {
+  const sig = db.prepare('SELECT * FROM signals WHERE id=?').get(parseInt(req.params.id));
+  if (!sig) return res.status(404).json({ error:'Signal not found' });
+  if (sig.status !== 'PENDING') return res.status(400).json({ error:'Signal already processed: '+sig.status });
+  await executeSignal(sig);
+  res.json({ ok:true, signal_id:sig.id });
+});
+
+app.post('/api/autotrade/reject/:id', (req, res) => {
+  const sig = db.prepare('SELECT * FROM signals WHERE id=?').get(parseInt(req.params.id));
+  if (!sig) return res.status(404).json({ error:'Signal not found' });
+  if (sig.status !== 'PENDING') return res.status(400).json({ error:'Already processed: '+sig.status });
+  db.prepare(`UPDATE signals SET status='REJECTED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(sig.id);
+  if (sig.tg_message_id) tgEditMsg(sig.tg_message_id, `❌ REJECTED via web — Signal #${sig.id}\n${sig.pair} ${sig.direction} ${sig.confidence}%`);
+  res.json({ ok:true });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -314,128 +314,228 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
   );
 }
 
-// ─── AUTO-TRADE ENGINE UI ─────────────────────────────────────────────────────
+// ─── SIGNAL ENGINE UI ─────────────────────────────────────────────────────────
 function AutoTradePanel() {
-  const [at, setAt]       = useState({ enabled:false, threshold:80, risk_pct:1, max_per_day:3 });
-  const [log, setLog]     = useState([]);
-  const [status, setStatus] = useState(null);
+  const [at,       setAt]       = useState({ enabled:false, threshold:80, risk_pct:1, max_per_day:3 });
+  const [signals,  setSignals]  = useState([]);
+  const [status,   setStatus]   = useState(null);
   const [scanning, setScanning] = useState(false);
-  const [atStatus, setAtStatus] = useState(null);
+  const [atSt,     setAtSt]     = useState(null);
+  const [acting,   setActing]   = useState({});
 
   const load = async () => {
-    const s = await fetch("/api/autotrade/settings").then(r=>r.json()).catch(()=>null);
+    const [s, l, st] = await Promise.all([
+      fetch("/api/autotrade/settings").then(r=>r.json()).catch(()=>null),
+      fetch("/api/autotrade/log").then(r=>r.json()).catch(()=>[]),
+      fetch("/api/autotrade/status").then(r=>r.json()).catch(()=>null),
+    ]);
     if (s) setAt(s);
-    const l = await fetch("/api/autotrade/log").then(r=>r.json()).catch(()=>[]);
-    setLog(l);
-    const st = await fetch("/api/autotrade/status").then(r=>r.json()).catch(()=>null);
-    if (st) setAtStatus(st);
+    if (Array.isArray(l)) setSignals(l);
+    if (st) setAtSt(st);
   };
-  useEffect(() => { load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, []);
+  useEffect(() => { load(); const t = setInterval(load, 8000); return () => clearInterval(t); }, []);
 
-  const save = async (overrides = {}) => {
+  const save = async (overrides={}) => {
     const updated = { ...at, ...overrides };
     setAt(updated);
     const r = await fetch("/api/autotrade/settings", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(updated),
+      body:JSON.stringify(updated),
     }).then(res=>res.json());
-    setStatus(r.ok ? "✅ Settings saved" : "❌ " + r.error);
-    setTimeout(() => setStatus(null), 3000);
+    setStatus(r.ok ? "✅ Saved — Telegram notified" : "❌ " + r.error);
+    setTimeout(()=>setStatus(null), 3000);
     load();
   };
 
-  const runScan = async () => {
+  const scanNow = async () => {
     setScanning(true);
     await fetch("/api/autotrade/scan", { method:"POST" });
-    setTimeout(() => { setScanning(false); load(); }, 8000);
+    setTimeout(()=>{ setScanning(false); load(); }, 10000);
   };
 
+  const act = async (id, action) => {
+    setActing(p=>({...p,[id]:action}));
+    await fetch(`/api/autotrade/${action}/${id}`, { method:"POST" });
+    setTimeout(()=>{ load(); setActing(p=>({...p,[id]:null})); }, 2000);
+  };
+
+  const pending  = signals.filter(s => s.status === "PENDING");
+  const history  = signals.filter(s => s.status !== "PENDING");
+
+  const statusColor = { EXECUTED:"#00ff88", REJECTED:"#ff4466", FAILED:"#ff8844", PENDING:"#ffcc00", APPROVED:"#00ccff" };
+
   return (
-    <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
-      {/* Engine toggle */}
-      <div style={{ ...S.card, borderLeft:`3px solid ${at.enabled?"#00ff88":"#333"}` }}>
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
-          <div style={S.title}>⚡ AUTO-TRADE ENGINE</div>
-          <button onClick={() => save({ enabled:!at.enabled })}
-            style={{ padding:"6px 18px", borderRadius:20, border:"none", cursor:"pointer", fontWeight:800, fontSize:11, letterSpacing:2,
+    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+
+      {/* Settings card */}
+      <div style={{ ...S.card, borderLeft:`3px solid ${at.enabled?"#00ff88":"#1a1a30"}` }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+          <div>
+            <div style={S.title}>⚡ AI SIGNAL SCANNER</div>
+            <div style={{ fontSize:10, color:"#333", marginTop:2 }}>
+              Scans all pairs every 5 min → sends Telegram alert → you approve or reject
+            </div>
+          </div>
+          <button onClick={()=>save({ enabled:!at.enabled })}
+            style={{ padding:"8px 22px", borderRadius:20, border:"none", cursor:"pointer", fontWeight:800, fontSize:12, letterSpacing:2,
               background:at.enabled?"#003322":"#1a0808", color:at.enabled?"#00ff88":"#ff4466" }}>
-            {at.enabled ? "ON ●" : "OFF ○"}
+            {at.enabled ? "● ON" : "○ OFF"}
           </button>
         </div>
+
         {at.enabled && (
-          <div style={{ padding:"8px 12px", background:"#00150a", borderRadius:8, marginBottom:12, fontSize:11, color:"#00ff88" }}>
-            ⚡ ACTIVE — scanning all pairs every 5 minutes automatically
+          <div style={{ padding:"8px 12px", background:"#001a0a", borderRadius:7, marginBottom:12, fontSize:11, color:"#00ff88", border:"1px solid #00ff8822" }}>
+            ⚡ ACTIVE — scanning every 5 min · alerts sent to @Precision_Trader_v3_Pro_Bot
           </div>
         )}
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:12 }}>
+
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:9, marginBottom:12 }}>
           <div>
             <label style={S.lbl}>Min Confidence %</label>
             <input type="number" value={at.threshold} min="50" max="99"
-              onChange={e => setAt(p=>({...p,threshold:parseInt(e.target.value)}))}
+              onChange={e=>setAt(p=>({...p,threshold:parseInt(e.target.value)}))}
               style={{ ...S.inp, color:"#00ccff" }} />
-            <div style={{ fontSize:9, color:"#333", marginTop:3 }}>Auto-execute only if AI ≥ this %</div>
           </div>
           <div>
-            <label style={S.lbl}>Risk per Trade %</label>
-            <input type="number" value={at.risk_pct} min="0.1" max="3" step="0.1"
-              onChange={e => setAt(p=>({...p,risk_pct:parseFloat(e.target.value)}))}
+            <label style={S.lbl}>Risk per Signal %</label>
+            <input type="number" value={at.risk_pct} min="0.1" max="5" step="0.1"
+              onChange={e=>setAt(p=>({...p,risk_pct:parseFloat(e.target.value)}))}
               style={{ ...S.inp, color:"#ffcc00" }} />
-            <div style={{ fontSize:9, color:"#333", marginTop:3 }}>% of balance per auto-trade</div>
+          </div>
+          <div>
+            <label style={S.lbl}>Max Signals / Day</label>
+            <input type="number" value={at.max_per_day} min="1" max="10"
+              onChange={e=>setAt(p=>({...p,max_per_day:parseInt(e.target.value)}))}
+              style={{ ...S.inp }} />
           </div>
         </div>
-        <div style={{ marginBottom:12 }}>
-          <label style={S.lbl}>Max Auto-Trades per Day</label>
-          <input type="number" value={at.max_per_day} min="1" max="10"
-            onChange={e => setAt(p=>({...p,max_per_day:parseInt(e.target.value)}))}
-            style={{ ...S.inp }} />
-        </div>
+
         {status && <div style={{ fontSize:11, color:status.startsWith("✅")?"#00ff88":"#ff4466", marginBottom:8 }}>{status}</div>}
+
         <div style={{ display:"flex", gap:8 }}>
-          <button onClick={() => save()} style={{ ...S.btn, flex:1, color:"#00ccff", border:"1px solid #00ccff44", background:"#001a2e" }}>
+          <button onClick={()=>save()} style={{ ...S.btn, flex:1, color:"#00ccff", border:"1px solid #00ccff44", background:"#001a2e" }}>
             SAVE SETTINGS
           </button>
-          <button onClick={runScan} disabled={scanning} style={{ ...S.btn, flex:1, color:"#ffcc00", border:"1px solid #ffcc0044", background:"#1a1500" }}>
-            {scanning ? "SCANNING..." : "▶ SCAN NOW"}
+          <button onClick={scanNow} disabled={scanning || atSt?.scanning}
+            style={{ ...S.btn, flex:1, color:"#ffcc00", border:"1px solid #ffcc0044", background:"#1a1500" }}>
+            {scanning||atSt?.scanning ? "⟳ SCANNING..." : "▶ SCAN NOW"}
           </button>
         </div>
-        {atStatus && (
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:6, marginTop:12 }}>
+
+        {atSt && (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6, marginTop:12 }}>
             {[
-              ["Today Trades", atStatus.today_trades + "/" + atStatus.max_per_day, "#bbb"],
-              ["Total Trades",  atStatus.total_trades, "#00ccff"],
-              ["Status", atStatus.scanning?"SCANNING":"IDLE", atStatus.scanning?"#ffcc00":"#333"],
-            ].map(([l,v,c]) => (
-              <div key={l} style={{ background:"#08081a", borderRadius:6, padding:"7px 9px", textAlign:"center" }}>
-                <div style={{ fontSize:9, color:"#333", letterSpacing:1, marginBottom:3 }}>{l}</div>
-                <div style={{ fontSize:14, fontFamily:"monospace", color:c, fontWeight:800 }}>{v}</div>
+              ["Pending",       atSt.pending_signals,  "#ffcc00"],
+              ["Today Signals", atSt.today_signals+"/"+atSt.max_per_day, "#bbb"],
+              ["Total Signals", atSt.total_signals,    "#00ccff"],
+              ["Scanner",       atSt.scanning?"ACTIVE":"IDLE", atSt.scanning?"#ffcc00":"#333"],
+            ].map(([l,v,c])=>(
+              <div key={l} style={{ background:"#08081a", borderRadius:6, padding:"8px 6px", textAlign:"center" }}>
+                <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1, marginBottom:3 }}>{l}</div>
+                <div style={{ fontSize:15, fontFamily:"monospace", color:c, fontWeight:800 }}>{v}</div>
               </div>
             ))}
           </div>
         )}
       </div>
 
-      {/* Auto-trade log */}
-      <div style={S.card}>
-        <div style={S.title}>Auto-Trade History</div>
-        {log.length === 0 ? (
-          <div style={{ color:"#2a2a4a", fontSize:12, textAlign:"center", padding:"20px 0" }}>
-            No auto-trades yet. Enable the engine and it will trade automatically when AI finds ≥{at.threshold}% confidence setups.
+      {/* PENDING signals — awaiting decision */}
+      {pending.length > 0 && (
+        <div style={{ ...S.card, borderLeft:"3px solid #ffcc00" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:12 }}>
+            <div style={S.title}>⏳ PENDING SIGNALS ({pending.length})</div>
+            <span style={{ fontSize:10, color:"#ffcc00", animation:"pulse 1s infinite" }}>● AWAITING YOUR DECISION</span>
           </div>
-        ) : log.slice(0,15).map(t => (
-          <div key={t.id} style={{ padding:"10px 11px", background:"#08081a", borderRadius:8, marginBottom:7, border:"1px solid #0d0d1e" }}>
-            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-              <div style={{ display:"flex", alignItems:"center", gap:7 }}>
-                <span style={{ fontWeight:800, color:"#ccc", fontSize:12 }}>{t.pair}</span>
-                <span style={{ ...S.badge, color:t.direction==="BUY"?"#00ff88":"#ff4466", background:t.direction==="BUY"?"#003322":"#330011" }}>{t.direction}</span>
-                <span style={{ ...S.badge, background:"#001a2e", color:"#00ccff" }}>{t.confidence}%</span>
+          <div style={{ fontSize:11, color:"#555", marginBottom:12 }}>
+            Approve via Telegram or click the buttons below. Signal expires when market moves significantly.
+          </div>
+          {pending.map(sig => (
+            <div key={sig.id} style={{ background:"#0a0a1a", borderRadius:10, padding:"14px", marginBottom:10, border:"1px solid #ffcc0033" }}>
+              {/* Header */}
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <span style={{ fontWeight:800, fontSize:15, color:"#fff" }}>{sig.pair}</span>
+                  <span style={{ ...S.badge, fontSize:11, color:sig.direction==="BUY"?"#00ff88":"#ff4466",
+                    background:sig.direction==="BUY"?"#003322":"#330011" }}>
+                    {sig.direction} {sig.direction==="BUY"?"▲":"▼"}
+                  </span>
+                  <span style={{ ...S.badge, background:"#001a2e", color:"#00ccff", fontSize:11 }}>
+                    {sig.confidence}% AI
+                  </span>
+                </div>
+                <span style={{ fontSize:10, color:"#333" }}>#{sig.id} · {sig.created_at?.slice(11,16)}</span>
               </div>
-              <span style={{ fontSize:10, color:"#333", fontFamily:"monospace" }}>{t.timestamp?.slice(0,16)}</span>
+
+              {/* Trade details grid */}
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:8, marginBottom:10 }}>
+                {[
+                  ["Entry",    sig.entry_price?.toFixed(5), "#bbb"],
+                  ["Stop Loss",sig.stop_loss?.toFixed(5)+" (-"+sig.sl_pips+" pip)", "#ff4466"],
+                  ["Take Profit",sig.take_profit?.toFixed(5)+" (+"+sig.tp_pips+" pip)", "#00ff88"],
+                  ["Size",     sig.lots+" lots", "#ffcc00"],
+                  ["Risk",     sig.risk_pct+"% = $"+parseFloat(sig.risk_amount||0).toFixed(0), "#ff8844"],
+                  ["EMA",      sig.ema_align||"—", "#00ccff"],
+                ].map(([l,v,c])=>(
+                  <div key={l} style={{ background:"#08081a", borderRadius:6, padding:"7px 9px" }}>
+                    <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1, marginBottom:3 }}>{l}</div>
+                    <div style={{ fontSize:11, color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* RSI + H4 inline */}
+              <div style={{ display:"flex", gap:10, marginBottom:12, fontSize:11 }}>
+                <span style={{ color:"#555" }}>RSI: <span style={{ color:sig.rsi>70?"#ff4466":sig.rsi<30?"#00ff88":"#bbb", fontFamily:"monospace" }}>{sig.rsi}</span></span>
+                <span style={{ color:"#555" }}>H4: <span style={{ color:"#00ccff" }}>{sig.h4_trend}</span></span>
+              </div>
+
+              {/* APPROVE / REJECT buttons */}
+              <div style={{ display:"flex", gap:8 }}>
+                <button onClick={()=>act(sig.id,"approve")} disabled={!!acting[sig.id]}
+                  style={{ flex:1, padding:"11px 0", borderRadius:9, border:"1px solid #00ff8866",
+                    background:"#003322", color:"#00ff88", cursor:"pointer", fontWeight:800, fontSize:13, letterSpacing:2 }}>
+                  {acting[sig.id]==="approve" ? "EXECUTING..." : "✅ APPROVE"}
+                </button>
+                <button onClick={()=>act(sig.id,"reject")} disabled={!!acting[sig.id]}
+                  style={{ flex:1, padding:"11px 0", borderRadius:9, border:"1px solid #ff446666",
+                    background:"#1a0808", color:"#ff4466", cursor:"pointer", fontWeight:800, fontSize:13, letterSpacing:2 }}>
+                  {acting[sig.id]==="reject" ? "REJECTING..." : "❌ REJECT"}
+                </button>
+              </div>
             </div>
-            <div style={{ fontSize:10, color:"#333", marginTop:5, display:"flex", gap:12 }}>
-              <span>Entry: <span style={{ color:"#555" }}>{t.entry_price?.toFixed(5)}</span></span>
-              <span>SL: <span style={{ color:"#ff446688" }}>{t.stop_loss?.toFixed(5)}</span></span>
-              <span>TP: <span style={{ color:"#00ff8888" }}>{t.take_profit?.toFixed(5)}</span></span>
-              <span style={{ marginLeft:"auto", color:t.status==="FILLED"?"#00ff88":"#ffcc00" }}>{t.status}</span>
+          ))}
+        </div>
+      )}
+
+      {/* Signal history */}
+      <div style={S.card}>
+        <div style={S.title}>Signal History ({history.length})</div>
+        {history.length === 0 && (
+          <div style={{ color:"#2a2a4a", fontSize:12, textAlign:"center", padding:"24px 0" }}>
+            {at.enabled
+              ? `Scanner active — signals appear here when AI finds ≥${at.threshold}% confidence setups`
+              : "Enable the scanner above to start receiving trade signals"}
+          </div>
+        )}
+        {history.slice(0,30).map((sig,i) => (
+          <div key={sig.id} style={{ padding:"10px 12px", background:i%2===0?"#07071a":"#08081a",
+            borderRadius:7, marginBottom:4, border:"1px solid #0d0d1e",
+            borderLeft:`3px solid ${statusColor[sig.status]||"#333"}` }}>
+            <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:5 }}>
+              <span style={{ fontWeight:800, color:"#bbb", fontSize:12, minWidth:52 }}>{sig.pair}</span>
+              <span style={{ ...S.badge, fontSize:9, color:sig.direction==="BUY"?"#00ff88":"#ff4466",
+                background:sig.direction==="BUY"?"#003322":"#330011" }}>{sig.direction}</span>
+              <span style={{ ...S.badge, background:"#001a2e", color:"#00ccff", fontSize:9 }}>{sig.confidence}%</span>
+              <span style={{ marginLeft:"auto", fontSize:10, fontWeight:700,
+                color:statusColor[sig.status]||"#555" }}>{sig.status}</span>
+              <span style={{ fontSize:9, color:"#2a2a4a", fontFamily:"monospace" }}>#{sig.id}</span>
+            </div>
+            <div style={{ display:"flex", gap:12, fontSize:10, color:"#333" }}>
+              <span>Entry: <span style={{ color:"#555" }}>{sig.entry_price?.toFixed(5)}</span></span>
+              <span>SL: <span style={{ color:"#ff446688" }}>{sig.stop_loss?.toFixed(5)}</span></span>
+              <span>TP: <span style={{ color:"#00ff8888" }}>{sig.take_profit?.toFixed(5)}</span></span>
+              {sig.filled_price && <span>Filled: <span style={{ color:"#00ccff88" }}>{sig.filled_price?.toFixed(5)}</span></span>}
+              <span style={{ marginLeft:"auto" }}>{sig.created_at?.slice(0,16)}</span>
             </div>
           </div>
         ))}

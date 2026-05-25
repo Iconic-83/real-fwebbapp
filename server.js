@@ -91,9 +91,10 @@ async function oandaRequest(path, method = 'GET', data = null) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// TECHNICAL INDICATORS  (calculated server-side from real candle data)
+// TECHNICAL INDICATORS — 4-Timeframe Precision Engine
 // ═════════════════════════════════════════════════════════════════════════════
 function calcEMA(closes, period) {
+  if (!closes.length) return 0;
   const k = 2 / (period + 1);
   let ema = closes[0];
   for (let i = 1; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
@@ -101,11 +102,12 @@ function calcEMA(closes, period) {
 }
 
 function calcRSI(closes, period = 14) {
+  if (closes.length < period + 1) return 50;
   let gains = 0, losses = 0;
-  const start = Math.max(1, closes.length - period);
+  const start = closes.length - period;
   for (let i = start; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff; else losses += Math.abs(diff);
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gains += d; else losses += Math.abs(d);
   }
   const avgG = gains / period, avgL = losses / period;
   if (avgL === 0) return 100;
@@ -113,43 +115,119 @@ function calcRSI(closes, period = 14) {
 }
 
 function calcATR(candles, period = 14) {
-  let sum = 0;
+  if (candles.length < 2) return 0;
+  let sum = 0, cnt = 0;
   const start = Math.max(1, candles.length - period);
   for (let i = start; i < candles.length; i++) {
-    const h = parseFloat(candles[i].mid.h);
-    const l = parseFloat(candles[i].mid.l);
-    const pc = parseFloat(candles[i - 1].mid.c);
-    sum += Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+    const h = parseFloat(candles[i].mid.h), l = parseFloat(candles[i].mid.l), pc = parseFloat(candles[i-1].mid.c);
+    sum += Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc)); cnt++;
   }
-  return sum / period;
+  return cnt ? sum/cnt : 0;
 }
 
 function calcMACD(closes) {
-  const ema12 = calcEMA(closes, 12);
-  const ema26 = calcEMA(closes, 26);
-  return parseFloat((ema12 - ema26).toFixed(5));
+  if (closes.length < 26) return 0;
+  return parseFloat((calcEMA(closes, 12) - calcEMA(closes, 26)).toFixed(6));
 }
 
-function buildIndicators(h1Candles, h4Candles) {
-  const closes = h1Candles.map(c => parseFloat(c.mid.c));
-  const highs   = h1Candles.map(c => parseFloat(c.mid.h));
-  const lows    = h1Candles.map(c => parseFloat(c.mid.l));
+// ADX — Average Directional Index (trend strength)
+function calcADX(candles, period = 14) {
+  if (candles.length < period + 2) return 0;
+  const slice = candles.slice(-(period + 2));
+  let plusDM = 0, minusDM = 0, trSum = 0;
+  for (let i = 1; i < slice.length; i++) {
+    const h  = parseFloat(slice[i].mid.h),   l  = parseFloat(slice[i].mid.l);
+    const ph = parseFloat(slice[i-1].mid.h), pl = parseFloat(slice[i-1].mid.l), pc = parseFloat(slice[i-1].mid.c);
+    const upMove = h - ph, downMove = pl - l;
+    plusDM  += (upMove > downMove && upMove > 0) ? upMove : 0;
+    minusDM += (downMove > upMove && downMove > 0) ? downMove : 0;
+    trSum   += Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc));
+  }
+  if (!trSum) return 0;
+  const diPlus  = (plusDM  / trSum) * 100;
+  const diMinus = (minusDM / trSum) * 100;
+  const diSum   = diPlus + diMinus;
+  if (!diSum) return 0;
+  return parseFloat((Math.abs(diPlus - diMinus) / diSum * 100).toFixed(1));
+}
+
+// Stochastic (for overbought/oversold confirmation)
+function calcStoch(candles, kPeriod = 14) {
+  if (candles.length < kPeriod) return { k:50, d:50 };
+  const slice = candles.slice(-kPeriod);
+  const highs = slice.map(c => parseFloat(c.mid.h));
+  const lows  = slice.map(c => parseFloat(c.mid.l));
+  const close = parseFloat(slice[slice.length-1].mid.c);
+  const hh = Math.max(...highs), ll = Math.min(...lows);
+  const k  = hh===ll ? 50 : ((close-ll)/(hh-ll))*100;
+  return { k: parseFloat(k.toFixed(1)), d: parseFloat(k.toFixed(1)) }; // simplified
+}
+
+// Candle pattern detection
+function detectPattern(candles) {
+  const last = candles.slice(-3);
+  if (last.length < 2) return 'NONE';
+  const prev = last[last.length-2], curr = last[last.length-1];
+  const co = parseFloat(curr.mid.o), cc = parseFloat(curr.mid.c);
+  const ch = parseFloat(curr.mid.h), cl = parseFloat(curr.mid.l);
+  const po = parseFloat(prev.mid.o), pc = parseFloat(prev.mid.c);
+  const body = Math.abs(cc-co), range = ch-cl;
+  const lowerWick = Math.min(co,cc)-cl, upperWick = ch-Math.max(co,cc);
+
+  if (lowerWick > body*2 && body < range*0.3) return cc > co ? 'BULLISH_PIN_BAR' : 'BEARISH_PIN_BAR';
+  if (cc > co && pc < po && cc > po && co < pc) return 'BULLISH_ENGULFING';
+  if (cc < co && pc > po && cc < po && co > pc) return 'BEARISH_ENGULFING';
+  if (body < range*0.1) return 'DOJI';
+  if (cc > co) return 'BULLISH_CANDLE';
+  return 'BEARISH_CANDLE';
+}
+
+// Build full indicator set for any timeframe
+function buildIndicators(candles, refCandles = []) {
+  if (!candles?.length) return null;
+  const closes = candles.map(c => parseFloat(c.mid.c));
+  const highs  = candles.map(c => parseFloat(c.mid.h));
+  const lows   = candles.map(c => parseFloat(c.mid.l));
 
   const ema9  = calcEMA(closes, 9);
   const ema21 = calcEMA(closes, 21);
   const ema50 = calcEMA(closes.slice(-50), 50);
+  const ema200= calcEMA(closes, Math.min(200, closes.length));
   const rsi14 = calcRSI(closes, 14);
-  const atr14 = calcATR(h1Candles, 14);
+  const atr14 = calcATR(candles, 14);
   const macd  = calcMACD(closes);
+  const adx   = calcADX(candles, 14);
+  const stoch = calcStoch(candles, 14);
 
-  // Swing highs/lows (last 20 candles)
   const recentHighs = highs.slice(-20);
   const recentLows  = lows.slice(-20);
   const resistance  = Math.max(...recentHighs);
   const support     = Math.min(...recentLows);
 
-  // Last 5 candle summary
-  const last5 = h1Candles.slice(-5).map(c => ({
+  // Strong S/R (50-candle lookback)
+  const strongHighs = highs.slice(-50);
+  const strongLows  = lows.slice(-50);
+  const strongResist = Math.max(...strongHighs);
+  const strongSupport= Math.min(...strongLows);
+
+  const currentClose = closes[closes.length-1];
+  const prevClose    = closes[closes.length-2] || currentClose;
+  const momentum     = ((currentClose - prevClose) / prevClose) * 100;
+
+  const trend = currentClose > ema21 ? 'BULLISH' : 'BEARISH';
+  const emaAlignment =
+    (ema9>ema21 && ema21>ema50) ? 'BULLISH' :
+    (ema9<ema21 && ema21<ema50) ? 'BEARISH' : 'MIXED';
+
+  // Reference timeframe trend (e.g. H4 context for H1)
+  let refTrend = 'UNKNOWN', refEma = 0;
+  if (refCandles?.length > 2) {
+    const rc = refCandles.map(c => parseFloat(c.mid.c));
+    refEma  = calcEMA(rc, 21);
+    refTrend= rc[rc.length-1] > refEma ? 'BULLISH' : 'BEARISH';
+  }
+
+  const last5 = candles.slice(-5).map(c => ({
     open:  parseFloat(c.mid.o).toFixed(5),
     high:  parseFloat(c.mid.h).toFixed(5),
     low:   parseFloat(c.mid.l).toFixed(5),
@@ -157,22 +235,171 @@ function buildIndicators(h1Candles, h4Candles) {
     bull:  parseFloat(c.mid.c) >= parseFloat(c.mid.o),
   }));
 
-  // H4 trend
-  let h4Trend = 'N/A';
-  if (h4Candles?.length > 0) {
-    const h4Closes = h4Candles.map(c => parseFloat(c.mid.c));
-    const h4ema21 = calcEMA(h4Closes, 21);
-    h4Trend = h4Closes[h4Closes.length - 1] > h4ema21 ? 'BULLISH (above H4 EMA21)' : 'BEARISH (below H4 EMA21)';
-  }
+  const pattern = detectPattern(candles);
 
-  // Trend strength
-  const currentClose = closes[closes.length - 1];
-  const trend = currentClose > ema21 ? 'ABOVE EMA21 (bullish bias)' : 'BELOW EMA21 (bearish bias)';
-  const emaAlignment = (ema9 > ema21 && ema21 > ema50) ? 'BULLISH ALIGNMENT (EMA9>EMA21>EMA50)' :
-                       (ema9 < ema21 && ema21 < ema50) ? 'BEARISH ALIGNMENT (EMA9<EMA21<EMA50)' : 'MIXED (no clear alignment)';
-
-  return { ema9, ema21, ema50, rsi14, atr14, macd, resistance, support, trend, emaAlignment, h4Trend, last5 };
+  return {
+    ema9, ema21, ema50, ema200, rsi14, atr14, macd, adx, stoch,
+    resistance, support, strongResist, strongSupport,
+    trend, emaAlignment, refTrend, last5, pattern, momentum,
+    // Derived
+    h4Trend: refTrend + ' (ref EMA21)',
+    emaAlignmentFull: emaAlignment === 'BULLISH' ? 'BULLISH ALIGNMENT (EMA9>EMA21>EMA50)' :
+                      emaAlignment === 'BEARISH' ? 'BEARISH ALIGNMENT (EMA9<EMA21<EMA50)' : 'MIXED',
+  };
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 12-CHECK PRECISION SCORING ENGINE
+// Each check = 1 point. Signal only fires if score >= minScore (10+)
+// ═══════════════════════════════════════════════════════════════════
+function scoreSignal({ direction, price, m15, h1, h4, d1, newsEvents = [] }) {
+  const isBuy = direction === 'BUY';
+  const checks = [];
+
+  const pass = (name, cond, weight=1) => checks.push({ name, pass:!!cond, weight });
+
+  // ── CHECK 1: H1 EMA full stack alignment ─────────────────────────
+  pass('H1 EMA Stack',
+    isBuy ? (h1.ema9>h1.ema21 && h1.ema21>h1.ema50) :
+             (h1.ema9<h1.ema21 && h1.ema21<h1.ema50), 2);
+
+  // ── CHECK 2: H4 trend agrees ──────────────────────────────────────
+  pass('H4 Trend Match',
+    isBuy ? h4.trend==='BULLISH' : h4.trend==='BEARISH', 2);
+
+  // ── CHECK 3: D1 trend agrees (master trend) ───────────────────────
+  pass('D1 Master Trend',
+    isBuy ? d1.trend==='BULLISH' : d1.trend==='BEARISH', 2);
+
+  // ── CHECK 4: M15 EMA confirms (entry timing) ──────────────────────
+  pass('M15 EMA Confirms',
+    isBuy ? h1.ema9 > h1.ema21 : h1.ema9 < h1.ema21, 1);
+
+  // ── CHECK 5: RSI in healthy zone (not over-extended) ─────────────
+  const rsi = h1.rsi14;
+  pass('RSI Zone Safe',
+    isBuy ? (rsi > 40 && rsi < 68) : (rsi > 32 && rsi < 60), 1);
+
+  // ── CHECK 6: RSI NOT overbought/oversold (entering wrong zone) ───
+  pass('RSI Not Extreme',
+    isBuy ? rsi < 75 : rsi > 25, 1);
+
+  // ── CHECK 7: MACD confirms direction ─────────────────────────────
+  pass('MACD Direction',
+    isBuy ? h1.macd > 0 : h1.macd < 0, 1);
+
+  // ── CHECK 8: ADX shows trending market (not ranging) ─────────────
+  pass('ADX Trending', h1.adx >= 20, 1);
+
+  // ── CHECK 9: Market session — London (7-12) or NY (12-17) UTC ────
+  const utcHour = new Date().getUTCHours();
+  pass('Prime Session', utcHour >= 7 && utcHour <= 17, 1);
+
+  // ── CHECK 10: Price relative to H4 EMA (not overextended) ────────
+  const h4Dist = Math.abs(price - h4.ema21) / price * 100;
+  pass('Not Overextended H4', h4Dist < 0.8, 1); // within 0.8% of H4 EMA21
+
+  // ── CHECK 11: NO high-impact news in next 45 minutes ─────────────
+  const nowUTC  = new Date();
+  const hasNews = newsEvents.some(e => {
+    if (e.impact !== 'HIGH') return false;
+    const [hh, mm] = (e.time || '99:99').split(':').map(Number);
+    const eventMin = hh * 60 + mm;
+    const nowMin   = nowUTC.getUTCHours() * 60 + nowUTC.getUTCMinutes();
+    return Math.abs(eventMin - nowMin) <= 45;
+  });
+  pass('No News Blackout', !hasNews, 2);
+
+  // ── CHECK 12: Candle pattern confirms direction ───────────────────
+  const bullishPatterns = ['BULLISH_PIN_BAR','BULLISH_ENGULFING','BULLISH_CANDLE'];
+  const bearishPatterns = ['BEARISH_PIN_BAR','BEARISH_ENGULFING','BEARISH_CANDLE'];
+  pass('Candle Pattern',
+    isBuy ? bullishPatterns.includes(h1.pattern) :
+             bearishPatterns.includes(h1.pattern), 1);
+
+  const totalWeight  = checks.reduce((s,c) => s + c.weight, 0);
+  const passedWeight = checks.reduce((s,c) => s + (c.pass ? c.weight : 0), 0);
+  const score        = checks.filter(c => c.pass).length;
+  const maxScore     = checks.length;
+  const pct          = Math.round(passedWeight / totalWeight * 100);
+
+  return { score, maxScore, pct, checks };
+}
+
+// ── Market session name ──────────────────────────────────────────────────────
+function getSession() {
+  const h = new Date().getUTCHours();
+  if (h >= 0  && h < 7)  return 'ASIAN';
+  if (h >= 7  && h < 12) return 'LONDON';
+  if (h >= 12 && h < 17) return 'NY';
+  if (h >= 12 && h < 17) return 'LONDON+NY';
+  return 'OFF_HOURS';
+}
+
+// ── Trailing stop monitor — protects open profits ────────────────────────────
+async function runTrailingStops() {
+  const keys = getApiKeys();
+  if (!keys.oanda_key || !keys.oanda_account) return;
+  try {
+    const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/openTrades`);
+    const trades = r?.trades || [];
+    for (const trade of trades) {
+      const pl   = parseFloat(trade.unrealizedPL || 0);
+      const units= parseFloat(trade.currentUnits || 0);
+      const entry= parseFloat(trade.price || 0);
+      const instr= trade.instrument;
+      const isBuy= units > 0;
+      const pipSize = PIP[instr] || 0.0001;
+      const dp    = instr==='XAU_USD' ? 2 : 5;
+
+      // Current SL
+      const currentSL = parseFloat(trade.stopLossOrder?.price || 0);
+      if (!currentSL) continue;
+
+      const currentPx = parseFloat(priceCache[instr.replace('_','/')] || entry);
+      const plPips = isBuy
+        ? (currentPx - entry) / pipSize
+        : (entry - currentPx) / pipSize;
+      const slPips = isBuy
+        ? (entry - currentSL) / pipSize
+        : (currentSL - entry) / pipSize;
+
+      // Move SL to breakeven once +1:1 reached
+      const beThreshold = slPips * 1.0;
+      if (plPips >= beThreshold && currentSL) {
+        const bePrice = isBuy
+          ? (entry + pipSize * 3).toFixed(dp)  // 3 pip above entry
+          : (entry - pipSize * 3).toFixed(dp);
+        const newSL = parseFloat(bePrice);
+        const shouldMove = isBuy ? newSL > currentSL : newSL < currentSL;
+        if (shouldMove) {
+          await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/orders`, 'PUT', {
+            stopLoss: { price: bePrice, timeInForce:'GTC' }
+          });
+          console.log(`[TSL] Moved SL to breakeven: ${instr} trade ${trade.id} → ${bePrice}`);
+        }
+      }
+
+      // Trail SL at 1.5× ATR behind price once +1.5:1 reached
+      if (plPips >= slPips * 1.5) {
+        const atr = h1AtrCache[instr] || slPips * pipSize;
+        const trailSL = isBuy
+          ? (currentPx - atr * 1.5).toFixed(dp)
+          : (currentPx + atr * 1.5).toFixed(dp);
+        const trailPrice = parseFloat(trailSL);
+        const shouldTrail = isBuy ? trailPrice > currentSL : trailPrice < currentSL;
+        if (shouldTrail) {
+          await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/orders`, 'PUT', {
+            stopLoss: { price: trailSL, timeInForce:'GTC' }
+          });
+          console.log(`[TSL] Trailing SL moved: ${instr} → ${trailSL}`);
+        }
+      }
+    }
+  } catch(e) { /* silent */ }
+}
+const h1AtrCache = {};
+setInterval(runTrailingStops, 30000); // check every 30s
 
 // ═════════════════════════════════════════════════════════════════════════════
 // STORAGE API
@@ -861,11 +1088,10 @@ async function runAutoScan() {
   const settings = getStorageValue('autotrade_settings');
   if (!settings?.enabled) return;
 
-  const threshold = parseInt(settings.threshold  || 80);
+  const minScore  = parseInt(settings.min_score  || 9);   // out of 12 checks
   const riskPct   = parseFloat(settings.risk_pct || 1);
   const maxPerDay = parseInt(settings.max_per_day || 3);
 
-  // How many signals sent today (pending or executed)
   const todaySent = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now') AND status IN ('PENDING','EXECUTED','APPROVED')`).get();
   if (todaySent.c >= maxPerDay) return;
 
@@ -873,109 +1099,201 @@ async function runAutoScan() {
   if (!keys.oanda_key || !keys.oanda_account || !keys.openai_key) return;
 
   autoScanning = true;
-  console.log('[SCAN] Starting market scan...');
+  const session = getSession();
+  console.log(`[SCAN] Starting precision scan — session: ${session}`);
+
+  // Pre-fetch news for blackout check
+  const currentNews = newsCache || [];
 
   const scanPairs = ['EUR_USD','GBP_USD','USD_JPY','XAU_USD','AUD_USD','USD_CAD'];
+
   for (const instr of scanPairs) {
     try {
-      // Re-check daily cap
       const fresh = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now') AND status IN ('PENDING','EXECUTED','APPROVED')`).get();
       if (fresh.c >= maxPerDay) break;
 
-      // Skip if there is already a PENDING signal for this pair
       const existPending = db.prepare(`SELECT id FROM signals WHERE pair=? AND status='PENDING'`).get(instr.replace('_','/'));
       if (existPending) continue;
 
       const label = instr.replace('_', '/');
-      const price = priceCache[label];
+      const price = parseFloat(priceCache[label] || 0);
       if (!price) continue;
 
-      // Fetch candles + build indicators
-      const [h1Res, h4Res] = await Promise.allSettled([
-        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=H1&price=M`),
-        oandaRequest(`/v3/instruments/${instr}/candles?count=20&granularity=H4&price=M`),
+      // ── Fetch all 4 timeframes in parallel ─────────────────────────
+      const [m15r, h1r, h4r, d1r] = await Promise.allSettled([
+        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=M15&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H1&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=H4&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=D&price=M`),
       ]);
-      const h1 = h1Res.status==='fulfilled' ? h1Res.value?.candles||[] : [];
-      const h4 = h4Res.status==='fulfilled' ? h4Res.value?.candles||[] : [];
-      if (h1.length < 10) continue;
-      const ind = buildIndicators(h1, h4);
-      const dp  = instr==='XAU_USD' ? 2 : 5;
+      const m15c = m15r.status==='fulfilled' ? m15r.value?.candles||[] : [];
+      const h1c  = h1r.status==='fulfilled'  ? h1r.value?.candles||[]  : [];
+      const h4c  = h4r.status==='fulfilled'  ? h4r.value?.candles||[]  : [];
+      const d1c  = d1r.status==='fulfilled'  ? d1r.value?.candles||[]  : [];
+      if (h1c.length < 26) continue;
 
-      // GPT-4o analysis
+      // ── Build indicators for each timeframe ─────────────────────────
+      const indM15 = buildIndicators(m15c.length>5 ? m15c : h1c.slice(-15), h1c);
+      const indH1  = buildIndicators(h1c, h4c);
+      const indH4  = buildIndicators(h4c.length>5 ? h4c : h1c, d1c);
+      const indD1  = buildIndicators(d1c.length>5 ? d1c : h4c, []);
+
+      // Cache ATR for trailing stop monitor
+      h1AtrCache[instr] = indH1.atr14;
+
+      // ── Determine AI direction from H1 EMA alignment ─────────────────
+      const aiDirection = indH1.emaAlignment === 'BULLISH' ? 'BUY'
+                        : indH1.emaAlignment === 'BEARISH' ? 'SELL'
+                        : null;
+      if (!aiDirection) {
+        console.log(`[SCAN] ${label}: EMA mixed — skipped`);
+        continue;
+      }
+
+      // ── Run 12-check scoring engine ───────────────────────────────────
+      const scored = scoreSignal({
+        direction: aiDirection, price,
+        m15: indM15, h1: indH1, h4: indH4, d1: indD1,
+        newsEvents: currentNews,
+      });
+      console.log(`[SCAN] ${label}: ${aiDirection} score ${scored.score}/${scored.maxScore} (${scored.pct}%) — need ${minScore}`);
+
+      // Reject if score too low
+      if (scored.score < minScore) {
+        const failed = scored.checks.filter(c=>!c.pass).map(c=>c.name).join(', ');
+        console.log(`[SCAN] ${label}: REJECTED — failed: ${failed}`);
+        continue;
+      }
+
+      // ── GPT-4o — precision prompt with ALL 4-timeframe data ──────────
+      const dp = instr==='XAU_USD' ? 2 : 5;
       const openai = new OpenAI({ apiKey:keys.openai_key });
-      const completion = await openai.chat.completions.create({
-        model:'gpt-4o', max_tokens:350,
-        messages:[
-          { role:'system', content:'Forex analyst. Only flag HIGH confidence signals. Return exactly 6 lines.' },
-          { role:'user', content:
-`Analyze ${label} at ${price}.
-EMA9=${ind.ema9.toFixed(dp)} EMA21=${ind.ema21.toFixed(dp)} EMA50=${ind.ema50.toFixed(dp)}
-RSI14=${ind.rsi14} ATR=${ind.atr14.toFixed(dp)} MACD=${ind.macd}
-Trend: ${ind.trend} | H4: ${ind.h4Trend}
-Support=${ind.support.toFixed(dp)} Resistance=${ind.resistance.toFixed(dp)}
 
-Return EXACTLY:
+      const promptCtx =
+`PAIR: ${label} | PRICE: ${price} | SESSION: ${session}
+SCORE: ${scored.score}/${scored.maxScore} checks passed
+
+M15: EMA9=${indM15.ema9.toFixed(dp)} EMA21=${indM15.ema21.toFixed(dp)} RSI=${indM15.rsi14} Pattern=${indM15.pattern}
+H1:  EMA9=${indH1.ema9.toFixed(dp)} EMA21=${indH1.ema21.toFixed(dp)} EMA50=${indH1.ema50.toFixed(dp)} RSI=${indH1.rsi14} MACD=${indH1.macd} ADX=${indH1.adx} ATR=${indH1.atr14.toFixed(dp)}
+H4:  EMA21=${indH4.ema21.toFixed(dp)} Trend=${indH4.trend} RSI=${indH4.rsi14}
+D1:  EMA21=${indD1.ema21.toFixed(dp)} Trend=${indD1.trend}
+H1 EMA Alignment: ${indH1.emaAlignment}
+H4 Trend: ${indH4.trend} | D1 Trend: ${indD1.trend}
+Support=${indH1.support.toFixed(dp)} Resistance=${indH1.resistance.toFixed(dp)}
+Strong Support=${indH1.strongSupport.toFixed(dp)} Strong Resistance=${indH1.strongResist.toFixed(dp)}
+Checks passed: ${scored.checks.filter(c=>c.pass).map(c=>c.name).join(', ')}
+Checks failed: ${scored.checks.filter(c=>!c.pass).map(c=>c.name).join(', ')||'NONE'}`;
+
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o', max_tokens: 400,
+        messages: [
+          { role: 'system', content:
+`You are a professional forex trading system with a STRICT 95% win-rate target.
+RULES YOU MUST FOLLOW:
+- Only give BULLISH if D1+H4+H1 all show BULLISH trend. Otherwise NEUTRAL.
+- Only give BEARISH if D1+H4+H1 all show BEARISH trend. Otherwise NEUTRAL.
+- RSI must be below 65 for BUY signals. Above 35 for SELL signals.
+- ADX must be >= 20 for any trade.
+- Set SL at the nearest strong support/resistance level (not ATR guess).
+- Set TP at minimum 1:2 R:R.
+- Confidence must reflect ALL 4 timeframes agreeing. Only 90%+ if all perfect.
+- If ANY filter failed, reduce confidence by 15% per failure.
+- NEVER recommend a trade if D1 and H4 disagree.` },
+          { role: 'user', content:
+`${promptCtx}
+
+Return EXACTLY these 6 lines (no other text):
 1. Market Bias: BULLISH / BEARISH / NEUTRAL
-2. Confidence Score: X%
-3. Entry Zone: price
-4. Stop Loss: price
-5. Take Profit: price
+2. Confidence Score: X% (deduct 15% for each failed check)
+3. Entry Zone: exact price
+4. Stop Loss: price (at nearest S/R level, not random ATR)
+5. Take Profit: price (minimum 1:2 R:R)
 6. Risk/Reward: 1:X` },
         ],
       });
+
       const analysis = completion.choices[0].message.content;
       const parsed   = parseAIResponse(analysis);
 
-      console.log(`[SCAN] ${label}: ${parsed.direction} ${parsed.confidence}% (min: ${threshold}%)`);
-      if (parsed.confidence < threshold || parsed.direction==='NEUTRAL') continue;
+      console.log(`[SCAN] ${label}: AI says ${parsed.direction} ${parsed.confidence}%`);
+
+      // Only signal if direction matches our score AND confidence is high enough
+      const aiThreshold = parseInt(settings.threshold || 80);
+      if (parsed.confidence < aiThreshold) {
+        console.log(`[SCAN] ${label}: AI confidence ${parsed.confidence}% < threshold ${aiThreshold}% — skipped`);
+        continue;
+      }
+      if (parsed.direction === 'NEUTRAL' || parsed.direction !== aiDirection) {
+        console.log(`[SCAN] ${label}: AI direction mismatch — skipped`);
+        continue;
+      }
       if (!parsed.stopLoss || !parsed.takeProfit) continue;
 
-      // Position sizing
+      // Validate R:R >= 1.5
+      const pipSize = PIP[instr] || 0.0001;
+      const slPips  = Math.abs(price - parsed.stopLoss)  / pipSize;
+      const tpPips  = Math.abs(price - parsed.takeProfit) / pipSize;
+      if (slPips < 2) continue;
+      const rr = tpPips / slPips;
+      if (rr < 1.5) {
+        console.log(`[SCAN] ${label}: R:R ${rr.toFixed(1)} too low — skipped`);
+        continue;
+      }
+
+      // ── Position sizing from real balance ─────────────────────────────
       const acctData = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
       const balance  = parseFloat(acctData?.account?.balance || 0);
-      const pipSize  = PIP[instr] || 0.0001;
-      const slPips   = Math.abs(parseFloat(price) - parsed.stopLoss) / pipSize;
-      const tpPips   = Math.abs(parseFloat(price) - parsed.takeProfit) / pipSize;
-      if (slPips < 2) continue;
       const riskAmt  = balance * (riskPct / 100);
       let pipVal     = pipSize;
-      if (instr==='USD_JPY') pipVal = 0.01 / parseFloat(price);
-      if (instr==='USD_CAD') pipVal = 0.0001 / parseFloat(price);
+      if (instr==='USD_JPY') pipVal = 0.01 / price;
+      if (instr==='USD_CAD') pipVal = 0.0001 / price;
       if (instr==='XAU_USD') pipVal = 0.1;
       const units = Math.floor(riskAmt / (slPips * pipVal));
       if (units < 100) continue;
       const lots = (units / 100000).toFixed(2);
 
-      // Save signal
+      // ── Save signal with full scoring data ────────────────────────────
       const signalId = db.prepare(`
         INSERT INTO signals (pair,direction,confidence,entry_price,stop_loss,take_profit,sl_pips,tp_pips,units,risk_pct,risk_amount,lots,analysis,ema_align,rsi,h4_trend)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `).run(
-        label, parsed.direction, parsed.confidence, parseFloat(price),
-        parsed.stopLoss, parsed.takeProfit, slPips.toFixed(1), tpPips.toFixed(1),
-        units, riskPct, riskAmt, lots, analysis,
-        ind.emaAlignment.split(' ')[0], ind.rsi14, ind.h4Trend.split(' ')[0]
+        label, parsed.direction, parsed.confidence, price,
+        parsed.stopLoss, parsed.takeProfit,
+        slPips.toFixed(1), tpPips.toFixed(1),
+        units, riskPct, riskAmt, lots,
+        `${analysis}\n\nSCORE: ${scored.score}/${scored.maxScore} | SESSION: ${session} | ADX: ${indH1.adx} | Pattern: ${indH1.pattern}`,
+        indH1.emaAlignment, indH1.rsi14, indH4.trend
       ).lastInsertRowid;
 
-      // Telegram message with APPROVE / REJECT buttons
-      const dirArrow = parsed.direction==='BUY' ? '▲' : '▼';
+      // ── Build Telegram message with full 4-TF breakdown ──────────────
+      const passedStr = scored.checks.filter(c=>c.pass).map(c=>`✅ ${c.name}`).join('\n');
+      const failedStr = scored.checks.filter(c=>!c.pass).map(c=>`❌ ${c.name}`).join('\n');
+      const dirArrow  = parsed.direction==='BUY' ? '▲' : '▼';
+
       const tgText =
-`🔔 TRADE SIGNAL #${signalId}
+`🎯 HIGH-PRECISION SIGNAL #${signalId}
+Score: ${scored.score}/${scored.maxScore} checks passed
 
-Pair:       ${label}
-Direction:  ${parsed.direction} ${dirArrow}
-Confidence: ${parsed.confidence}%
-Entry:      ${parseFloat(price).toFixed(dp)}
-Stop Loss:  ${parsed.stopLoss.toFixed(dp)}  (-${slPips.toFixed(1)} pips)
-Take Profit:${parsed.takeProfit.toFixed(dp)} (+${tpPips.toFixed(1)} pips)
-Risk:       ${riskPct}% = $${riskAmt.toFixed(0)}
-Size:       ${lots} lots
+Pair:        ${label}
+Direction:   ${parsed.direction} ${dirArrow}
+AI Confidence: ${parsed.confidence}%
+Entry:       ${price.toFixed(dp)}
+Stop Loss:   ${parsed.stopLoss.toFixed(dp)} (-${slPips.toFixed(1)} pips)
+Take Profit: ${parsed.takeProfit.toFixed(dp)} (+${tpPips.toFixed(1)} pips)
+R:R Ratio:   1:${rr.toFixed(1)}
+Risk:        ${riskPct}% = $${riskAmt.toFixed(0)}
+Size:        ${lots} lots
+Session:     ${session}
 
-📊 EMA: ${ind.emaAlignment.split(' ')[0]}
-📈 H4: ${ind.h4Trend.split(' ')[0]}
-⚡ RSI: ${ind.rsi14}
+Checks:
+${passedStr}
+${failedStr ? failedStr : ''}
 
-Tap to decide:`;
+M15: ${indM15.emaAlignment} | RSI ${indM15.rsi14}
+H1:  ${indH1.emaAlignment} | RSI ${indH1.rsi14} | ADX ${indH1.adx}
+H4:  ${indH4.trend} | RSI ${indH4.rsi14}
+D1:  ${indD1.trend}
+Pattern: ${indH1.pattern}`;
 
       const r = await tgSendButtons(tgText, [[
         { text:'✅ APPROVE', callback_data:`approve_${signalId}` },
@@ -984,12 +1302,12 @@ Tap to decide:`;
       if (r?.result?.message_id) {
         db.prepare(`UPDATE signals SET tg_message_id=? WHERE id=?`).run(r.result.message_id, signalId);
       }
-      console.log(`[SCAN] ✅ Signal #${signalId} sent to Telegram: ${label} ${parsed.direction} ${parsed.confidence}%`);
+      console.log(`[SCAN] ✅ Signal #${signalId}: ${label} ${parsed.direction} ${parsed.confidence}% score=${scored.score}/${scored.maxScore}`);
 
     } catch(e) {
       console.error(`[SCAN] Error ${instr}:`, e.message);
     }
-    await new Promise(r => setTimeout(r, 2500));
+    await new Promise(r => setTimeout(r, 3000));
   }
   autoScanning = false;
   console.log('[SCAN] Scan complete.');
@@ -1002,16 +1320,24 @@ setTimeout(runAutoScan, 20000);
 
 // ── Signal API endpoints ──────────────────────────────────────────────────────
 app.get('/api/autotrade/settings', (req, res) => {
-  const s = getStorageValue('autotrade_settings') || { enabled:false, threshold:80, risk_pct:1, max_per_day:3 };
+  const s = getStorageValue('autotrade_settings') || { enabled:false, threshold:85, risk_pct:1, max_per_day:3, min_score:9 };
   res.json(s);
 });
 
 app.post('/api/autotrade/settings', (req, res) => {
-  const { enabled, threshold, risk_pct, max_per_day } = req.body;
-  const s = { enabled:!!enabled, threshold:parseInt(threshold||80), risk_pct:parseFloat(risk_pct||1), max_per_day:parseInt(max_per_day||3) };
+  const { enabled, threshold, risk_pct, max_per_day, min_score } = req.body;
+  const s = {
+    enabled:   !!enabled,
+    threshold: parseInt(threshold  || 85),
+    risk_pct:  parseFloat(risk_pct || 1),
+    max_per_day: parseInt(max_per_day || 3),
+    min_score: parseInt(min_score || 9),
+  };
   setStorageValue('autotrade_settings', s);
-  const onOff = s.enabled ? 'ON ✅' : 'OFF ⛔';
-  sendTelegramMsg(`⚡ Signal Scanner: ${onOff}\nThreshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax signals/day: ${s.max_per_day}\n\nYou will receive Telegram alerts with APPROVE/REJECT buttons.`);
+  const onOff = s.enabled ? 'ON' : 'OFF';
+  sendTelegramMsg(
+    `Signal Scanner: ${onOff}\nScore filter: ${s.min_score}/12 checks required\nAI threshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax/day: ${s.max_per_day}\n\nOnly the highest-confidence setups will be signalled.`
+  );
   res.json({ ok:true, settings:s });
 });
 

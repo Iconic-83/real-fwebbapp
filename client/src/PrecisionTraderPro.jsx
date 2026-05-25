@@ -316,7 +316,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
 
 // ─── SIGNAL ENGINE UI ─────────────────────────────────────────────────────────
 function AutoTradePanel() {
-  const [at,       setAt]       = useState({ enabled:false, threshold:80, risk_pct:1, max_per_day:3 });
+  const [at,       setAt]       = useState({ enabled:false, threshold:85, risk_pct:1, max_per_day:3, min_score:9 });
   const [signals,  setSignals]  = useState([]);
   const [status,   setStatus]   = useState(null);
   const [scanning, setScanning] = useState(false);
@@ -389,21 +389,29 @@ function AutoTradePanel() {
           </div>
         )}
 
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:9, marginBottom:12 }}>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:9, marginBottom:12 }}>
           <div>
-            <label style={S.lbl}>Min Confidence %</label>
+            <label style={S.lbl}>Min Score /12</label>
+            <input type="number" value={at.min_score} min="7" max="12"
+              onChange={e=>setAt(p=>({...p,min_score:parseInt(e.target.value)}))}
+              style={{ ...S.inp, color:"#ff88ff" }} />
+            <div style={{ fontSize:9, color:"#333", marginTop:2 }}>12-check filter</div>
+          </div>
+          <div>
+            <label style={S.lbl}>Min AI Conf %</label>
             <input type="number" value={at.threshold} min="50" max="99"
               onChange={e=>setAt(p=>({...p,threshold:parseInt(e.target.value)}))}
               style={{ ...S.inp, color:"#00ccff" }} />
+            <div style={{ fontSize:9, color:"#333", marginTop:2 }}>GPT-4o threshold</div>
           </div>
           <div>
-            <label style={S.lbl}>Risk per Signal %</label>
+            <label style={S.lbl}>Risk / Trade %</label>
             <input type="number" value={at.risk_pct} min="0.1" max="5" step="0.1"
               onChange={e=>setAt(p=>({...p,risk_pct:parseFloat(e.target.value)}))}
               style={{ ...S.inp, color:"#ffcc00" }} />
           </div>
           <div>
-            <label style={S.lbl}>Max Signals / Day</label>
+            <label style={S.lbl}>Max / Day</label>
             <input type="number" value={at.max_per_day} min="1" max="10"
               onChange={e=>setAt(p=>({...p,max_per_day:parseInt(e.target.value)}))}
               style={{ ...S.inp }} />

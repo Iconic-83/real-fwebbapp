@@ -9,8 +9,9 @@ const cors    = require('cors');
 const path    = require('path');
 const fs      = require('fs');
 const axios   = require('axios');
-const OpenAI  = require('openai');
-const db      = require('./db');
+const OpenAI    = require('openai');
+const Anthropic = require('@anthropic-ai/sdk');
+const db        = require('./db');
 
 const app    = express();
 const PORT   = process.env.PORT || 3001;
@@ -41,6 +42,7 @@ function getApiKeys() {
   const stored = getStorageValue('ptp_keys') || {};
   return {
     openai_key:    process.env.OPENAI_API_KEY    || stored.openai_key    || '',
+    claude_key:    process.env.ANTHROPIC_API_KEY  || stored.claude_key   || '',
     oanda_key:     process.env.OANDA_API_KEY      || stored.oanda_key     || '',
     oanda_account: process.env.OANDA_ACCOUNT_ID   || stored.oanda_account || '',
     twelve_key:    process.env.TWELVE_DATA_KEY    || stored.twelve_key    || '',
@@ -249,53 +251,53 @@ function buildIndicators(candles, refCandles = []) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 12-CHECK PRECISION SCORING ENGINE
-// Each check = 1 point. Signal only fires if score >= minScore (10+)
+// 12-CHECK PRECISION SCORING ENGINE — top-down: H4 → H2 → M30 → M5
+// Each check = 1 point. Signal only fires if score >= minScore
 // ═══════════════════════════════════════════════════════════════════
-function scoreSignal({ direction, price, m15, h1, h4, d1, newsEvents = [] }) {
+function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [] }) {
   const isBuy = direction === 'BUY';
   const checks = [];
 
   const pass = (name, cond, weight=1) => checks.push({ name, pass:!!cond, weight });
 
-  // ── CHECK 1: H1 EMA full stack alignment ─────────────────────────
-  pass('H1 EMA Stack',
-    isBuy ? (h1.ema9>h1.ema21 && h1.ema21>h1.ema50) :
-             (h1.ema9<h1.ema21 && h1.ema21<h1.ema50), 2);
+  // ── CHECK 1: H4 EMA full stack alignment (master timeframe) ──────
+  pass('H4 EMA Stack',
+    isBuy ? (h4.ema9>h4.ema21 && h4.ema21>h4.ema50) :
+             (h4.ema9<h4.ema21 && h4.ema21<h4.ema50), 2);
 
-  // ── CHECK 2: H4 trend agrees ──────────────────────────────────────
-  pass('H4 Trend Match',
+  // ── CHECK 2: H4 trend — master trend must agree ───────────────────
+  pass('H4 Master Trend',
     isBuy ? h4.trend==='BULLISH' : h4.trend==='BEARISH', 2);
 
-  // ── CHECK 3: D1 trend agrees (master trend) ───────────────────────
-  pass('D1 Master Trend',
-    isBuy ? d1.trend==='BULLISH' : d1.trend==='BEARISH', 2);
+  // ── CHECK 3: H2 trend agrees with H4 ─────────────────────────────
+  pass('H2 Trend Match',
+    isBuy ? h2.trend==='BULLISH' : h2.trend==='BEARISH', 2);
 
-  // ── CHECK 4: M15 EMA confirms (entry timing) ──────────────────────
-  pass('M15 EMA Confirms',
-    isBuy ? h1.ema9 > h1.ema21 : h1.ema9 < h1.ema21, 1);
+  // ── CHECK 4: M30 EMA confirms direction (entry prep) ─────────────
+  pass('M30 EMA Confirms',
+    isBuy ? m30.ema9 > m30.ema21 : m30.ema9 < m30.ema21, 1);
 
-  // ── CHECK 5: RSI in healthy zone (not over-extended) ─────────────
-  const rsi = h1.rsi14;
+  // ── CHECK 5: RSI on M30 in healthy zone (not over-extended) ──────
+  const rsi = m30.rsi14;
   pass('RSI Zone Safe',
     isBuy ? (rsi > 40 && rsi < 68) : (rsi > 32 && rsi < 60), 1);
 
-  // ── CHECK 6: RSI NOT overbought/oversold (entering wrong zone) ───
+  // ── CHECK 6: RSI on M30 NOT extreme ──────────────────────────────
   pass('RSI Not Extreme',
     isBuy ? rsi < 75 : rsi > 25, 1);
 
-  // ── CHECK 7: MACD confirms direction ─────────────────────────────
+  // ── CHECK 7: MACD on M30 confirms direction ───────────────────────
   pass('MACD Direction',
-    isBuy ? h1.macd > 0 : h1.macd < 0, 1);
+    isBuy ? m30.macd > 0 : m30.macd < 0, 1);
 
-  // ── CHECK 8: ADX shows trending market (not ranging) ─────────────
-  pass('ADX Trending', h1.adx >= 20, 1);
+  // ── CHECK 8: ADX on H4 shows trending market (not ranging) ───────
+  pass('ADX Trending', h4.adx >= 20, 1);
 
   // ── CHECK 9: Market session — London (7-12) or NY (12-17) UTC ────
   const utcHour = new Date().getUTCHours();
   pass('Prime Session', utcHour >= 7 && utcHour <= 17, 1);
 
-  // ── CHECK 10: Price relative to H4 EMA (not overextended) ────────
+  // ── CHECK 10: Price close to H4 EMA21 (not overextended) ─────────
   const h4Dist = Math.abs(price - h4.ema21) / price * 100;
   pass('Not Overextended H4', h4Dist < 0.8, 1); // within 0.8% of H4 EMA21
 
@@ -310,12 +312,12 @@ function scoreSignal({ direction, price, m15, h1, h4, d1, newsEvents = [] }) {
   });
   pass('No News Blackout', !hasNews, 2);
 
-  // ── CHECK 12: Candle pattern confirms direction ───────────────────
+  // ── CHECK 12: M5 candle pattern confirms direction (entry trigger) ─
   const bullishPatterns = ['BULLISH_PIN_BAR','BULLISH_ENGULFING','BULLISH_CANDLE'];
   const bearishPatterns = ['BEARISH_PIN_BAR','BEARISH_ENGULFING','BEARISH_CANDLE'];
-  pass('Candle Pattern',
-    isBuy ? bullishPatterns.includes(h1.pattern) :
-             bearishPatterns.includes(h1.pattern), 1);
+  pass('M5 Entry Pattern',
+    isBuy ? bullishPatterns.includes(m5.pattern) :
+             bearishPatterns.includes(m5.pattern), 1);
 
   const totalWeight  = checks.reduce((s,c) => s + c.weight, 0);
   const passedWeight = checks.reduce((s,c) => s + (c.pass ? c.weight : 0), 0);
@@ -324,6 +326,130 @@ function scoreSignal({ direction, price, m15, h1, h4, d1, newsEvents = [] }) {
   const pct          = Math.round(passedWeight / totalWeight * 100);
 
   return { score, maxScore, pct, checks };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PURE CALCULATION ENGINE — replaces AI API
+// Institutional-grade rule-based analysis: S/R, confidence, SL/TP
+// ═══════════════════════════════════════════════════════════════════
+function calcTradeSetup({ direction, price, h4, h2, m30, m5, scored, session }) {
+  const isBuy = direction === 'BUY';
+  const dp    = price > 100 ? 2 : 5;
+  const atr   = h4.atr14 || m30.atr14 || 0.001;
+
+  // ── CONFIDENCE CALCULATION ─────────────────────────────────────────
+  // Start from weighted score percentage
+  let conf = scored.pct;
+
+  // +8  all 3 main TFs trend-aligned
+  if (h4.trend === h2.trend && h2.trend === m30.trend &&
+      (isBuy ? h4.trend === 'BULLISH' : h4.trend === 'BEARISH')) conf += 8;
+
+  // +7  H4 ADX strong trend (> 25)
+  if (h4.adx >= 25) conf += 7;
+  // -12 ADX weak — ranging market
+  else if (h4.adx < 20) conf -= 12;
+
+  // +5  M30 RSI in the ideal entry zone (not overbought/oversold)
+  const rsi = m30.rsi14;
+  if (isBuy  && rsi >= 42 && rsi <= 60) conf += 5;
+  if (!isBuy && rsi >= 40 && rsi <= 58) conf += 5;
+
+  // +7  Price near H4 EMA21 — pullback entry (best timing)
+  const h4Dist = Math.abs(price - h4.ema21) / price * 100;
+  if (h4Dist < 0.25) conf += 7;      // very close to EMA — ideal
+  else if (h4Dist > 0.65) conf -= 6; // over-extended — penalty
+
+  // +8  H4 EMA200 confirms direction (only trade with the big trend)
+  if (h4.ema200) {
+    if ( isBuy && price > h4.ema200) conf += 8;
+    if (!isBuy && price < h4.ema200) conf += 8;
+    if ( isBuy && price < h4.ema200) conf -= 12; // against EMA200 — big penalty
+    if (!isBuy && price > h4.ema200) conf -= 12;
+  }
+
+  // +5  Strong M5 reversal pattern (entry trigger candle)
+  const m5BullPat = ['BULLISH_PIN_BAR','BULLISH_ENGULFING'];
+  const m5BearPat = ['BEARISH_PIN_BAR','BEARISH_ENGULFING'];
+  if ( isBuy && m5BullPat.includes(m5.pattern)) conf += 5;
+  if (!isBuy && m5BearPat.includes(m5.pattern)) conf += 5;
+
+  // +4  M30 MACD momentum agrees
+  if ( isBuy && m30.macd > 0) conf += 4;
+  if (!isBuy && m30.macd < 0) conf += 4;
+
+  // +3  H4 EMA stack fully aligned
+  const h4FullStack = isBuy
+    ? (h4.ema9 > h4.ema21 && h4.ema21 > h4.ema50 && h4.ema50 > h4.ema200)
+    : (h4.ema9 < h4.ema21 && h4.ema21 < h4.ema50 && h4.ema50 < h4.ema200);
+  if (h4FullStack) conf += 3;
+
+  // +3  H2 EMA9 agrees with direction
+  if ( isBuy && h2.ema9 > h2.ema21) conf += 3;
+  if (!isBuy && h2.ema9 < h2.ema21) conf += 3;
+
+  // Cap: never claim 100% (markets always have uncertainty)
+  conf = Math.min(95, Math.max(10, Math.round(conf)));
+
+  // ── STOP LOSS — at nearest H4 strong S/R ──────────────────────────
+  let stopLoss;
+  if (isBuy) {
+    // Below strong H4 support, +0.2 ATR buffer
+    const candidate = h4.strongSupport - (atr * 0.2);
+    const dist = price - candidate;
+    if (dist >= atr * 0.6 && dist <= atr * 3.0) {
+      stopLoss = candidate;
+    } else {
+      stopLoss = price - (atr * 1.6); // fallback: 1.6× ATR
+    }
+  } else {
+    // Above strong H4 resistance, +0.2 ATR buffer
+    const candidate = h4.strongResist + (atr * 0.2);
+    const dist = candidate - price;
+    if (dist >= atr * 0.6 && dist <= atr * 3.0) {
+      stopLoss = candidate;
+    } else {
+      stopLoss = price + (atr * 1.6);
+    }
+  }
+
+  // ── TAKE PROFIT — at H4 S/R or minimum 1:2.5 R:R ─────────────────
+  const slDist = Math.abs(price - stopLoss);
+  let takeProfit;
+  if (isBuy) {
+    const tpSR  = h4.resistance > price + slDist ? h4.resistance : null;
+    const tpRR  = price + slDist * 2.5;
+    // Use H4 resistance if it gives at least 1:2 R:R, else use 2.5× SL
+    takeProfit = (tpSR && tpSR - price >= slDist * 2) ? tpSR : tpRR;
+  } else {
+    const tpSR  = h4.support < price - slDist ? h4.support : null;
+    const tpRR  = price - slDist * 2.5;
+    takeProfit = (tpSR && price - tpSR >= slDist * 2) ? tpSR : tpRR;
+  }
+
+  stopLoss   = parseFloat(stopLoss.toFixed(dp));
+  takeProfit = parseFloat(takeProfit.toFixed(dp));
+  const rr   = Math.abs(price - takeProfit) / Math.abs(price - stopLoss);
+
+  // ── ANALYSIS TEXT ──────────────────────────────────────────────────
+  const tfAgree = h4.trend === h2.trend && h2.trend === m30.trend;
+  const analysis =
+`Market Bias: ${isBuy ? 'BULLISH' : 'BEARISH'}
+Confidence Score: ${conf}%
+Entry Zone: ${price.toFixed(dp)}
+Stop Loss: ${stopLoss.toFixed(dp)} (${isBuy ? 'below' : 'above'} H4 ${isBuy ? 'Support' : 'Resistance'} + ATR buffer)
+Take Profit: ${takeProfit.toFixed(dp)} (H4 ${isBuy ? 'Resistance' : 'Support'} level)
+Risk/Reward: 1:${rr.toFixed(1)}
+
+TIMEFRAME ANALYSIS:
+H4 (Master): ${h4.emaAlignment} | EMA9/21/50 ${h4FullStack ? 'FULLY STACKED ✓' : 'partial'} | ADX ${h4.adx} ${h4.adx>=25?'(STRONG)':h4.adx>=20?'(OK)':'(WEAK ⚠)'}
+H2 (Confirm): ${h2.trend} trend | RSI ${h2.rsi14} | EMA ${h2.ema9>h2.ema21?'bullish':'bearish'} cross
+M30 (Entry): ${m30.trend} | RSI ${rsi} | MACD ${m30.macd>0?'▲ positive':'▼ negative'} | ${m30.pattern}
+M5 (Trigger): ${m5.pattern} | RSI ${m5.rsi14}
+All timeframes aligned: ${tfAgree ? 'YES ✓' : 'PARTIAL'}
+Session: ${session} | Calc Engine v1 (rule-based)`;
+
+  return { direction, confidence: conf, stopLoss, takeProfit, rr, analysis };
 }
 
 // ── Market session name ──────────────────────────────────────────────────────
@@ -1096,7 +1222,7 @@ async function runAutoScan() {
   if (todaySent.c >= maxPerDay) return;
 
   const keys = getApiKeys();
-  if (!keys.oanda_key || !keys.oanda_account || !keys.openai_key) return;
+  if (!keys.oanda_key || !keys.oanda_account) return; // only OANDA needed now
 
   autoScanning = true;
   const session = getSession();
@@ -1119,41 +1245,41 @@ async function runAutoScan() {
       const price = parseFloat(priceCache[label] || 0);
       if (!price) continue;
 
-      // ── Fetch all 4 timeframes in parallel ─────────────────────────
-      const [m15r, h1r, h4r, d1r] = await Promise.allSettled([
-        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=M15&price=M`),
-        oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H1&price=M`),
-        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=H4&price=M`),
-        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=D&price=M`),
+      // ── Fetch all 4 timeframes in parallel: H4 → H2 → M30 → M5 ───
+      const [h4r, h2r, m30r, m5r] = await Promise.allSettled([
+        oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H4&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H2&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=M30&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=M5&price=M`),
       ]);
-      const m15c = m15r.status==='fulfilled' ? m15r.value?.candles||[] : [];
-      const h1c  = h1r.status==='fulfilled'  ? h1r.value?.candles||[]  : [];
       const h4c  = h4r.status==='fulfilled'  ? h4r.value?.candles||[]  : [];
-      const d1c  = d1r.status==='fulfilled'  ? d1r.value?.candles||[]  : [];
-      if (h1c.length < 26) continue;
+      const h2c  = h2r.status==='fulfilled'  ? h2r.value?.candles||[]  : [];
+      const m30c = m30r.status==='fulfilled' ? m30r.value?.candles||[] : [];
+      const m5c  = m5r.status==='fulfilled'  ? m5r.value?.candles||[]  : [];
+      if (h4c.length < 26) continue;
 
-      // ── Build indicators for each timeframe ─────────────────────────
-      const indM15 = buildIndicators(m15c.length>5 ? m15c : h1c.slice(-15), h1c);
-      const indH1  = buildIndicators(h1c, h4c);
-      const indH4  = buildIndicators(h4c.length>5 ? h4c : h1c, d1c);
-      const indD1  = buildIndicators(d1c.length>5 ? d1c : h4c, []);
+      // ── Build indicators for each timeframe (top-down) ───────────────
+      const indH4  = buildIndicators(h4c, []);
+      const indH2  = buildIndicators(h2c.length>5 ? h2c : h4c, h4c);
+      const indM30 = buildIndicators(m30c.length>5 ? m30c : h2c, h2c);
+      const indM5  = buildIndicators(m5c.length>5 ? m5c : m30c.slice(-15), m30c);
 
-      // Cache ATR for trailing stop monitor
-      h1AtrCache[instr] = indH1.atr14;
+      // Cache ATR (use M30 ATR for trailing stops — entry timeframe)
+      h1AtrCache[instr] = indM30.atr14;
 
-      // ── Determine AI direction from H1 EMA alignment ─────────────────
-      const aiDirection = indH1.emaAlignment === 'BULLISH' ? 'BUY'
-                        : indH1.emaAlignment === 'BEARISH' ? 'SELL'
+      // ── Determine direction from H4 EMA alignment (master TF) ────────
+      const aiDirection = indH4.emaAlignment === 'BULLISH' ? 'BUY'
+                        : indH4.emaAlignment === 'BEARISH' ? 'SELL'
                         : null;
       if (!aiDirection) {
-        console.log(`[SCAN] ${label}: EMA mixed — skipped`);
+        console.log(`[SCAN] ${label}: H4 EMA mixed — skipped`);
         continue;
       }
 
       // ── Run 12-check scoring engine ───────────────────────────────────
       const scored = scoreSignal({
         direction: aiDirection, price,
-        m15: indM15, h1: indH1, h4: indH4, d1: indD1,
+        h4: indH4, h2: indH2, m30: indM30, m5: indM5,
         newsEvents: currentNews,
       });
       console.log(`[SCAN] ${label}: ${aiDirection} score ${scored.score}/${scored.maxScore} (${scored.pct}%) — need ${minScore}`);
@@ -1165,66 +1291,26 @@ async function runAutoScan() {
         continue;
       }
 
-      // ── GPT-4o — precision prompt with ALL 4-timeframe data ──────────
+      // ── Pure calculation engine — no API, instant, deterministic ────
       const dp = instr==='XAU_USD' ? 2 : 5;
-      const openai = new OpenAI({ apiKey:keys.openai_key });
-
-      const promptCtx =
-`PAIR: ${label} | PRICE: ${price} | SESSION: ${session}
-SCORE: ${scored.score}/${scored.maxScore} checks passed
-
-M15: EMA9=${indM15.ema9.toFixed(dp)} EMA21=${indM15.ema21.toFixed(dp)} RSI=${indM15.rsi14} Pattern=${indM15.pattern}
-H1:  EMA9=${indH1.ema9.toFixed(dp)} EMA21=${indH1.ema21.toFixed(dp)} EMA50=${indH1.ema50.toFixed(dp)} RSI=${indH1.rsi14} MACD=${indH1.macd} ADX=${indH1.adx} ATR=${indH1.atr14.toFixed(dp)}
-H4:  EMA21=${indH4.ema21.toFixed(dp)} Trend=${indH4.trend} RSI=${indH4.rsi14}
-D1:  EMA21=${indD1.ema21.toFixed(dp)} Trend=${indD1.trend}
-H1 EMA Alignment: ${indH1.emaAlignment}
-H4 Trend: ${indH4.trend} | D1 Trend: ${indD1.trend}
-Support=${indH1.support.toFixed(dp)} Resistance=${indH1.resistance.toFixed(dp)}
-Strong Support=${indH1.strongSupport.toFixed(dp)} Strong Resistance=${indH1.strongResist.toFixed(dp)}
-Checks passed: ${scored.checks.filter(c=>c.pass).map(c=>c.name).join(', ')}
-Checks failed: ${scored.checks.filter(c=>!c.pass).map(c=>c.name).join(', ')||'NONE'}`;
-
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o', max_tokens: 400,
-        messages: [
-          { role: 'system', content:
-`You are a professional forex trading system with a STRICT 95% win-rate target.
-RULES YOU MUST FOLLOW:
-- Only give BULLISH if D1+H4+H1 all show BULLISH trend. Otherwise NEUTRAL.
-- Only give BEARISH if D1+H4+H1 all show BEARISH trend. Otherwise NEUTRAL.
-- RSI must be below 65 for BUY signals. Above 35 for SELL signals.
-- ADX must be >= 20 for any trade.
-- Set SL at the nearest strong support/resistance level (not ATR guess).
-- Set TP at minimum 1:2 R:R.
-- Confidence must reflect ALL 4 timeframes agreeing. Only 90%+ if all perfect.
-- If ANY filter failed, reduce confidence by 15% per failure.
-- NEVER recommend a trade if D1 and H4 disagree.` },
-          { role: 'user', content:
-`${promptCtx}
-
-Return EXACTLY these 6 lines (no other text):
-1. Market Bias: BULLISH / BEARISH / NEUTRAL
-2. Confidence Score: X% (deduct 15% for each failed check)
-3. Entry Zone: exact price
-4. Stop Loss: price (at nearest S/R level, not random ATR)
-5. Take Profit: price (minimum 1:2 R:R)
-6. Risk/Reward: 1:X` },
-        ],
+      const setup = calcTradeSetup({
+        direction: aiDirection, price,
+        h4: indH4, h2: indH2, m30: indM30, m5: indM5,
+        scored, session,
       });
+      const analysis = setup.analysis;
+      const parsed   = {
+        direction:  setup.direction,
+        confidence: setup.confidence,
+        stopLoss:   setup.stopLoss,
+        takeProfit: setup.takeProfit,
+      };
+      console.log(`[SCAN] ${label}: Calc Engine → ${parsed.direction} ${parsed.confidence}%`);
 
-      const analysis = completion.choices[0].message.content;
-      const parsed   = parseAIResponse(analysis);
-
-      console.log(`[SCAN] ${label}: AI says ${parsed.direction} ${parsed.confidence}%`);
-
-      // Only signal if direction matches our score AND confidence is high enough
+      // Only signal if confidence meets threshold
       const aiThreshold = parseInt(settings.threshold || 80);
       if (parsed.confidence < aiThreshold) {
-        console.log(`[SCAN] ${label}: AI confidence ${parsed.confidence}% < threshold ${aiThreshold}% — skipped`);
-        continue;
-      }
-      if (parsed.direction === 'NEUTRAL' || parsed.direction !== aiDirection) {
-        console.log(`[SCAN] ${label}: AI direction mismatch — skipped`);
+        console.log(`[SCAN] ${label}: Confidence ${parsed.confidence}% < threshold ${aiThreshold}% — skipped`);
         continue;
       }
       if (!parsed.stopLoss || !parsed.takeProfit) continue;
@@ -1261,8 +1347,8 @@ Return EXACTLY these 6 lines (no other text):
         parsed.stopLoss, parsed.takeProfit,
         slPips.toFixed(1), tpPips.toFixed(1),
         units, riskPct, riskAmt, lots,
-        `${analysis}\n\nSCORE: ${scored.score}/${scored.maxScore} | SESSION: ${session} | ADX: ${indH1.adx} | Pattern: ${indH1.pattern}`,
-        indH1.emaAlignment, indH1.rsi14, indH4.trend
+        `${analysis}\n\nSCORE: ${scored.score}/${scored.maxScore} | SESSION: ${session} | ADX(H4): ${indH4.adx} | M5 Pattern: ${indM5.pattern}`,
+        indH4.emaAlignment, indM30.rsi14, indH2.trend
       ).lastInsertRowid;
 
       // ── Build Telegram message with full 4-TF breakdown ──────────────
@@ -1289,11 +1375,10 @@ Checks:
 ${passedStr}
 ${failedStr ? failedStr : ''}
 
-M15: ${indM15.emaAlignment} | RSI ${indM15.rsi14}
-H1:  ${indH1.emaAlignment} | RSI ${indH1.rsi14} | ADX ${indH1.adx}
-H4:  ${indH4.trend} | RSI ${indH4.rsi14}
-D1:  ${indD1.trend}
-Pattern: ${indH1.pattern}`;
+H4 (Master):  ${indH4.emaAlignment} | RSI ${indH4.rsi14} | ADX ${indH4.adx}
+H2 (Confirm): ${indH2.trend} | RSI ${indH2.rsi14}
+M30 (Entry):  ${indM30.trend} | RSI ${indM30.rsi14} | MACD ${indM30.macd}
+M5 (Trigger): ${indM5.trend} | Pattern: ${indM5.pattern}`;
 
       const r = await tgSendButtons(tgText, [[
         { text:'✅ APPROVE', callback_data:`approve_${signalId}` },
@@ -1445,11 +1530,11 @@ app.get('/api/health', (req, res) => {
     price_source: priceSource,
     news_events:  newsCache.length,
     keys_configured: {
-      openai:   !!keys.openai_key,
       oanda:    !!keys.oanda_key,
       twelve:   !!keys.twelve_key,
       telegram: !!keys.tg_token,
     },
+    ai_engine: 'Rule-Based Calc Engine (no API needed)',
   });
 });
 

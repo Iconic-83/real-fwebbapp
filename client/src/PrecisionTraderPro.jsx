@@ -1571,11 +1571,16 @@ function Settings({ keys, setKeys, aiReady }) {
         ⚠ Keys are stored in the server database — secure and accessible from any device.
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
-        <div style={S.card}>
-          <div style={S.title}>OpenAI</div>
-          <label style={S.lbl}>API Key (GPT-4o)</label>
-          <input {...field("openai_key")} />
-          <div style={{ fontSize:10, color:"#2a2a4a", marginTop:5, lineHeight:1.6 }}>Required for AI market analysis. Get your key at platform.openai.com</div>
+        <div style={{ ...S.card, gridColumn:"1/-1", borderLeft:"3px solid #00ff88", background:"#001a0e" }}>
+          <div style={{ ...S.title, color:"#00ff88" }}>🧠 AI Engine — Rule-Based Calculation</div>
+          <div style={{ fontSize:12, color:"#aaa", lineHeight:1.7 }}>
+            No API key required. The scanner uses a built-in institutional-grade calculation engine:<br/>
+            • Multi-timeframe confluence (H4 → H2 → M30 → M5)<br/>
+            • Smart S/R level detection for SL/TP placement<br/>
+            • Weighted confidence scoring with 15+ market factors<br/>
+            • EMA stack, ADX strength, RSI zone, MACD momentum, pattern recognition<br/>
+            <span style={{ color:"#00ff88" }}>✓ Active — 100% calculation-based, zero latency, zero cost</span>
+          </div>
         </div>
         <div style={S.card}>
           <div style={S.title}>OANDA</div>
@@ -1602,7 +1607,7 @@ function Settings({ keys, setKeys, aiReady }) {
         <div style={S.card}>
           <div style={S.title}>Connection Status</div>
           {[
-            ["OpenAI GPT-4o",    !!local.openai_key],
+            ["AI Engine (built-in)", true],
             ["OANDA API Key",    !!local.oanda_key],
             ["OANDA Account ID", !!local.oanda_account],
             ["Twelve Data Key",  !!local.twelve_key],
@@ -1646,7 +1651,7 @@ export default function App() {
 
   const { account, trades, connected:oConn, refresh } = useOanda(keysLoaded ? keys : {});
   const { prices, prevPrices, connected:tConn }        = useTwelve(keysLoaded ? keys : {});
-  const aiReady = !!(keys.openai_key);
+  const aiReady = !!(keys.claude_key || keys.openai_key);
 
   useEffect(() => { const t = setInterval(() => setTime(new Date()), 1000); return () => clearInterval(t); }, []);
   useEffect(() => { if (oConn || tConn) setPage("dashboard"); }, [oConn, tConn]);

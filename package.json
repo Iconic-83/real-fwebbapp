@@ -7,7 +7,7 @@
     "dev": "concurrently \"npm run server\" \"npm run client\"",
     "server": "node server.js",
     "client": "cd client && npm run dev",
-    "build": "cd client && npm install && npm run build",
+    "build": "cd client && npm install && ./node_modules/.bin/vite build",
     "start": "node server.js",
     "install:all": "npm install && cd client && npm install"
   },

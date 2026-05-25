@@ -212,6 +212,20 @@ app.get('/api/news', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CURRENT PUBLIC URL  (reads from tunnel.sh output)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/url', (req, res) => {
+  const fs = require('fs');
+  const urlFile = path.join(__dirname, 'data', 'current-url.txt');
+  try {
+    const url = fs.readFileSync(urlFile, 'utf8').trim();
+    res.json({ url, active: true });
+  } catch {
+    res.json({ url: null, active: false, message: 'Tunnel URL not yet available' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HEALTH CHECK
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {

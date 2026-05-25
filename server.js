@@ -62,23 +62,92 @@ app.post('/api/storage/:key', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PRICES API  (Twelve Data proxy)
+// PRICES API  — Primary: OANDA (free, unlimited) | Fallback: Twelve Data
+// Server-side cache: polls every 5s, frontend gets instant response every time
 // ─────────────────────────────────────────────────────────────────────────────
-const PAIRS = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD','AUD/USD','USD/CAD'];
+const PAIRS      = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD','AUD/USD','USD/CAD'];
+const OANDA_INSTR = 'EUR_USD,GBP_USD,USD_JPY,XAU_USD,AUD_USD,USD_CAD';
 
-app.get('/api/prices', async (req, res) => {
+let priceCache     = {};   // { 'EUR/USD': '1.08450', ... }
+let priceCacheTime = 0;    // timestamp of last successful fetch
+let priceSource    = 'none';
+
+// Background price poller — runs every 5 seconds, uses OANDA first
+async function pollPrices() {
   const keys = getApiKeys();
-  if (!keys.twelve_key) return res.status(400).json({ error: 'Twelve Data key not configured' });
-  try {
-    const syms = PAIRS.join(',');
-    const r = await axios.get(
-      `https://api.twelvedata.com/price?symbol=${syms}&apikey=${keys.twelve_key}`,
-      { timeout: 10000 }
-    );
-    res.json(r.data);
-  } catch (e) {
-    res.status(502).json({ error: 'Twelve Data fetch failed: ' + e.message });
+
+  // ── Try OANDA pricing endpoint (free, real-time, no rate limit) ──────────
+  if (keys.oanda_key && keys.oanda_account) {
+    const bases = ['https://api-fxpractice.oanda.com', 'https://api-fxtrade.oanda.com'];
+    for (const base of bases) {
+      try {
+        const r = await axios.get(
+          `${base}/v3/accounts/${keys.oanda_account}/pricing?instruments=${OANDA_INSTR}`,
+          { headers: { Authorization: `Bearer ${keys.oanda_key}` }, timeout: 8000 }
+        );
+        if (r.data?.prices?.length > 0) {
+          const newCache = {};
+          r.data.prices.forEach(p => {
+            const sym = p.instrument.replace('_', '/');
+            const bid = parseFloat(p.bids?.[0]?.price || 0);
+            const ask = parseFloat(p.asks?.[0]?.price || 0);
+            if (bid && ask) newCache[sym] = ((bid + ask) / 2).toFixed(p.instrument === 'XAU_USD' ? 2 : 5);
+          });
+          if (Object.keys(newCache).length > 0) {
+            priceCache     = newCache;
+            priceCacheTime = Date.now();
+            priceSource    = 'OANDA';
+            return; // success — no need to try Twelve Data
+          }
+        }
+      } catch {}
+    }
   }
+
+  // ── Fallback: Twelve Data (800 calls/day — only used if OANDA fails) ─────
+  if (keys.twelve_key) {
+    try {
+      const syms = PAIRS.join(',');
+      const r = await axios.get(
+        `https://api.twelvedata.com/price?symbol=${syms}&apikey=${keys.twelve_key}`,
+        { timeout: 10000 }
+      );
+      if (r.data && !r.data.code) { // code present = error (e.g. 429)
+        const newCache = {};
+        PAIRS.forEach(p => { if (r.data[p]?.price) newCache[p] = r.data[p].price; });
+        if (Object.keys(newCache).length > 0) {
+          priceCache     = newCache;
+          priceCacheTime = Date.now();
+          priceSource    = 'TwelveData';
+        }
+      }
+    } catch {}
+  }
+}
+
+// Start polling immediately and every 5 seconds
+pollPrices();
+setInterval(pollPrices, 5000);
+
+// Price endpoint — instant response from cache (no rate limits hit per request)
+app.get('/api/prices', (req, res) => {
+  if (Object.keys(priceCache).length === 0) {
+    return res.status(503).json({ error: 'Prices not yet loaded. Configure OANDA or Twelve Data keys.' });
+  }
+  // Convert to Twelve Data format so frontend works unchanged
+  const out = {};
+  PAIRS.forEach(p => { if (priceCache[p]) out[p] = { price: priceCache[p] }; });
+  res.json(out);
+});
+
+// Price source info
+app.get('/api/prices/source', (req, res) => {
+  res.json({
+    source:    priceSource,
+    cached_at: priceCacheTime ? new Date(priceCacheTime).toISOString() : null,
+    age_ms:    priceCacheTime ? Date.now() - priceCacheTime : null,
+    pairs:     priceCache,
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

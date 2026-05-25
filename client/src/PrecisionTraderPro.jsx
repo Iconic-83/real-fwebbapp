@@ -70,6 +70,28 @@ async function sendTelegram(msg, keys) {
   });
 }
 
+async function getPositionSize(pair, entry, stopLoss, riskPct) {
+  const r = await fetch("/api/trade/size", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pair, entryPrice: entry, stopLossPrice: stopLoss, riskPercent: riskPct }),
+  });
+  return r.json();
+}
+
+async function getDailyStatus() {
+  const r = await fetch("/api/trade/daily");
+  return r.json();
+}
+
+async function recordPL(pl) {
+  await fetch("/api/trade/record", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pl }),
+  });
+}
+
 async function aiAnalyze(pairLabel, price, systemContext = "") {
   const r = await fetch("/api/ai/analyze", {
     method: "POST",
@@ -78,7 +100,7 @@ async function aiAnalyze(pairLabel, price, systemContext = "") {
   });
   const d = await r.json();
   if (d.error) throw new Error(d.error);
-  return d.analysis || "No analysis returned.";
+  return { analysis: d.analysis || "No analysis returned.", indicators: d.indicators || null };
 }
 
 async function fetchNewsCalendar() {
@@ -302,7 +324,37 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
   const [status, setStatus] = useState(null);
   const [closing, setClosing] = useState(null);
 
+  // Position Sizer state
+  const [riskPct, setRiskPct]   = useState("1");
+  const [sizeResult, setSizeResult] = useState(null);
+  const [sizing, setSizing]         = useState(false);
+
+  // Daily loss limit state
+  const [daily, setDaily] = useState(null);
+  useEffect(() => {
+    getDailyStatus().then(setDaily);
+    const t = setInterval(() => getDailyStatus().then(setDaily), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  const calcSize = async () => {
+    if (!sl) { alert("Enter a Stop Loss price first"); return; }
+    const livePrice = prices[pair];
+    if (!livePrice) { alert("No live price available"); return; }
+    setSizing(true); setSizeResult(null);
+    const res = await getPositionSize(PAIR_LABELS[pair], livePrice.toFixed(5), sl, riskPct);
+    setSizeResult(res);
+    if (res.recommendedUnits) setUnits(String(res.recommendedUnits));
+    setSizing(false);
+  };
+
   const execute = async () => {
+    // Check daily loss limit first
+    const d = await getDailyStatus();
+    if (d.limit_hit) {
+      setStatus({ ok:false, msg:`⛔ Daily loss limit reached (${d.used_percent}% used). Stop trading today.` });
+      return;
+    }
     if (!keys.oanda_key || !keys.oanda_account) { setStatus({ ok:false, msg:"OANDA keys not configured" }); return; }
     setStatus({ ok:null, msg:"Sending order to OANDA..." });
     const body = { order: { type:"MARKET", instrument:pair, units:dir==="BUY" ? units : `-${units}`, ...(sl?{stopLossOnFill:{price:sl}}:{}), ...(tp?{takeProfitOnFill:{price:tp}}:{}) } };
@@ -326,9 +378,14 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
     try {
       const r = await oandaFetch(`/v3/accounts/${keys.oanda_account}/trades/${id}/close`, { method:"PUT", body:"{}" });
       if (r.orderFillTransaction) {
-        const realized = r.orderFillTransaction.pl;
-        addAlert({ type:"CLOSE", icon:"🔒", title:"Trade Closed", detail:`Realized P&L: ${realized}`, color:"#00ccff" });
-        sendTelegram(`🔒 <b>TRADE CLOSED</b>\nRealized P&L: ${realized}`, keys);
+        const realized = parseFloat(r.orderFillTransaction.pl);
+        // Record P&L for daily limit tracking
+        await recordPL(realized);
+        getDailyStatus().then(setDaily);
+        addAlert({ type:"CLOSE", icon:"🔒", title:"Trade Closed", detail:`Realized P&L: ${realized >= 0 ? '+' : ''}${realized.toFixed(2)}`, color:"#00ccff" });
+        fetch("/api/telegram/send", { method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ message:`🔒 <b>TRADE CLOSED</b>\nP&L: ${realized >= 0 ? '+' : ''}${realized.toFixed(2)}\nPair: ${PAIR_LABELS[pair]}` })
+        });
         refresh();
       }
     } catch {}
@@ -368,9 +425,42 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
             <div><label style={S.lbl}>Stop Loss</label><input value={sl} onChange={e => setSl(e.target.value)} style={S.inp} placeholder="price" /></div>
             <div><label style={S.lbl}>Take Profit</label><input value={tp} onChange={e => setTp(e.target.value)} style={S.inp} placeholder="price" /></div>
           </div>
-          <button onClick={autofill} style={{ ...S.btn, width:"100%", marginBottom:11, padding:"6px 0", fontSize:10, color:"#555", background:"transparent", border:"1px solid #13132b", letterSpacing:2 }}>
+          <button onClick={autofill} style={{ ...S.btn, width:"100%", marginBottom:6, padding:"6px 0", fontSize:10, color:"#555", background:"transparent", border:"1px solid #13132b", letterSpacing:2 }}>
             AUTO-FILL SL/TP (20/40 pip)
           </button>
+          {/* Position Sizer — Risk % → Auto Units */}
+          <div style={{ display:"flex", gap:6, marginBottom:11, alignItems:"flex-end" }}>
+            <div style={{ flex:1 }}>
+              <label style={S.lbl}>Risk %</label>
+              <input value={riskPct} onChange={e => setRiskPct(e.target.value)} style={{ ...S.inp, color:"#ffcc00" }} type="number" step="0.1" min="0.1" max="5" placeholder="1" />
+            </div>
+            <button onClick={calcSize} disabled={sizing} style={{ ...S.btn, padding:"9px 12px", color:"#ffcc00", border:"1px solid #ffcc0044", background:"#1a1500", fontSize:10, letterSpacing:1, whiteSpace:"nowrap" }}>
+              {sizing ? "..." : "CALC SIZE"}
+            </button>
+          </div>
+          {sizeResult && !sizeResult.error && (
+            <div style={{ padding:"8px 10px", background:"#0d0d00", borderRadius:8, marginBottom:11, border:"1px solid #ffcc0022" }}>
+              <div style={{ fontSize:10, color:"#ffcc00", letterSpacing:2, marginBottom:5 }}>POSITION SIZE</div>
+              <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
+                <span style={{ color:"#555" }}>Units</span>
+                <span style={{ color:"#ffcc00", fontFamily:"monospace", fontWeight:800 }}>{sizeResult.recommendedUnits?.toLocaleString()}</span>
+              </div>
+              <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
+                <span style={{ color:"#555" }}>SL Pips</span>
+                <span style={{ color:"#bbb", fontFamily:"monospace" }}>{sizeResult.slPips}</span>
+              </div>
+              <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
+                <span style={{ color:"#555" }}>Risk $</span>
+                <span style={{ color:"#ff8844", fontFamily:"monospace" }}>{sizeResult.currency}{sizeResult.riskAmount}</span>
+              </div>
+              <div style={{ fontSize:10, color:"#2a2a4a", marginTop:4 }}>{sizeResult.note}</div>
+            </div>
+          )}
+          {sizeResult?.error && (
+            <div style={{ padding:"7px 10px", background:"#1a0808", borderRadius:8, marginBottom:11, fontSize:11, color:"#ff4466" }}>
+              {sizeResult.error}
+            </div>
+          )}
           {livePrice && (
             <div style={{ padding:"7px 11px", background:"#07071a", borderRadius:8, marginBottom:11, fontSize:12, display:"flex", justifyContent:"space-between" }}>
               <span style={{ color:"#333" }}>Live Price</span>
@@ -386,6 +476,40 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
             {dir} {PAIR_LABELS[pair]}
           </button>
         </div>
+        {/* Daily Loss Limit Panel */}
+        {daily && (
+          <div style={{ ...S.card, borderLeft:`3px solid ${daily.limit_hit?"#ff4466":parseFloat(daily.used_percent)>60?"#ffcc00":"#00ff88"}` }}>
+            <div style={S.title}>Daily Loss Limit (3% Rule)</div>
+            {daily.limit_hit && (
+              <div style={{ padding:"8px 10px", background:"#1a0808", borderRadius:7, marginBottom:10, fontSize:12, color:"#ff4466", fontWeight:700 }}>
+                ⛔ STOP TRADING — limit reached
+              </div>
+            )}
+            <div style={{ marginBottom:8 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
+                <span style={{ color:"#555" }}>Used</span>
+                <span style={{ color:daily.limit_hit?"#ff4466":parseFloat(daily.used_percent)>60?"#ffcc00":"#00ff88", fontFamily:"monospace" }}>
+                  {daily.used_percent}%
+                </span>
+              </div>
+              <div style={{ height:5, background:"#0d0d1e", borderRadius:3 }}>
+                <div style={{ height:"100%", width:`${Math.min(100, parseFloat(daily.used_percent))}%`, background:daily.limit_hit?"#ff4466":parseFloat(daily.used_percent)>60?"#ffcc00":"#00ff88", borderRadius:3, transition:"width 0.5s" }} />
+              </div>
+            </div>
+            {[
+              ["Today P&L",   `${parseFloat(daily.realized_pl)>=0?"+":""}${daily.realized_pl}`, parseFloat(daily.realized_pl)>=0?"#00ff88":"#ff4466"],
+              ["Max Loss",    daily.max_daily_loss, "#ff4466"],
+              ["Trades Today", daily.trade_count,   "#bbb"],
+              ["Status",      daily.safe_to_trade?"✓ SAFE TO TRADE":"⛔ STOP", daily.safe_to_trade?"#00ff88":"#ff4466"],
+            ].map(([l,v,c]) => (
+              <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
+                <span style={{ color:"#444" }}>{l}</span>
+                <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
         {account && (
           <div style={S.card}>
             <div style={S.title}>Account</div>
@@ -446,16 +570,30 @@ function Opportunities({ prices, keys, addAlert }) {
     const results = [];
     for (const pair of available) {
       try {
-        const text = await aiAnalyze(PAIR_LABELS[pair], prices[pair]);
+        const res  = await aiAnalyze(PAIR_LABELS[pair], prices[pair]);
+        const text = res.analysis;
         const bm   = text.match(/Market Bias:\s*(BULLISH|BEARISH|NEUTRAL)/i);
         const cm   = text.match(/Confidence Score:\s*(\d+)/i);
-        results.push({ pair, label:PAIR_LABELS[pair], price:prices[pair], bias:bm?.[1]?.toUpperCase()||"NEUTRAL", conf:cm?parseInt(cm[1]):70, analysis:text });
+        const slm  = text.match(/Stop Loss:\s*([0-9.]+)/i);
+        const tpm  = text.match(/Take Profit:\s*([0-9.]+)/i);
+        results.push({
+          pair, label:PAIR_LABELS[pair], price:prices[pair],
+          bias:bm?.[1]?.toUpperCase()||"NEUTRAL", conf:cm?parseInt(cm[1]):70,
+          analysis:text, indicators: res.indicators,
+          sl: slm?.[1], tp: tpm?.[1],
+        });
       } catch {}
     }
     setSignals(results);
     if (results.length > 0) {
       const top = [...results].sort((a, b) => b.conf - a.conf)[0];
-      sendTelegram(`🔍 <b>AI MARKET SCAN</b>\nTop Signal: ${top.label} ${top.bias}\nConfidence: ${top.conf}%\nPrice: ${top.price}`, keys);
+      const slLine = top.sl ? `SL: ${top.sl}` : '';
+      const tpLine = top.tp ? `TP: ${top.tp}` : '';
+      // Send to Telegram with full signal
+      fetch("/api/telegram/send", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ message: `🔍 <b>AI MARKET SCAN — PrecisionTraderPro</b>\n\n📊 Top Signal: <b>${top.label}</b>\n📈 Bias: <b>${top.bias}</b>\n🎯 Confidence: <b>${top.conf}%</b>\n💰 Price: ${top.price}\n${slLine ? `🛑 ${slLine}\n` : ''}${tpLine ? `✅ ${tpLine}\n` : ''}\nReal candle data used ✓` })
+      });
       addAlert({ type:"SCAN", icon:"◈", title:"AI Scan Complete", detail:`Best: ${top.label} ${top.bias} ${top.conf}%`, color:"#00ccff" });
     }
     setScanning(false);
@@ -800,18 +938,24 @@ function Alerts({ alerts, keys, priceAlerts, setPriceAlerts }) {
 
 // ─── AI INSIGHTS ─────────────────────────────────────────────────────────────
 function AIInsights({ prices }) {
-  const [pair, setPair]     = useState("EUR_USD");
+  const [pair, setPair]       = useState("EUR_USD");
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
-  const [error, setError]   = useState(null);
+  const [result, setResult]   = useState(null);
+  const [indicators, setIndicators] = useState(null);
+  const [error, setError]     = useState(null);
   const [history, setHistory] = useState([]);
 
   const analyze = async () => {
-    setLoading(true); setResult(null); setError(null);
+    setLoading(true); setResult(null); setIndicators(null); setError(null);
     try {
-      const text = await aiAnalyze(PAIR_LABELS[pair], prices[pair] || "unknown");
-      setResult(text);
-      setHistory(h => [{ pair:PAIR_LABELS[pair], price:prices[pair], text, time:new Date().toLocaleTimeString() }, ...h.slice(0, 4)]);
+      const res = await aiAnalyze(PAIR_LABELS[pair], prices[pair] || "unknown");
+      setResult(res.analysis);
+      setIndicators(res.indicators);
+      setHistory(h => [{
+        pair:PAIR_LABELS[pair], price:prices[pair],
+        text:res.analysis, indicators:res.indicators,
+        time:new Date().toLocaleTimeString()
+      }, ...h.slice(0, 4)]);
     } catch(e) { setError(e.message); }
     setLoading(false);
   };
@@ -821,8 +965,8 @@ function AIInsights({ prices }) {
     const m = text.match(new RegExp(`${label}:\\s*(.+)`, "i"));
     return m ? m[1].trim() : null;
   };
-  const bias  = result ? parseField(result, "Market Bias") : null;
-  const conf  = result ? parseField(result, "Confidence Score") : null;
+  const bias   = result ? parseField(result, "Market Bias") : null;
+  const conf   = result ? parseField(result, "Confidence Score") : null;
   const bColor = { BULLISH:"#00ff88", BEARISH:"#ff4466", NEUTRAL:"#ffcc00" };
 
   return (
@@ -845,7 +989,8 @@ function AIInsights({ prices }) {
             <div style={S.card}>
               <div style={S.title}>Recent Analyses</div>
               {history.map((h, i) => (
-                <div key={i} onClick={() => setResult(h.text)} style={{ cursor:"pointer", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
+                <div key={i} onClick={() => { setResult(h.text); setIndicators(h.indicators); }}
+                  style={{ cursor:"pointer", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
                   <div style={{ color:"#888", fontWeight:700 }}>{h.pair}</div>
                   <div style={{ color:"#2a2a4a", fontSize:10 }}>{h.time}</div>
                 </div>
@@ -853,34 +998,81 @@ function AIInsights({ prices }) {
             </div>
           )}
         </div>
-        <div style={S.card}>
-          {!result && !loading && !error && (
-            <div style={{ height:280, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#1a1a30" }}>
-              <div style={{ fontSize:44, marginBottom:12 }}>✦</div>
-              <div style={{ fontSize:13 }}>Select a pair and run AI analysis</div>
-            </div>
-          )}
-          {loading && (
-            <div style={{ height:280, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
-              <div style={{ color:"#00ccff", letterSpacing:3, fontSize:12, animation:"pulse 1s infinite" }}>GPT-4o PROCESSING...</div>
-              <div style={{ color:"#2a2a4a", marginTop:10, fontSize:12 }}>{PAIR_LABELS[pair]}</div>
-            </div>
-          )}
-          {error && (
-            <div style={{ padding:20, color:"#ff4466", fontSize:13, background:"#1a0808", borderRadius:8, margin:10 }}>
-              ⚠ {error}
-            </div>
-          )}
-          {result && (
-            <div>
-              <div style={{ display:"flex", gap:12, alignItems:"center", marginBottom:16, flexWrap:"wrap" }}>
-                <div style={{ fontSize:10, color:"#00ccff", letterSpacing:3 }}>✦ GPT-4o — {PAIR_LABELS[pair]}</div>
-                {bias && <span style={{ ...S.badge, color:bColor[bias.toUpperCase()]||"#aaa", background:`${bColor[bias.toUpperCase()]||"#aaa"}20`, border:`1px solid ${bColor[bias.toUpperCase()]||"#aaa"}33` }}>{bias.toUpperCase()}</span>}
-                {conf && <span style={{ fontSize:11, fontFamily:"monospace", color:"#ffcc00" }}>{conf}</span>}
+
+        <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
+          {/* Indicators Panel — shows real OANDA candle data used */}
+          {indicators && (
+            <div style={{ ...S.card, borderLeft:"3px solid #00ccff" }}>
+              <div style={S.title}>📊 Real OANDA Indicators (H1 — 50 candles)</div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"6px 16px" }}>
+                {[
+                  ["EMA 9",    indicators.ema9?.toFixed?.(5)   || indicators.ema9,  "#ffcc00"],
+                  ["EMA 21",   indicators.ema21?.toFixed?.(5)  || indicators.ema21, "#ffcc00"],
+                  ["EMA 50",   indicators.ema50?.toFixed?.(5)  || indicators.ema50, "#ffcc00"],
+                  ["RSI(14)",  indicators.rsi14, indicators.rsi14>70?"#ff4466":indicators.rsi14<30?"#00ff88":"#bbb"],
+                  ["ATR(14)",  indicators.atr14?.toFixed?.(5)  || indicators.atr14, "#bbb"],
+                  ["MACD",     indicators.macd,  indicators.macd>0?"#00ff88":"#ff4466"],
+                  ["Support",  indicators.support?.toFixed?.(5)||indicators.support,"#00ff88"],
+                  ["Resist.",  indicators.resistance?.toFixed?.(5)||indicators.resistance,"#ff4466"],
+                ].map(([label, val, color]) => (
+                  <div key={label} style={{ display:"flex", justifyContent:"space-between", padding:"4px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
+                    <span style={{ color:"#444" }}>{label}</span>
+                    <span style={{ color, fontFamily:"monospace", fontWeight:700 }}>{val}</span>
+                  </div>
+                ))}
               </div>
-              <div style={{ fontSize:13, color:"#bbb", lineHeight:1.9, whiteSpace:"pre-wrap", fontFamily:"monospace" }}>{result}</div>
+              <div style={{ marginTop:8, fontSize:10, padding:"5px 8px", background:"#07071a", borderRadius:6 }}>
+                <span style={{ color:"#00ccff" }}>H1: </span><span style={{ color:"#555" }}>{indicators.trend}</span>
+                <span style={{ color:"#00ccff", marginLeft:8 }}>H4: </span><span style={{ color:"#555" }}>{indicators.h4Trend}</span>
+              </div>
+              <div style={{ marginTop:4, fontSize:10, padding:"5px 8px", background:"#07071a", borderRadius:6, color:"#555" }}>
+                EMA: {indicators.emaAlignment}
+              </div>
+              {indicators.rsi14 > 70 && (
+                <div style={{ marginTop:6, padding:"5px 10px", background:"#330011", borderRadius:6, fontSize:11, color:"#ff4466" }}>
+                  ⚠ RSI {indicators.rsi14} — OVERBOUGHT. High risk of pullback.
+                </div>
+              )}
+              {indicators.rsi14 < 30 && (
+                <div style={{ marginTop:6, padding:"5px 10px", background:"#003311", borderRadius:6, fontSize:11, color:"#00ff88" }}>
+                  ⚠ RSI {indicators.rsi14} — OVERSOLD. Possible bounce zone.
+                </div>
+              )}
             </div>
           )}
+
+          <div style={S.card}>
+            {!result && !loading && !error && (
+              <div style={{ height:220, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#1a1a30" }}>
+                <div style={{ fontSize:44, marginBottom:12 }}>✦</div>
+                <div style={{ fontSize:12 }}>Analysis uses real 50-candle OANDA data</div>
+                <div style={{ fontSize:10, color:"#1a1a30", marginTop:6 }}>EMA, RSI, ATR, Support/Resistance all calculated live</div>
+              </div>
+            )}
+            {loading && (
+              <div style={{ height:220, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
+                <div style={{ color:"#00ccff", letterSpacing:3, fontSize:12, animation:"pulse 1s infinite" }}>FETCHING CANDLES + ANALYZING...</div>
+                <div style={{ color:"#2a2a4a", marginTop:10, fontSize:11 }}>50 H1 candles + 20 H4 candles from OANDA</div>
+                <div style={{ color:"#1a1a30", marginTop:4, fontSize:11 }}>{PAIR_LABELS[pair]}</div>
+              </div>
+            )}
+            {error && (
+              <div style={{ padding:20, color:"#ff4466", fontSize:13, background:"#1a0808", borderRadius:8, margin:10 }}>
+                ⚠ {error}
+              </div>
+            )}
+            {result && (
+              <div>
+                <div style={{ display:"flex", gap:10, alignItems:"center", marginBottom:14, flexWrap:"wrap" }}>
+                  <div style={{ fontSize:10, color:"#00ccff", letterSpacing:2 }}>✦ GPT-4o + Real Candles — {PAIR_LABELS[pair]}</div>
+                  {bias && <span style={{ ...S.badge, color:bColor[bias.toUpperCase()]||"#aaa", background:`${bColor[bias.toUpperCase()]||"#aaa"}20`, border:`1px solid ${bColor[bias.toUpperCase()]||"#aaa"}33` }}>{bias.toUpperCase()}</span>}
+                  {conf && <span style={{ fontSize:11, fontFamily:"monospace", color:"#ffcc00" }}>{conf}</span>}
+                  <span style={{ fontSize:9, color:"#2a2a4a", marginLeft:"auto" }}>based on real OANDA candles</span>
+                </div>
+                <div style={{ fontSize:12, color:"#bbb", lineHeight:2, whiteSpace:"pre-wrap", fontFamily:"monospace" }}>{result}</div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

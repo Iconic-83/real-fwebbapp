@@ -314,6 +314,136 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
   );
 }
 
+// ─── AUTO-TRADE ENGINE UI ─────────────────────────────────────────────────────
+function AutoTradePanel() {
+  const [at, setAt]       = useState({ enabled:false, threshold:80, risk_pct:1, max_per_day:3 });
+  const [log, setLog]     = useState([]);
+  const [status, setStatus] = useState(null);
+  const [scanning, setScanning] = useState(false);
+  const [atStatus, setAtStatus] = useState(null);
+
+  const load = async () => {
+    const s = await fetch("/api/autotrade/settings").then(r=>r.json()).catch(()=>null);
+    if (s) setAt(s);
+    const l = await fetch("/api/autotrade/log").then(r=>r.json()).catch(()=>[]);
+    setLog(l);
+    const st = await fetch("/api/autotrade/status").then(r=>r.json()).catch(()=>null);
+    if (st) setAtStatus(st);
+  };
+  useEffect(() => { load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, []);
+
+  const save = async (overrides = {}) => {
+    const updated = { ...at, ...overrides };
+    setAt(updated);
+    const r = await fetch("/api/autotrade/settings", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(updated),
+    }).then(res=>res.json());
+    setStatus(r.ok ? "✅ Settings saved" : "❌ " + r.error);
+    setTimeout(() => setStatus(null), 3000);
+    load();
+  };
+
+  const runScan = async () => {
+    setScanning(true);
+    await fetch("/api/autotrade/scan", { method:"POST" });
+    setTimeout(() => { setScanning(false); load(); }, 8000);
+  };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
+      {/* Engine toggle */}
+      <div style={{ ...S.card, borderLeft:`3px solid ${at.enabled?"#00ff88":"#333"}` }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+          <div style={S.title}>⚡ AUTO-TRADE ENGINE</div>
+          <button onClick={() => save({ enabled:!at.enabled })}
+            style={{ padding:"6px 18px", borderRadius:20, border:"none", cursor:"pointer", fontWeight:800, fontSize:11, letterSpacing:2,
+              background:at.enabled?"#003322":"#1a0808", color:at.enabled?"#00ff88":"#ff4466" }}>
+            {at.enabled ? "ON ●" : "OFF ○"}
+          </button>
+        </div>
+        {at.enabled && (
+          <div style={{ padding:"8px 12px", background:"#00150a", borderRadius:8, marginBottom:12, fontSize:11, color:"#00ff88" }}>
+            ⚡ ACTIVE — scanning all pairs every 5 minutes automatically
+          </div>
+        )}
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:12 }}>
+          <div>
+            <label style={S.lbl}>Min Confidence %</label>
+            <input type="number" value={at.threshold} min="50" max="99"
+              onChange={e => setAt(p=>({...p,threshold:parseInt(e.target.value)}))}
+              style={{ ...S.inp, color:"#00ccff" }} />
+            <div style={{ fontSize:9, color:"#333", marginTop:3 }}>Auto-execute only if AI ≥ this %</div>
+          </div>
+          <div>
+            <label style={S.lbl}>Risk per Trade %</label>
+            <input type="number" value={at.risk_pct} min="0.1" max="3" step="0.1"
+              onChange={e => setAt(p=>({...p,risk_pct:parseFloat(e.target.value)}))}
+              style={{ ...S.inp, color:"#ffcc00" }} />
+            <div style={{ fontSize:9, color:"#333", marginTop:3 }}>% of balance per auto-trade</div>
+          </div>
+        </div>
+        <div style={{ marginBottom:12 }}>
+          <label style={S.lbl}>Max Auto-Trades per Day</label>
+          <input type="number" value={at.max_per_day} min="1" max="10"
+            onChange={e => setAt(p=>({...p,max_per_day:parseInt(e.target.value)}))}
+            style={{ ...S.inp }} />
+        </div>
+        {status && <div style={{ fontSize:11, color:status.startsWith("✅")?"#00ff88":"#ff4466", marginBottom:8 }}>{status}</div>}
+        <div style={{ display:"flex", gap:8 }}>
+          <button onClick={() => save()} style={{ ...S.btn, flex:1, color:"#00ccff", border:"1px solid #00ccff44", background:"#001a2e" }}>
+            SAVE SETTINGS
+          </button>
+          <button onClick={runScan} disabled={scanning} style={{ ...S.btn, flex:1, color:"#ffcc00", border:"1px solid #ffcc0044", background:"#1a1500" }}>
+            {scanning ? "SCANNING..." : "▶ SCAN NOW"}
+          </button>
+        </div>
+        {atStatus && (
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:6, marginTop:12 }}>
+            {[
+              ["Today Trades", atStatus.today_trades + "/" + atStatus.max_per_day, "#bbb"],
+              ["Total Trades",  atStatus.total_trades, "#00ccff"],
+              ["Status", atStatus.scanning?"SCANNING":"IDLE", atStatus.scanning?"#ffcc00":"#333"],
+            ].map(([l,v,c]) => (
+              <div key={l} style={{ background:"#08081a", borderRadius:6, padding:"7px 9px", textAlign:"center" }}>
+                <div style={{ fontSize:9, color:"#333", letterSpacing:1, marginBottom:3 }}>{l}</div>
+                <div style={{ fontSize:14, fontFamily:"monospace", color:c, fontWeight:800 }}>{v}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Auto-trade log */}
+      <div style={S.card}>
+        <div style={S.title}>Auto-Trade History</div>
+        {log.length === 0 ? (
+          <div style={{ color:"#2a2a4a", fontSize:12, textAlign:"center", padding:"20px 0" }}>
+            No auto-trades yet. Enable the engine and it will trade automatically when AI finds ≥{at.threshold}% confidence setups.
+          </div>
+        ) : log.slice(0,15).map(t => (
+          <div key={t.id} style={{ padding:"10px 11px", background:"#08081a", borderRadius:8, marginBottom:7, border:"1px solid #0d0d1e" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+                <span style={{ fontWeight:800, color:"#ccc", fontSize:12 }}>{t.pair}</span>
+                <span style={{ ...S.badge, color:t.direction==="BUY"?"#00ff88":"#ff4466", background:t.direction==="BUY"?"#003322":"#330011" }}>{t.direction}</span>
+                <span style={{ ...S.badge, background:"#001a2e", color:"#00ccff" }}>{t.confidence}%</span>
+              </div>
+              <span style={{ fontSize:10, color:"#333", fontFamily:"monospace" }}>{t.timestamp?.slice(0,16)}</span>
+            </div>
+            <div style={{ fontSize:10, color:"#333", marginTop:5, display:"flex", gap:12 }}>
+              <span>Entry: <span style={{ color:"#555" }}>{t.entry_price?.toFixed(5)}</span></span>
+              <span>SL: <span style={{ color:"#ff446688" }}>{t.stop_loss?.toFixed(5)}</span></span>
+              <span>TP: <span style={{ color:"#00ff8888" }}>{t.take_profit?.toFixed(5)}</span></span>
+              <span style={{ marginLeft:"auto", color:t.status==="FILLED"?"#00ff88":"#ffcc00" }}>{t.status}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── LIVE TRADING ─────────────────────────────────────────────────────────────
 function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
   const [pair, setPair]     = useState("EUR_USD");
@@ -323,6 +453,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
   const [tp, setTp]         = useState("");
   const [status, setStatus] = useState(null);
   const [closing, setClosing] = useState(null);
+  const [tab, setTab]       = useState("manual"); // "manual" | "auto"
 
   // Position Sizer state
   const [riskPct, setRiskPct]   = useState("1");
@@ -404,7 +535,22 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
   };
 
   return (
-    <div style={{ display:"grid", gridTemplateColumns:"300px 1fr", gap:16 }}>
+    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      {/* Tab row */}
+      <div style={{ display:"flex", gap:8 }}>
+        {[["manual","📋 Manual Trade"],["auto","⚡ Auto-Trade Engine"]].map(([id,label]) => (
+          <button key={id} onClick={() => setTab(id)}
+            style={{ padding:"8px 18px", borderRadius:8, border:`1px solid ${tab===id?"#00ccff44":"#13132b"}`,
+              background:tab===id?"#001a2e":"transparent", color:tab===id?"#00ccff":"#333",
+              cursor:"pointer", fontWeight:800, fontSize:11, letterSpacing:2 }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "auto" && <AutoTradePanel />}
+      {tab === "manual" && (
+      <div style={{ display:"grid", gridTemplateColumns:"300px 1fr", gap:16 }}>
       <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
         <div style={S.card}>
           <div style={S.title}>New Order</div>
@@ -555,6 +701,8 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
           );
         })}
       </div>
+    </div>
+      )}
     </div>
   );
 }
@@ -1080,89 +1228,209 @@ function AIInsights({ prices }) {
 }
 
 // ─── ANALYTICS ────────────────────────────────────────────────────────────────
-function Analytics({ account, trades }) {
-  const pl = trades.reduce((s, t) => s + parseFloat(t.unrealizedPL || 0), 0);
-  const buys = trades.filter(t => parseFloat(t.currentUnits) > 0);
-  const sells = trades.filter(t => parseFloat(t.currentUnits) < 0);
-  const winners = trades.filter(t => parseFloat(t.unrealizedPL) > 0);
-  const losers  = trades.filter(t => parseFloat(t.unrealizedPL) < 0);
-  const winRate = trades.length ? Math.round(winners.length / trades.length * 100) : 0;
-  const avgWin  = winners.length ? winners.reduce((s, t) => s + parseFloat(t.unrealizedPL), 0) / winners.length : 0;
-  const avgLoss = losers.length  ? Math.abs(losers.reduce((s, t) => s + parseFloat(t.unrealizedPL), 0) / losers.length) : 0;
-  const rr = avgLoss > 0 ? (avgWin / avgLoss).toFixed(2) : "—";
+function Analytics({ account, trades: openTrades }) {
+  const [history, setHistory] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [daily,   setDaily]   = useState(null);
+  const [autoLog, setAutoLog] = useState([]);
 
-  const pairDist = {};
-  trades.forEach(t => { const k = PAIR_LABELS[t.instrument] || t.instrument; pairDist[k] = (pairDist[k] || 0) + 1; });
-  const maxCount = Math.max(...Object.values(pairDist), 1);
+  const load = async () => {
+    setLoading(true);
+    const [h, d, a] = await Promise.all([
+      fetch("/api/history?count=100").then(r => r.json()).catch(() => null),
+      fetch("/api/trade/daily").then(r => r.json()).catch(() => null),
+      fetch("/api/autotrade/log").then(r => r.json()).catch(() => []),
+    ]);
+    if (h && !h.error) setHistory(h);
+    if (d) setDaily(d);
+    setAutoLog(a || []);
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, []);
+
+  const st = history?.stats || {};
+  const wr = parseInt(st.win_rate || 0);
+
+  // P&L bar chart from last 20 trades
+  const plData = (history?.trades || []).slice(0, 20).reverse().map(t => t.pl);
+  const maxAbs = Math.max(...plData.map(Math.abs), 1);
+
+  // Pair stats from history
+  const pairStats = {};
+  (history?.trades || []).forEach(t => {
+    if (!pairStats[t.pair]) pairStats[t.pair] = { total:0, won:0, pl:0 };
+    pairStats[t.pair].total++;
+    if (t.pl > 0) pairStats[t.pair].won++;
+    pairStats[t.pair].pl += t.pl;
+  });
 
   return (
-    <div>
-      <div style={S.ph}>Analytics</div>
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:13, marginBottom:16 }}>
+    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div style={S.ph}>Trading Analytics</div>
+        <button onClick={load} style={{ ...S.btn, color:"#00ccff", border:"1px solid #00ccff44", background:"#001a2e", padding:"6px 14px" }}>
+          ↻ Refresh
+        </button>
+      </div>
+
+      {/* Top KPI row */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:11 }}>
         {[
-          { l:"Balance",    v:account ? `$${parseFloat(account.balance).toFixed(2)}` : "—", c:"#00ff88" },
-          { l:"Open P&L",   v:`${pl>=0?"+":""}$${pl.toFixed(2)}`, c:pl>=0?"#00ff88":"#ff4466" },
-          { l:"Open Trades",v:trades.length, c:"#ffcc00" },
-          { l:"Win Rate",   v:`${winRate}%`, c:winRate>=50?"#00ff88":"#ff4466" },
-          { l:"Avg Win",    v:winners.length ? `+$${avgWin.toFixed(2)}` : "—", c:"#00ff88" },
-          { l:"Avg Loss",   v:losers.length  ? `-$${avgLoss.toFixed(2)}` : "—", c:"#ff4466" },
+          { l:"Total Trades",  v: st.total || 0,                          c:"#ccc" },
+          { l:"Won ✅",         v: st.won   || 0,                          c:"#00ff88" },
+          { l:"Lost ❌",        v: st.lost  || 0,                          c:"#ff4466" },
+          { l:"Win Rate",      v: `${wr}%`,                                c: wr>=50?"#00ff88":"#ff4466" },
+          { l:"Total P&L",     v: st.total_pl ? `$${parseFloat(st.total_pl)>=0?"+":""}${st.total_pl}` : "—", c: parseFloat(st.total_pl||0)>=0?"#00ff88":"#ff4466" },
         ].map(k => (
           <div key={k.l} style={S.card}>
             <div style={S.title}>{k.l}</div>
-            <div style={{ fontSize:24, fontFamily:"monospace", color:k.c, fontWeight:800, marginTop:4 }}>{k.v}</div>
+            <div style={{ fontSize:22, fontFamily:"monospace", color:k.c, fontWeight:800, marginTop:4 }}>{k.v}</div>
           </div>
         ))}
       </div>
-      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:13 }}>
-        {account && (
-          <div style={S.card}>
-            <div style={S.title}>Account Details</div>
+
+      {/* Second row */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:11 }}>
+        {[
+          { l:"Avg Win",   v: st.avg_win  ? `+$${st.avg_win}`  : "—", c:"#00ff88" },
+          { l:"Avg Loss",  v: st.avg_loss ? `$${st.avg_loss}`  : "—", c:"#ff4466" },
+          { l:"R:R Ratio", v: st.rr || "—",                             c:"#ff88ff" },
+          { l:"Today P&L", v: daily ? `${parseFloat(daily.realized_pl)>=0?"+":""}$${daily.realized_pl}` : "—",
+                           c: parseFloat(daily?.realized_pl||0)>=0?"#00ff88":"#ff4466" },
+        ].map(k => (
+          <div key={k.l} style={S.card}>
+            <div style={S.title}>{k.l}</div>
+            <div style={{ fontSize:20, fontFamily:"monospace", color:k.c, fontWeight:800, marginTop:4 }}>{k.v}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* P&L bar chart + daily limit */}
+      <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr", gap:13 }}>
+        <div style={S.card}>
+          <div style={S.title}>P&L per Trade (last 20 closed)</div>
+          {plData.length === 0 && loading && <div style={{ color:"#2a2a4a", fontSize:12, padding:"20px 0", textAlign:"center" }}>Loading...</div>}
+          {plData.length === 0 && !loading && <div style={{ color:"#2a2a4a", fontSize:12, padding:"20px 0", textAlign:"center" }}>No closed trades yet</div>}
+          <div style={{ display:"flex", alignItems:"flex-end", gap:4, height:80, marginTop:10 }}>
+            {plData.map((pl, i) => {
+              const h = Math.max(4, Math.abs(pl / maxAbs) * 76);
+              const up = pl >= 0;
+              return (
+                <div key={i} title={`${up?"+":""}$${pl.toFixed(2)}`}
+                  style={{ flex:1, height:h, background:up?"#00ff8888":"#ff446688",
+                    borderRadius:up?"3px 3px 0 0":"0 0 3px 3px",
+                    alignSelf:up?"flex-end":"flex-start",
+                    border:`1px solid ${up?"#00ff8833":"#ff446633"}`,
+                    cursor:"pointer", transition:"opacity 0.2s" }} />
+              );
+            })}
+          </div>
+        </div>
+        {daily && (
+          <div style={{ ...S.card, borderLeft:`3px solid ${daily.limit_hit?"#ff4466":parseFloat(daily.used_percent)>60?"#ffcc00":"#00ff88"}` }}>
+            <div style={S.title}>Daily Limit (3% Rule)</div>
+            <div style={{ height:6, background:"#0d0d1e", borderRadius:3, marginBottom:12, marginTop:6 }}>
+              <div style={{ height:"100%", width:`${Math.min(100, parseFloat(daily.used_percent))}%`,
+                background:daily.limit_hit?"#ff4466":parseFloat(daily.used_percent)>60?"#ffcc00":"#00ff88",
+                borderRadius:3, transition:"width 0.5s" }} />
+            </div>
             {[
-              ["Margin Available", `$${parseFloat(account.marginAvailable||0).toFixed(2)}`, "#00ccff"],
-              ["Margin Used",      `$${parseFloat(account.marginUsed||0).toFixed(2)}`,      "#ffcc00"],
-              ["Currency",         account.currency || "—",                                  "#aaa"],
-              ["R:R Ratio",        rr,                                                        "#ff88ff"],
-              ["Leverage",         account.marginRate ? `1:${Math.round(1/parseFloat(account.marginRate))}` : "—", "#00ff88"],
-              ["Account ID",       account.id?.slice(-8) || "—",                              "#555"],
-            ].map(([l, v, c]) => (
-              <div key={l} style={{ padding:"10px", background:"#07071a", borderRadius:8, marginBottom:7 }}>
-                <div style={{ fontSize:10, color:"#2a2a4a", textTransform:"uppercase", letterSpacing:2, marginBottom:5 }}>{l}</div>
-                <div style={{ color:c, fontFamily:"monospace", fontSize:15, fontWeight:700 }}>{v}</div>
+              ["Used",   `${daily.used_percent}%`, daily.limit_hit?"#ff4466":parseFloat(daily.used_percent)>60?"#ffcc00":"#00ff88"],
+              ["P&L",   `${parseFloat(daily.realized_pl)>=0?"+":""}$${daily.realized_pl}`, parseFloat(daily.realized_pl)>=0?"#00ff88":"#ff4466"],
+              ["Limit", `$${daily.max_daily_loss}`, "#ff4466"],
+              ["Trades", daily.trade_count, "#bbb"],
+              ["Safe",  daily.safe_to_trade?"YES":"STOP", daily.safe_to_trade?"#00ff88":"#ff4466"],
+            ].map(([l,v,c]) => (
+              <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
+                <span style={{ color:"#444" }}>{l}</span>
+                <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
               </div>
             ))}
           </div>
         )}
+      </div>
+
+      {/* Pair breakdown */}
+      {Object.keys(pairStats).length > 0 && (
         <div style={S.card}>
-          <div style={S.title}>Trade Breakdown</div>
-          {[
-            ["Total Trades",  trades.length,                           "#ccc"],
-            ["BUY Trades",    buys.length,                             "#00ff88"],
-            ["SELL Trades",   sells.length,                            "#ff4466"],
-            ["Winning",       winners.length,                          "#00ff88"],
-            ["Losing",        losers.length,                           "#ff4466"],
-            ["Breakeven",     trades.length-winners.length-losers.length,"#555"],
-          ].map(([l, v, c]) => (
-            <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
-              <span style={{ color:"#333" }}>{l}</span>
-              <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
-            </div>
-          ))}
+          <div style={S.title}>Performance by Pair</div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10 }}>
+            {Object.entries(pairStats).map(([pair, ps]) => {
+              const pWr = Math.round(ps.won / ps.total * 100);
+              return (
+                <div key={pair} style={{ background:"#08081a", borderRadius:8, padding:"10px 12px", border:"1px solid #0d0d1e" }}>
+                  <div style={{ fontWeight:800, color:"#ccc", fontSize:12, marginBottom:7 }}>{pair}</div>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
+                    <span style={{ color:"#444" }}>Trades</span>
+                    <span style={{ color:"#bbb", fontFamily:"monospace" }}>{ps.total}</span>
+                  </div>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
+                    <span style={{ color:"#444" }}>Win Rate</span>
+                    <span style={{ color:pWr>=50?"#00ff88":"#ff4466", fontFamily:"monospace" }}>{pWr}%</span>
+                  </div>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:6 }}>
+                    <span style={{ color:"#444" }}>P&L</span>
+                    <span style={{ color:ps.pl>=0?"#00ff88":"#ff4466", fontFamily:"monospace", fontWeight:700 }}>
+                      {ps.pl>=0?"+":""}${ps.pl.toFixed(2)}
+                    </span>
+                  </div>
+                  <div style={{ height:3, background:"#0d0d1e", borderRadius:2 }}>
+                    <div style={{ height:"100%", width:`${pWr}%`, background:pWr>=50?"#00ff88":"#ff4466", borderRadius:2 }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
-        <div style={S.card}>
-          <div style={S.title}>Pair Distribution</div>
-          {Object.keys(pairDist).length === 0 && <div style={{ color:"#2a2a4a", fontSize:12, marginTop:20, textAlign:"center" }}>No trade data</div>}
-          {Object.entries(pairDist).map(([pair, count]) => (
-            <div key={pair} style={{ marginBottom:10 }}>
-              <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
-                <span style={{ color:"#888" }}>{pair}</span>
-                <span style={{ color:"#ccc", fontFamily:"monospace" }}>{count}</span>
+      )}
+
+      {/* Full closed trade history table */}
+      <div style={S.card}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+          <div style={S.title}>Closed Trade History ({history?.trades?.length || 0} trades)</div>
+          {autoLog.length > 0 && (
+            <span style={{ fontSize:10, color:"#00ccff", background:"#001a2e", padding:"3px 9px", borderRadius:12, border:"1px solid #00ccff33" }}>
+              ⚡ {autoLog.length} auto-trades
+            </span>
+          )}
+        </div>
+        {loading && <div style={{ color:"#2a2a4a", fontSize:12, padding:"20px", textAlign:"center" }}>Loading trade history...</div>}
+        {!loading && (!history?.trades || history.trades.length === 0) && (
+          <div style={{ color:"#2a2a4a", fontSize:12, padding:"20px", textAlign:"center" }}>
+            No closed trades found in your OANDA account
+          </div>
+        )}
+        {(history?.trades || []).map((t, i) => {
+          const isAuto = autoLog.some(a => Math.abs(a.entry_price - parseFloat(t.entryPrice)) < 0.0002 && a.pair === t.pair);
+          return (
+            <div key={t.id || i} style={{ padding:"10px 12px", background:i%2===0?"#07071a":"#08081a",
+              borderRadius:7, marginBottom:4, border:"1px solid #0d0d1e",
+              borderLeft:`3px solid ${t.pl>0?"#00ff88":t.pl<0?"#ff4466":"#333"}` }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4 }}>
+                <span style={{ fontWeight:800, color:"#ccc", fontSize:12, minWidth:50 }}>{t.pair}</span>
+                <span style={{ ...S.badge, color:t.direction==="BUY"?"#00ff88":"#ff4466",
+                  background:t.direction==="BUY"?"#003322":"#330011", fontSize:9 }}>{t.direction}</span>
+                {isAuto && <span style={{ ...S.badge, background:"#001a2e", color:"#00ccff", fontSize:9 }}>⚡AUTO</span>}
+                <span style={{ flex:1 }} />
+                <span style={{ fontFamily:"monospace", fontSize:13, fontWeight:800,
+                  color:t.pl>0?"#00ff88":t.pl<0?"#ff4466":"#555" }}>
+                  {t.pl>0?"+":""}${t.pl.toFixed(2)}
+                </span>
+                <span style={{ fontSize:10, color:t.pl>0?"#00ff8866":t.pl<0?"#ff446666":"#333", fontFamily:"monospace" }}>
+                  ({t.pips>0?"+":""}{t.pips} pips)
+                </span>
               </div>
-              <div style={{ height:4, background:"#0d0d1e", borderRadius:2 }}>
-                <div style={{ height:"100%", width:`${(count/maxCount)*100}%`, background:"#00ccff", borderRadius:2 }} />
+              <div style={{ display:"flex", gap:14, fontSize:10, color:"#333" }}>
+                <span>Entry: <span style={{ color:"#555" }}>{t.entryPrice}</span></span>
+                <span>Close: <span style={{ color:"#555" }}>{t.closePrice}</span></span>
+                <span>Units: <span style={{ color:"#555" }}>{t.units?.toLocaleString()}</span></span>
+                {t.sl && <span>SL: <span style={{ color:"#ff446688" }}>{t.sl}</span></span>}
+                {t.tp && <span>TP: <span style={{ color:"#00ff8888" }}>{t.tp}</span></span>}
+                <span style={{ marginLeft:"auto" }}>{t.closeTime}</span>
               </div>
             </div>
-          ))}
-        </div>
+          );
+        })}
       </div>
     </div>
   );

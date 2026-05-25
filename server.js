@@ -1,4 +1,9 @@
 require('dotenv').config();
+// Force IPv4 DNS — Telegram & some APIs fail on IPv6 in this environment
+const dns   = require('dns');
+const https = require('https');
+dns.setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const cors    = require('cors');
 const path    = require('path');
@@ -50,6 +55,12 @@ const LABEL_TO_OANDA = {
   'XAUUSD':'XAU_USD','AUDUSD':'AUD_USD','USDCAD':'USD_CAD',
   'EUR/USD':'EUR_USD','GBP/USD':'GBP_USD','USD/JPY':'USD_JPY',
   'XAU/USD':'XAU_USD','AUD/USD':'AUD_USD','USD/CAD':'USD_CAD',
+};
+
+// OANDA instrument → display label
+const PAIR_LABELS = {
+  EUR_USD:'EURUSD', GBP_USD:'GBPUSD', USD_JPY:'USDJPY',
+  XAU_USD:'XAUUSD', AUD_USD:'AUDUSD', USD_CAD:'USDCAD',
 };
 
 // Pip sizes
@@ -580,20 +591,336 @@ app.get('/api/news', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// TELEGRAM SIGNAL BROADCAST
-// Sends formatted signal to Telegram when AI finds high-confidence trade
+// TELEGRAM — Send alert + auto-detect chat ID
 // ═════════════════════════════════════════════════════════════════════════════
+// Send Telegram via native https (force IPv4 — axios IPv6 fails in this env)
+function sendTelegramMsg(text) {
+  const keys = getApiKeys();
+  if (!keys.tg_token || !keys.tg_chat) return Promise.resolve({ ok:false, error:'Telegram not configured' });
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ chat_id: keys.tg_chat, text });
+    const options = {
+      hostname: 'api.telegram.org',
+      path:     `/bot${keys.tg_token}/sendMessage`,
+      method:   'POST',
+      family:   4,           // ← force IPv4 (IPv6 blocked on this host)
+      timeout:  10000,
+      headers:  { 'Content-Type':'application/json', 'Content-Length': Buffer.byteLength(body) },
+    };
+    const req = https.request(options, (res) => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        try { const j = JSON.parse(d); resolve({ ok:!!j.ok, result:j }); }
+        catch { resolve({ ok:false, error: d }); }
+      });
+    });
+    req.on('error',   (e) => resolve({ ok:false, error:e.message }));
+    req.on('timeout', ()  => { req.destroy(); resolve({ ok:false, error:'timeout' }); });
+    req.write(body);
+    req.end();
+  });
+}
+
 app.post('/api/telegram/send', async (req, res) => {
   const { message } = req.body;
+  const r = await sendTelegramMsg(message);
+  if (!r.ok) return res.status(r.error==='Telegram not configured'?400:500).json({ error:r.error });
+  res.json({ ok:true });
+});
+
+// Auto-detect chat ID from getUpdates (call after user messages bot)
+app.post('/api/telegram/setup', async (req, res) => {
   const keys = getApiKeys();
-  if (!keys.tg_token || !keys.tg_chat) return res.status(400).json({ error:'Telegram not configured' });
+  if (!keys.tg_token) return res.status(400).json({ error:'Telegram token not set' });
   try {
-    await axios.post(`https://api.telegram.org/bot${keys.tg_token}/sendMessage`, {
-      chat_id: keys.tg_chat, text: message, parse_mode: 'HTML',
+    const r = await axios.get(`https://api.telegram.org/bot${keys.tg_token}/getUpdates?offset=-5`, { timeout:8000 });
+    const updates = r.data?.result || [];
+    if (!updates.length) return res.status(404).json({ error:'No messages yet — send a message to your bot first' });
+    const chatId = String(updates[updates.length-1].message?.chat?.id || updates[updates.length-1].channel_post?.chat?.id || '');
+    if (!chatId) return res.status(404).json({ error:'Could not find chat ID' });
+    // Save chat ID
+    const stored = getStorageValue('ptp_keys') || {};
+    stored.tg_chat = chatId;
+    setStorageValue('ptp_keys', stored);
+    // Send welcome message
+    await sendTelegramMsg('✅ PrecisionTraderPro\nTelegram alerts ACTIVE! You will receive trade signals here automatically.');
+    res.json({ ok:true, chat_id:chatId });
+  } catch(e) {
+    res.status(500).json({ error:e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AUTO-TRADE ENGINE ⚡
+// Scans all pairs every 5 min. If AI confidence >= threshold → auto-place order
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Create auto_trades log table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS auto_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    pair TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    confidence INTEGER NOT NULL,
+    units INTEGER NOT NULL,
+    entry_price REAL,
+    stop_loss REAL,
+    take_profit REAL,
+    oanda_order_id TEXT,
+    status TEXT DEFAULT 'PLACED',
+    pl REAL DEFAULT 0,
+    notes TEXT
+  );
+`);
+
+function parseAIResponse(analysis) {
+  const lines = analysis.split('\n').map(l => l.trim()).filter(Boolean);
+  const result = { direction:'NEUTRAL', confidence:0, stopLoss:null, takeProfit:null };
+  for (const line of lines) {
+    const lo = line.toLowerCase();
+    if (lo.includes('market bias')) {
+      if (line.toUpperCase().includes('BULLISH')) result.direction = 'BUY';
+      else if (line.toUpperCase().includes('BEARISH')) result.direction = 'SELL';
+      else result.direction = 'NEUTRAL';
+    }
+    if (lo.includes('confidence score')) {
+      const m = line.match(/(\d+)%/);
+      if (m) result.confidence = parseInt(m[1]);
+    }
+    if (lo.startsWith('4') && lo.includes('stop loss')) {
+      const m = line.match(/[\d]{1,4}\.[\d]{2,6}/g);
+      if (m) result.stopLoss = parseFloat(m[0]);
+    }
+    if (lo.startsWith('5') && lo.includes('take profit')) {
+      const m = line.match(/[\d]{1,4}\.[\d]{2,6}/g);
+      if (m) result.takeProfit = parseFloat(m[0]);
+    }
+  }
+  return result;
+}
+
+let autoScanning = false;
+
+async function runAutoScan() {
+  if (autoScanning) return; // prevent overlap
+  const settings = getStorageValue('autotrade_settings');
+  if (!settings?.enabled) return;
+
+  const threshold  = parseInt(settings.threshold  || 80);
+  const riskPct    = parseFloat(settings.risk_pct || 1);
+  const maxPerDay  = parseInt(settings.max_per_day || 3);
+  const todayLog   = getDailyPL();
+  if (todayLog.trade_count >= maxPerDay) return; // daily trade cap
+
+  const keys = getApiKeys();
+  if (!keys.oanda_key || !keys.oanda_account || !keys.openai_key) return;
+
+  autoScanning = true;
+  const scanPairs = ['EUR_USD','GBP_USD','USD_JPY','XAU_USD','AUD_USD','USD_CAD'];
+
+  for (const instr of scanPairs) {
+    try {
+      // Re-check daily cap per pair
+      const fresh = getDailyPL();
+      if (fresh.trade_count >= maxPerDay) break;
+
+      // Check daily loss limit
+      const acctData = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
+      const balance  = parseFloat(acctData?.account?.balance || 0);
+      const maxLoss  = balance * 0.03;
+      if (Math.abs(Math.min(0, fresh.realized_pl)) >= maxLoss && maxLoss > 0) {
+        await sendTelegramMsg(`⛔ Auto-Trade PAUSED\nDaily 3% loss limit reached. Trading stopped for today.`);
+        break;
+      }
+
+      const label = instr.replace('_', '/'); // EUR/USD
+      const price = priceCache[label];
+      if (!price) continue;
+
+      // Run AI analysis
+      const oandaInstr = instr;
+      let indicators = null, analysis = '';
+      const [h1Res, h4Res] = await Promise.allSettled([
+        oandaRequest(`/v3/instruments/${oandaInstr}/candles?count=50&granularity=H1&price=M`),
+        oandaRequest(`/v3/instruments/${oandaInstr}/candles?count=20&granularity=H4&price=M`),
+      ]);
+      const h1 = h1Res.status==='fulfilled' ? h1Res.value?.candles || [] : [];
+      const h4 = h4Res.status==='fulfilled' ? h4Res.value?.candles || [] : [];
+      if (h1.length < 10) continue;
+      indicators = buildIndicators(h1, h4);
+      const dp = instr === 'XAU_USD' ? 2 : 5;
+      const indCtx = `
+REAL OANDA DATA: ${label} @ ${price}
+EMA9=${indicators.ema9.toFixed(dp)} EMA21=${indicators.ema21.toFixed(dp)} EMA50=${indicators.ema50.toFixed(dp)}
+RSI14=${indicators.rsi14} ATR14=${indicators.atr14.toFixed(dp)} MACD=${indicators.macd}
+Trend: ${indicators.trend} | H4: ${indicators.h4Trend}
+Support=${indicators.support.toFixed(dp)} Resistance=${indicators.resistance.toFixed(dp)}`;
+
+      const openai = new OpenAI({ apiKey: keys.openai_key });
+      const completion = await openai.chat.completions.create({
+        model:'gpt-4o', max_tokens:500,
+        messages:[
+          { role:'system', content:'You are a forex analyst. Respond with EXACTLY 6 lines only. Be strict about risk.' },
+          { role:'user', content:`Analyze ${label} at ${price}.${indCtx}\n\nReturn EXACTLY:\n1. Market Bias: BULLISH / BEARISH / NEUTRAL\n2. Confidence Score: X%\n3. Entry Zone: price\n4. Stop Loss: price (ATR x1.5)\n5. Take Profit: price (1:2 RR)\n6. Risk/Reward: 1:X` },
+        ],
+      });
+      analysis = completion.choices[0].message.content;
+      const parsed = parseAIResponse(analysis);
+
+      console.log(`[AUTO] ${label}: ${parsed.direction} ${parsed.confidence}% (threshold: ${threshold}%)`);
+
+      if (parsed.confidence < threshold || parsed.direction === 'NEUTRAL') continue;
+      if (!parsed.stopLoss || !parsed.takeProfit) continue;
+
+      // Calculate position size
+      const pipSize = PIP[instr] || 0.0001;
+      const slPips  = Math.abs(parseFloat(price) - parsed.stopLoss) / pipSize;
+      if (slPips < 2) continue; // safety: reject if SL too tight
+      const riskAmt = balance * (riskPct / 100);
+      let pipValPerUnit = pipSize;
+      if (instr === 'USD_JPY') pipValPerUnit = 0.01 / parseFloat(price);
+      if (instr === 'USD_CAD') pipValPerUnit = 0.0001 / parseFloat(price);
+      if (instr === 'XAU_USD') pipValPerUnit = 0.1;
+      const units = Math.floor(riskAmt / (slPips * pipValPerUnit));
+      if (units < 100) continue;
+
+      const tradeUnits = parsed.direction === 'BUY' ? units : -units;
+
+      // Place OANDA market order
+      const orderBody = {
+        order: {
+          type: 'MARKET',
+          instrument: instr,
+          units: String(tradeUnits),
+          stopLossOnFill:   { price: parsed.stopLoss.toFixed(dp) },
+          takeProfitOnFill: { price: parsed.takeProfit.toFixed(dp) },
+        }
+      };
+      const orderResult = await oandaRequest(
+        `/v3/accounts/${keys.oanda_account}/orders`, 'POST', orderBody
+      );
+
+      const filled = orderResult?.orderFillTransaction;
+      const orderId = filled?.id || orderResult?.relatedTransactionIDs?.[0] || 'unknown';
+      const filledPrice = parseFloat(filled?.price || price);
+
+      // Log to SQLite
+      db.prepare(`
+        INSERT INTO auto_trades (pair, direction, confidence, units, entry_price, stop_loss, take_profit, oanda_order_id, status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(label, parsed.direction, parsed.confidence, Math.abs(tradeUnits), filledPrice,
+             parsed.stopLoss, parsed.takeProfit, orderId, filled ? 'FILLED' : 'SUBMITTED', analysis);
+
+      // Record in daily P&L counter
+      recordTradePL(0); // 0 P&L until trade closes
+
+      // Send Telegram alert
+      const tgMsg = `⚡ AUTO-TRADE EXECUTED
+Pair: ${label}
+Direction: ${parsed.direction}
+Confidence: ${parsed.confidence}%
+Entry: ${filledPrice.toFixed(dp)}
+Stop Loss: ${parsed.stopLoss.toFixed(dp)}
+Take Profit: ${parsed.takeProfit.toFixed(dp)}
+Size: ${Math.abs(tradeUnits).toLocaleString()} units (${riskPct}% risk)
+Status: ${filled ? 'FILLED' : 'SUBMITTED'}`;
+      await sendTelegramMsg(tgMsg);
+      console.log(`[AUTO] ✅ Trade placed: ${label} ${parsed.direction} ${Math.abs(tradeUnits)} units`);
+
+    } catch(e) {
+      console.error(`[AUTO] Error scanning ${instr}:`, e.message);
+    }
+    await new Promise(r => setTimeout(r, 2000)); // 2s gap between pairs
+  }
+  autoScanning = false;
+}
+
+// Auto-scan every 5 minutes
+setInterval(runAutoScan, 5 * 60 * 1000);
+// Also run once at startup if enabled
+setTimeout(runAutoScan, 15000);
+
+app.get('/api/autotrade/settings', (req, res) => {
+  const s = getStorageValue('autotrade_settings') || { enabled:false, threshold:80, risk_pct:1, max_per_day:3 };
+  res.json(s);
+});
+
+app.post('/api/autotrade/settings', (req, res) => {
+  const { enabled, threshold, risk_pct, max_per_day } = req.body;
+  const s = { enabled:!!enabled, threshold:parseInt(threshold||80), risk_pct:parseFloat(risk_pct||1), max_per_day:parseInt(max_per_day||3) };
+  setStorageValue('autotrade_settings', s);
+  if (enabled) {
+    sendTelegramMsg(`⚡ Auto-Trade Engine: ON\nConfidence threshold: ${s.threshold}%\nRisk per trade: ${s.risk_pct}%\nMax trades/day: ${s.max_per_day}`);
+  }
+  res.json({ ok:true, settings:s });
+});
+
+app.post('/api/autotrade/scan', async (req, res) => {
+  // Manual scan trigger
+  runAutoScan().catch(console.error);
+  res.json({ ok:true, msg:'Scan started' });
+});
+
+app.get('/api/autotrade/log', (req, res) => {
+  const rows = db.prepare('SELECT * FROM auto_trades ORDER BY timestamp DESC LIMIT 50').all();
+  res.json(rows);
+});
+
+app.get('/api/autotrade/status', (req, res) => {
+  const settings = getStorageValue('autotrade_settings') || { enabled:false };
+  const total = db.prepare('SELECT COUNT(*) as c FROM auto_trades').get();
+  const today = db.prepare("SELECT COUNT(*) as c FROM auto_trades WHERE date(timestamp)=date('now')").get();
+  res.json({ enabled:settings.enabled, threshold:settings.threshold||80, risk_pct:settings.risk_pct||1, max_per_day:settings.max_per_day||3, total_trades:total.c, today_trades:today.c, scanning:autoScanning });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRADE HISTORY — Closed trades from OANDA + auto-trade log
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/api/history', async (req, res) => {
+  const keys = getApiKeys();
+  if (!keys.oanda_key || !keys.oanda_account) return res.status(400).json({ error:'OANDA not configured' });
+  try {
+    const count = parseInt(req.query.count || 50);
+    const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=${count}`);
+    const trades = (r?.trades || []).map(t => ({
+      id:          t.id,
+      pair:        (PAIR_LABELS[t.instrument] || t.instrument),
+      direction:   parseFloat(t.initialUnits) > 0 ? 'BUY' : 'SELL',
+      units:       Math.abs(parseFloat(t.initialUnits)),
+      openTime:    t.openTime?.slice(0,16).replace('T',' '),
+      closeTime:   t.closeTime?.slice(0,16).replace('T',' '),
+      entryPrice:  parseFloat(t.price).toFixed(5),
+      closePrice:  parseFloat(t.averageClosePrice || t.price).toFixed(5),
+      pl:          parseFloat(t.realizedPL || 0),
+      pips:        null, // calculated below
+      sl:          t.stopLossOrder?.price || null,
+      tp:          t.takeProfitOrder?.price || null,
+    }));
+    // Calculate pip P&L
+    trades.forEach(t => {
+      const oInstr = Object.keys(PAIR_LABELS).find(k => PAIR_LABELS[k] === t.pair) || t.pair.replace('/','_');
+      const pipSize = PIP[oInstr] || 0.0001;
+      const priceDiff = Math.abs(parseFloat(t.closePrice) - parseFloat(t.entryPrice));
+      t.pips = (priceDiff / pipSize * (t.pl >= 0 ? 1 : -1)).toFixed(1);
     });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+
+    // Summary stats
+    const won     = trades.filter(t => t.pl > 0);
+    const lost    = trades.filter(t => t.pl < 0);
+    const be      = trades.filter(t => t.pl === 0);
+    const totalPL = trades.reduce((s, t) => s + t.pl, 0);
+    const winRate = trades.length ? Math.round(won.length / trades.length * 100) : 0;
+    const avgWin  = won.length  ? won.reduce((s,t) => s + t.pl, 0)  / won.length  : 0;
+    const avgLoss = lost.length ? lost.reduce((s,t) => s + t.pl, 0) / lost.length : 0;
+    const rr      = avgLoss < 0 ? Math.abs(avgWin / avgLoss).toFixed(2) : '—';
+
+    res.json({ trades, stats: { total:trades.length, won:won.length, lost:lost.length, be:be.length,
+      total_pl:totalPL.toFixed(2), win_rate:winRate, avg_win:avgWin.toFixed(2),
+      avg_loss:avgLoss.toFixed(2), rr } });
+  } catch(e) {
+    res.status(500).json({ error:e.message });
   }
 });
 

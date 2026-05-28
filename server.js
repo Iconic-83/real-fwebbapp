@@ -71,11 +71,20 @@ const PIP = {
   XAU_USD:0.1,   AUD_USD:0.0001, USD_CAD:0.0001,
 };
 
+// FIX 4 — OANDA latency telemetry
+let oandaLatencyLog = [];
+let oandaFailCount  = 0;
+function getOandaAvgLatency() {
+  if (!oandaLatencyLog.length) return 0;
+  return oandaLatencyLog.reduce((s, v) => s + v, 0) / oandaLatencyLog.length;
+}
+
 async function oandaRequest(path, method = 'GET', data = null) {
   const keys = getApiKeys();
   if (!keys.oanda_key) throw new Error('OANDA key not configured');
   const bases = ['https://api-fxpractice.oanda.com', 'https://api-fxtrade.oanda.com'];
   for (const base of bases) {
+    const t0 = Date.now();
     try {
       const r = await axios({
         method, url: base + path,
@@ -83,12 +92,16 @@ async function oandaRequest(path, method = 'GET', data = null) {
         headers: { Authorization: `Bearer ${keys.oanda_key}`, 'Content-Type': 'application/json' },
         timeout: 12000,
       });
+      const ms = Date.now() - t0;
+      oandaLatencyLog.push(ms);
+      if (oandaLatencyLog.length > 20) oandaLatencyLog.shift();
       return r.data;
     } catch (e) {
-      if (e.response) return e.response.data; // auth/logic error — return it
-      // network error — try next base
+      oandaFailCount++;
+      if (e.response) return e.response.data;
     }
   }
+  oandaFailCount++;
   throw new Error('OANDA unreachable');
 }
 
@@ -151,6 +164,57 @@ function calcADX(candles, period = 14) {
   const diSum   = diPlus + diMinus;
   if (!diSum) return 0;
   return parseFloat((Math.abs(diPlus - diMinus) / diSum * 100).toFixed(1));
+}
+
+// Spread acceptable? — reject if spread > 25% of ATR (thin market / news spike)
+function isSpreadAcceptable(pair, atr) {
+  const spread = spreadCache[pair];
+  if (!spread || !atr) return true; // no data → allow (fail open)
+  return (spread / atr) <= 0.25;
+}
+
+// ATR expanded? — true if recent ATR is > threshold × historical ATR
+// Detects volatility explosions that make trend systems unreliable
+function isATRExpanded(candles, threshold = 1.8) {
+  if (candles.length < 35) return false;
+  const recentATR  = calcATR(candles.slice(-14), 14);
+  const historicATR = calcATR(candles.slice(-35, -14), 14);
+  if (!historicATR || !recentATR) return false;
+  return (recentATR / historicATR) > threshold;
+}
+
+// FIX 1 — Only use completed candles (OANDA marks last candle complete:false)
+function completedCandles(candles) {
+  return candles.filter(c => c.complete !== false);
+}
+
+// FIX 5 — Friday/weekend position size factor
+function getTimeBasedSizeFactor() {
+  const now = new Date();
+  const day = now.getUTCDay(), h = now.getUTCHours();
+  if (day === 5 && h >= 20) return 0.5; // Friday close — gap risk
+  if (day === 1 && h < 2)  return 0.5; // Monday open — gap risk
+  if (day === 0 || day === 6) return 0; // Weekend — no trading
+  return 1.0;
+}
+
+// FIX 7 — Market gap detection (candle open gaps > 2× ATR = abnormal)
+function hasMarketGap(candles, atr) {
+  if (candles.length < 2 || !atr) return false;
+  const prev = candles[candles.length - 2];
+  const curr = candles[candles.length - 1];
+  const gap  = Math.abs(parseFloat(curr.mid.o) - parseFloat(prev.mid.c));
+  return gap > atr * 2.0;
+}
+
+// FIX 9 — Stale data feed tracker
+let priceLastChanged = {}, pricePrevCache = {};
+function isFeedStale(pair) {
+  const lastChange = priceLastChanged[pair];
+  if (!lastChange) return false;
+  const h = new Date().getUTCHours();
+  const isMarketHours = h >= 7 && h <= 20;
+  return isMarketHours && (Date.now() - lastChange) > 120000; // >2min unchanged
 }
 
 // Stochastic (for overbought/oversold confirmation)
@@ -239,10 +303,22 @@ function buildIndicators(candles, refCandles = []) {
 
   const pattern = detectPattern(candles);
 
+  // FIX 6 — EMA slope: how steeply EMA21 is moving (flat = fake trend)
+  const ema21Prev = closes.length >= 26
+    ? calcEMA(closes.slice(0, -5), 21) : ema21;
+  const emaSlope = closes.length > 0
+    ? (ema21 - ema21Prev) / closes[closes.length - 1] * 10000 : 0; // bps/bar
+
+  // MACD histogram slope (momentum weakening detection)
+  const macdPrev = closes.length >= 31
+    ? parseFloat((calcEMA(closes.slice(0,-3),12) - calcEMA(closes.slice(0,-3),26)).toFixed(6)) : macd;
+  const macdSlope = macd - macdPrev;
+
   return {
     ema9, ema21, ema50, ema200, rsi14, atr14, macd, adx, stoch,
     resistance, support, strongResist, strongSupport,
     trend, emaAlignment, refTrend, last5, pattern, momentum,
+    emaSlope, macdSlope,
     // Derived
     h4Trend: refTrend + ' (ref EMA21)',
     emaAlignmentFull: emaAlignment === 'BULLISH' ? 'BULLISH ALIGNMENT (EMA9>EMA21>EMA50)' :
@@ -308,7 +384,8 @@ function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [] }) {
     const [hh, mm] = (e.time || '99:99').split(':').map(Number);
     const eventMin = hh * 60 + mm;
     const nowMin   = nowUTC.getUTCHours() * 60 + nowUTC.getUTCMinutes();
-    return Math.abs(eventMin - nowMin) <= 45;
+    const diff     = nowMin - eventMin; // positive = event already passed
+    return diff >= -45 && diff <= 30;   // 45 min before, 30 min after
   });
   pass('No News Blackout', !hasNews, 2);
 
@@ -462,6 +539,202 @@ function getSession() {
   return 'OFF_HOURS';
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// RISK GOVERNORS — hard enforced limits before every execution
+// ═════════════════════════════════════════════════════════════════════════════
+
+// USD directional correlation groups (who profits when USD moves which way)
+const USD_CORR_GROUP = {
+  'USD/JPY': { BUY:'USD_LONG',  SELL:'USD_SHORT' },
+  'USD/CAD': { BUY:'USD_LONG',  SELL:'USD_SHORT' },
+  'EUR/USD': { BUY:'USD_SHORT', SELL:'USD_LONG'  },
+  'GBP/USD': { BUY:'USD_SHORT', SELL:'USD_LONG'  },
+  'AUD/USD': { BUY:'USD_SHORT', SELL:'USD_LONG'  },
+  // XAU/USD omitted — standalone asset, no USD correlation limit
+};
+
+function getWeeklyPL() {
+  const now = new Date();
+  const daysFromMonday = now.getUTCDay() === 0 ? 6 : now.getUTCDay() - 1;
+  const monday = new Date(now.getTime() - daysFromMonday * 86400000).toISOString().slice(0, 10);
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(realized_pl), 0) as total, COUNT(*) as cnt
+    FROM signals WHERE status='CLOSED' AND date(closed_at) >= ?
+  `).get(monday);
+  return { realized_pl: row?.total || 0, trade_count: row?.cnt || 0, week_start: monday };
+}
+
+function getConsecutiveLosses() {
+  const recent = db.prepare(`
+    SELECT realized_pl FROM signals WHERE status='CLOSED'
+    ORDER BY closed_at DESC LIMIT 10
+  `).all();
+  let count = 0;
+  for (const t of recent) {
+    if ((t.realized_pl || 0) < 0) count++;
+    else break;
+  }
+  return count;
+}
+
+function getCorrelatedOpenCount(pair, direction) {
+  const myGroup = USD_CORR_GROUP[pair]?.[direction];
+  if (!myGroup) return 0;
+  const open = db.prepare(
+    `SELECT pair, direction FROM signals WHERE status='EXECUTED' AND closed_at IS NULL`
+  ).all();
+  return open.filter(s => USD_CORR_GROUP[s.pair]?.[s.direction] === myGroup).length;
+}
+
+async function checkRiskGovernors(signal) {
+  const keys = getApiKeys();
+  const blocks = [];
+
+  // 1 — Daily loss limit (3%) + weekly loss limit (6%) — fetch balance once
+  try {
+    if (keys.oanda_key && keys.oanda_account) {
+      const acct    = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
+      const balance = parseFloat(acct?.account?.balance || 0);
+      if (balance > 0) {
+        const daily = getDailyPL();
+        if (daily.realized_pl < 0 && Math.abs(daily.realized_pl) >= balance * 0.03)
+          blocks.push(`Daily loss limit reached: ${daily.realized_pl.toFixed(2)} / -${(balance*0.03).toFixed(2)} (3%)`);
+
+        const weekly = getWeeklyPL();
+        if (weekly.realized_pl < 0 && Math.abs(weekly.realized_pl) >= balance * 0.06)
+          blocks.push(`Weekly loss limit reached: ${weekly.realized_pl.toFixed(2)} / -${(balance*0.06).toFixed(2)} (6%)`);
+      }
+    }
+  } catch {}
+
+  // 2 — Consecutive loss circuit breaker (≥3 losses = pause)
+  const consec = getConsecutiveLosses();
+  if (consec >= 3)
+    blocks.push(`${consec} consecutive losses — circuit breaker active. Review before resuming.`);
+
+  // 3 — Correlated exposure (max 2 same-direction USD trades open at once)
+  if (signal) {
+    const corrOpen = getCorrelatedOpenCount(signal.pair, signal.direction);
+    if (corrOpen >= 2)
+      blocks.push(`Correlated exposure: ${corrOpen} same-direction USD trades already open`);
+  }
+
+  // FIX 10 — Extended kill switches
+  // 4. 5 losing trades today regardless of streak
+  const todayLosses = db.prepare(`
+    SELECT COUNT(*) as c FROM signals WHERE status='CLOSED' AND realized_pl < 0 AND date(closed_at)=date('now')
+  `).get();
+  if (todayLosses.c >= 5)
+    blocks.push(`5 losing trades today — daily loss count kill switch`);
+
+  // 5. OANDA API instability
+  const avgLat = getOandaAvgLatency();
+  if (avgLat > 5000 && oandaLatencyLog.length >= 5)
+    blocks.push(`OANDA API unstable: avg latency ${avgLat.toFixed(0)}ms`);
+
+  // 6. Stale data feed
+  if (signal && isFeedStale(signal.pair))
+    blocks.push(`Data feed stale for ${signal.pair} — price unchanged >2min during market hours`);
+
+  if (blocks.length > 0) {
+    blocks.forEach(detail => {
+      db.prepare(`INSERT INTO risk_events (event_type, detail, blocked_pair, action) VALUES (?,?,?,?)`)
+        .run('GOVERNOR_BLOCK', detail, signal?.pair || null, 'BLOCKED_EXECUTION');
+    });
+  }
+
+  return { allowed: blocks.length === 0, reasons: blocks };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRADE RECONCILIATION — pull OANDA closed trades → update local outcomes
+// Runs every 2 minutes. Fills realized_pl, exit_reason, duration, pips.
+// ═════════════════════════════════════════════════════════════════════════════
+async function reconcileTrades() {
+  const keys = getApiKeys();
+  if (!keys.oanda_key || !keys.oanda_account) return;
+
+  const pending = db.prepare(
+    `SELECT * FROM signals WHERE status='EXECUTED' AND closed_at IS NULL AND trade_id IS NOT NULL`
+  ).all();
+  if (!pending.length) return;
+
+  try {
+    const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=50`);
+    const closed = r?.trades || [];
+    if (!closed.length) return;
+
+    for (const sig of pending) {
+      const oTrade = closed.find(t => t.id === sig.trade_id);
+      if (!oTrade) continue;
+
+      const oInstr     = LABEL_TO_OANDA[sig.pair] || sig.pair.replace('/', '_');
+      const pipSize    = PIP[oInstr] || 0.0001;
+      const dp         = oInstr === 'XAU_USD' ? 2 : 5;
+      const entry      = parseFloat(sig.entry_price);
+      const exitPx     = parseFloat(oTrade.averageClosePrice || oTrade.price);
+      const realizedPL = parseFloat(oTrade.realizedPL || 0);
+      const isBuy      = sig.direction === 'BUY';
+      const actualPips = ((isBuy ? exitPx - entry : entry - exitPx) / pipSize).toFixed(1);
+
+      let exitReason = 'MANUAL';
+      if (oTrade.stopLossOrder?.state   === 'FILLED') exitReason = 'SL_HIT';
+      if (oTrade.takeProfitOrder?.state === 'FILLED') exitReason = 'TP_HIT';
+
+      const openMs  = new Date(oTrade.openTime).getTime();
+      const closeMs = new Date(oTrade.closeTime).getTime();
+      const durMins = Math.round((closeMs - openMs) / 60000);
+
+      db.prepare(`
+        UPDATE signals SET
+          realized_pl=?, exit_price=?, exit_reason=?,
+          closed_at=?, duration_mins=?, actual_pips=?, status='CLOSED'
+        WHERE id=?
+      `).run(realizedPL, exitPx, exitReason, oTrade.closeTime, durMins, actualPips, sig.id);
+
+      // Update daily P&L tracker
+      recordTradePL(realizedPL);
+
+      console.log(`[RECONCILE] #${sig.id} ${sig.pair} ${sig.direction} → ${exitReason} | P&L: ${realizedPL >= 0 ? '+' : ''}${realizedPL.toFixed(2)} | ${actualPips} pips | ${durMins}m`);
+
+      const icon = realizedPL >= 0 ? '✅' : '❌';
+      const dur  = durMins < 60 ? `${durMins}m` : `${Math.round(durMins/60)}h`;
+      sendTelegramMsg(
+`${icon} TRADE CLOSED — Signal #${sig.id}
+${sig.pair} ${sig.direction}
+Exit: ${exitReason.replace(/_/g, ' ')} @ ${exitPx.toFixed(dp)}
+P&L: ${realizedPL >= 0 ? '+' : ''}${realizedPL.toFixed(2)}
+Pips: ${actualPips >= 0 ? '+' : ''}${actualPips}
+Duration: ${dur}`
+      ).catch(() => {});
+    }
+  } catch(e) {
+    console.error('[RECONCILE]', e.message);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DATABASE BACKUP — daily automatic copy, keep last 7
+// ═════════════════════════════════════════════════════════════════════════════
+function backupDatabase() {
+  const src     = path.join(__dirname, 'data', 'precisiontrader.db');
+  const backDir = path.join(__dirname, 'data', 'backups');
+  try {
+    if (!fs.existsSync(backDir)) fs.mkdirSync(backDir, { recursive: true });
+    const stamp = new Date().toISOString().slice(0, 10);
+    const dest  = path.join(backDir, `precisiontrader_${stamp}.db`);
+    fs.copyFileSync(src, dest);
+    // Keep newest 7, delete the rest
+    const files = fs.readdirSync(backDir).filter(f => f.endsWith('.db')).sort();
+    files.slice(0, Math.max(0, files.length - 7)).forEach(f =>
+      fs.unlinkSync(path.join(backDir, f))
+    );
+    console.log(`[BACKUP] DB saved → ${dest}`);
+  } catch(e) {
+    console.error('[BACKUP]', e.message);
+  }
+}
+
 // ── Trailing stop monitor — protects open profits ────────────────────────────
 async function runTrailingStops() {
   const keys = getApiKeys();
@@ -553,6 +826,7 @@ const PAIRS       = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD','AUD/USD','USD/CAD'
 const OANDA_INSTR = 'EUR_USD,GBP_USD,USD_JPY,XAU_USD,AUD_USD,USD_CAD';
 
 let priceCache = {}, priceCacheTime = 0, priceSource = 'none';
+let spreadCache = {}; // pair → live spread (ask - bid)
 
 async function pollPrices() {
   const keys = getApiKeys();
@@ -570,7 +844,13 @@ async function pollPrices() {
             const sym = p.instrument.replace('_','/');
             const bid = parseFloat(p.bids?.[0]?.price||0);
             const ask = parseFloat(p.asks?.[0]?.price||0);
-            if (bid && ask) m[sym] = ((bid+ask)/2).toFixed(p.instrument==='XAU_USD'?2:5);
+            if (bid && ask) {
+              const mid = ((bid+ask)/2).toFixed(p.instrument==='XAU_USD'?2:5);
+              m[sym] = mid;
+              spreadCache[sym] = parseFloat((ask - bid).toFixed(p.instrument==='XAU_USD'?2:5));
+              // FIX 9 — track when price last changed (stale feed detection)
+              if (priceCache[sym] !== mid) priceLastChanged[sym] = Date.now();
+            }
           });
           if (Object.keys(m).length > 0) { priceCache=m; priceCacheTime=Date.now(); priceSource='OANDA'; return; }
         }
@@ -1044,6 +1324,45 @@ db.exec(`
 // Keep old table for compat (ignore if already exists)
 db.exec(`CREATE TABLE IF NOT EXISTS auto_trades (id INTEGER PRIMARY KEY, timestamp DATETIME, pair TEXT, direction TEXT, confidence INTEGER, units INTEGER, entry_price REAL, stop_loss REAL, take_profit REAL, oanda_order_id TEXT, status TEXT, pl REAL, notes TEXT);`);
 
+// ── Execution fill quality log ────────────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS execution_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    signal_id       INTEGER,
+    pair            TEXT,
+    session         TEXT,
+    expected_px     REAL,
+    actual_px       REAL,
+    slippage_pips   REAL,
+    slippage_dir    TEXT,
+    spread_at_entry REAL,
+    latency_ms      INTEGER
+  );
+`);
+
+// ── Migrate signals table — add outcome columns if not present ───────────────
+[
+  'trade_id TEXT',        // OANDA trade ID (from fill tradeOpened.tradeID)
+  'exit_price REAL',      // actual close price
+  'exit_reason TEXT',     // SL_HIT | TP_HIT | MANUAL
+  'closed_at DATETIME',   // when trade was closed on OANDA
+  'duration_mins INTEGER',// how long trade was open
+  'actual_pips REAL',     // realized pip move
+].forEach(col => { try { db.exec(`ALTER TABLE signals ADD COLUMN ${col}`); } catch {} });
+
+// ── Risk events log — every governor block or circuit breaker fire ───────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS risk_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    event_type   TEXT NOT NULL,
+    detail       TEXT,
+    blocked_pair TEXT,
+    action       TEXT
+  );
+`);
+
 // ── Parse AI response ────────────────────────────────────────────────────────
 function parseAIResponse(analysis) {
   const lines = analysis.split('\n').map(l => l.trim()).filter(Boolean);
@@ -1105,6 +1424,26 @@ async function executeSignal(signal) {
   const keys = getApiKeys();
   const oandaInstr = LABEL_TO_OANDA[signal.pair] || signal.pair.replace('/','_');
   const dp = oandaInstr==='XAU_USD' ? 2 : 5;
+
+  // ── RISK GOVERNOR CHECK — hard block before execution ────────────────────
+  const gov = await checkRiskGovernors(signal);
+  if (!gov.allowed) {
+    db.prepare(`UPDATE signals SET status='BLOCKED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(signal.id);
+    const reasons = gov.reasons.join('\n• ');
+    const blockMsg =
+`⛔ EXECUTION BLOCKED — Signal #${signal.id}
+${signal.pair} ${signal.direction} ${signal.confidence}%
+
+Risk Governor:
+• ${reasons}
+
+Review your risk position before resuming.`;
+    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, blockMsg);
+    else await sendTelegramMsg(blockMsg);
+    console.log(`[GOVERNOR] ⛔ Blocked #${signal.id} ${signal.pair}: ${reasons}`);
+    return;
+  }
+
   try {
     const tradeUnits = signal.direction==='BUY' ? signal.units : -signal.units;
     const orderResult = await oandaRequest(`/v3/accounts/${keys.oanda_account}/orders`, 'POST', {
@@ -1116,11 +1455,25 @@ async function executeSignal(signal) {
     });
     const filled    = orderResult?.orderFillTransaction;
     const orderId   = filled?.id || 'unknown';
+    const tradeId   = filled?.tradeOpened?.tradeID || null;
     const filledPx  = parseFloat(filled?.price || signal.entry_price);
 
-    db.prepare(`UPDATE signals SET status='EXECUTED', oanda_order_id=?, filled_price=?, actioned_at=CURRENT_TIMESTAMP WHERE id=?`)
-      .run(orderId, filledPx, signal.id);
+    db.prepare(`UPDATE signals SET status='EXECUTED', oanda_order_id=?, trade_id=?, filled_price=?, actioned_at=CURRENT_TIMESTAMP WHERE id=?`)
+      .run(orderId, tradeId, filledPx, signal.id);
     recordTradePL(0);
+
+    // FIX 3 — Slippage tracking
+    const pipSize     = PIP[oandaInstr] || 0.0001;
+    const isBuy       = signal.direction === 'BUY';
+    const slippagePips = Math.abs(filledPx - signal.entry_price) / pipSize;
+    const slippageDir  = (isBuy ? filledPx > signal.entry_price : filledPx < signal.entry_price) ? 'NEGATIVE' : 'POSITIVE';
+    db.prepare(`INSERT INTO execution_log (signal_id, pair, session, expected_px, actual_px, slippage_pips, slippage_dir, spread_at_entry, latency_ms)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(
+      signal.id, signal.pair, getSession(),
+      signal.entry_price, filledPx, slippagePips, slippageDir,
+      spreadCache[signal.pair] || null, Math.round(getOandaAvgLatency())
+    );
+    if (slippagePips > 3) console.warn(`[SLIPPAGE] ${signal.pair} ${slippageDir} ${slippagePips.toFixed(1)} pips`);
 
     const msg =
 `✅ TRADE EXECUTED — Signal #${signal.id}
@@ -1150,7 +1503,7 @@ async function pollTgCallbacks() {
   const keys = getApiKeys();
   if (!keys.tg_token || !keys.tg_chat) return;
   return new Promise((resolve) => {
-    const qs = `offset=${tgOffset}&timeout=0&allowed_updates=%5B%22callback_query%22%5D`;
+    const qs = `offset=${tgOffset}&timeout=0&allowed_updates=%5B%22callback_query%22%2C%22message%22%5D`;
     const opts = {
       hostname:'api.telegram.org', method:'GET', family:4, timeout:12000,
       path:`/bot${keys.tg_token}/getUpdates?${qs}`,
@@ -1163,6 +1516,30 @@ async function pollTgCallbacks() {
           if (!data.ok || !data.result?.length) { resolve(); return; }
           for (const upd of data.result) {
             tgOffset = Math.max(tgOffset, upd.update_id+1);
+
+            // FIX 8 — Handle text commands from Telegram
+            const txtMsg = upd.message?.text?.trim().toUpperCase();
+            if (txtMsg === 'FLATTEN ALL' || txtMsg === 'EMERGENCY STOP') {
+              await sendTelegramMsg('🚨 Emergency command received. Flattening all positions...');
+              emergencyFlatten('Telegram command').catch(console.error);
+              continue;
+            }
+            if (txtMsg === 'STATUS') {
+              const daily  = getDailyPL();
+              const consec = getConsecutiveLosses();
+              const avgLat = getOandaAvgLatency();
+              const s = getStorageValue('autotrade_settings') || {};
+              await sendTelegramMsg(
+`📊 PrecisionTraderPro Status
+Scanner: ${s.enabled ? 'ON' : 'OFF'}
+Daily P&L: ${daily.realized_pl.toFixed(2)}
+Consecutive losses: ${consec}
+OANDA latency: ${avgLat.toFixed(0)}ms
+Price source: ${priceSource}`
+              );
+              continue;
+            }
+
             const cbq = upd.callback_query;
             if (!cbq?.data) continue;
             const parts    = cbq.data.split('_');
@@ -1245,27 +1622,68 @@ async function runAutoScan() {
       const price = parseFloat(priceCache[label] || 0);
       if (!price) continue;
 
-      // ── Fetch all 4 timeframes in parallel: H4 → H2 → M30 → M5 ───
-      const [h4r, h2r, m30r, m5r] = await Promise.allSettled([
+      // ── Fetch all 5 timeframes in parallel: W1 → H4 → H2 → M30 → M5 ──
+      const [w1r, h4r, h2r, m30r, m5r] = await Promise.allSettled([
+        oandaRequest(`/v3/instruments/${instr}/candles?count=30&granularity=W&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H4&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H2&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=M30&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=M5&price=M`),
       ]);
+      const w1c  = w1r.status==='fulfilled'  ? w1r.value?.candles||[]  : [];
       const h4c  = h4r.status==='fulfilled'  ? h4r.value?.candles||[]  : [];
       const h2c  = h2r.status==='fulfilled'  ? h2r.value?.candles||[]  : [];
       const m30c = m30r.status==='fulfilled' ? m30r.value?.candles||[] : [];
       const m5c  = m5r.status==='fulfilled'  ? m5r.value?.candles||[]  : [];
       if (h4c.length < 26) continue;
 
+      // FIX 1 — Only build indicators on COMPLETED candles
+      const h4cc  = completedCandles(h4c);
+      const h2cc  = completedCandles(h2c);
+      const m30cc = completedCandles(m30c);
+      const m5cc  = completedCandles(m5c);
+      if (h4cc.length < 26) continue;
+
+      // FIX 9 — Stale feed check before scanning this pair
+      if (isFeedStale(label)) {
+        console.log(`[SCAN] ${label}: Data feed stale — skipped`);
+        continue;
+      }
+
       // ── Build indicators for each timeframe (top-down) ───────────────
-      const indH4  = buildIndicators(h4c, []);
-      const indH2  = buildIndicators(h2c.length>5 ? h2c : h4c, h4c);
-      const indM30 = buildIndicators(m30c.length>5 ? m30c : h2c, h2c);
-      const indM5  = buildIndicators(m5c.length>5 ? m5c : m30c.slice(-15), m30c);
+      const indH4  = buildIndicators(h4cc, []);
+      const indH2  = buildIndicators(h2cc.length>5 ? h2cc : h4cc, h4cc);
+      const indM30 = buildIndicators(m30cc.length>5 ? m30cc : h2cc, h2cc);
+      const indM5  = buildIndicators(m5cc.length>5 ? m5cc : m30cc.slice(-15), m30cc);
 
       // Cache ATR (use M30 ATR for trailing stops — entry timeframe)
       h1AtrCache[instr] = indM30.atr14;
+
+      // ── FILTER 1: ATR expansion — reject during volatility explosions ─
+      if (isATRExpanded(h4cc, 1.8)) {
+        console.log(`[SCAN] ${label}: H4 ATR expanded (volatility spike) — skipped`);
+        continue;
+      }
+
+      // ── FILTER 2: Spread check — reject if spread > 25% of H4 ATR ───
+      if (!isSpreadAcceptable(label, indH4.atr14)) {
+        const sp = spreadCache[label]?.toFixed(5) || '?';
+        console.log(`[SCAN] ${label}: Spread ${sp} too wide vs ATR ${indH4.atr14.toFixed(5)} — skipped`);
+        continue;
+      }
+
+      // ── FIX 7: Market gap — abnormal candle open vs previous close ────
+      if (hasMarketGap(h4cc, indH4.atr14)) {
+        console.log(`[SCAN] ${label}: H4 market gap detected — skipped`);
+        continue;
+      }
+
+      // ── FIX 6: EMA slope — flat EMA = fake trend ─────────────────────
+      const emaSlope = Math.abs(indH4.emaSlope || 0);
+      if (emaSlope < 1.0) {
+        console.log(`[SCAN] ${label}: H4 EMA flat (slope ${emaSlope.toFixed(2)}) — skipped`);
+        continue;
+      }
 
       // ── Determine direction from H4 EMA alignment (master TF) ────────
       const aiDirection = indH4.emaAlignment === 'BULLISH' ? 'BUY'
@@ -1274,6 +1692,18 @@ async function runAutoScan() {
       if (!aiDirection) {
         console.log(`[SCAN] ${label}: H4 EMA mixed — skipped`);
         continue;
+      }
+
+      // ── FILTER 3: W1 trend — no counter-trend trades ──────────────────
+      if (w1c.length >= 5) {
+        const w1closes = w1c.map(c => parseFloat(c.mid.c));
+        const w1ema21  = calcEMA(w1closes, Math.min(21, w1closes.length));
+        const w1trend  = w1closes[w1closes.length - 1] > w1ema21 ? 'BULLISH' : 'BEARISH';
+        if ((aiDirection === 'BUY' && w1trend === 'BEARISH') ||
+            (aiDirection === 'SELL' && w1trend === 'BULLISH')) {
+          console.log(`[SCAN] ${label}: W1 ${w1trend} — counter-trend ${aiDirection} rejected`);
+          continue;
+        }
       }
 
       // ── Run 12-check scoring engine ───────────────────────────────────
@@ -1397,7 +1827,14 @@ Return EXACTLY 6 lines, no other text:
         continue;
       }
 
-      // ── Position sizing from real balance ─────────────────────────────
+      // ── FIX 2: Spread efficiency — SL must be ≥ 5× the spread ────────
+      const spreadPips = (spreadCache[label] || 0) / pipSize;
+      if (spreadPips > 0 && slPips / spreadPips < 5) {
+        console.log(`[SCAN] ${label}: Spread efficiency ${(slPips/spreadPips).toFixed(1)}x too low (min 5x) — skipped`);
+        continue;
+      }
+
+      // ── Position sizing — scaled down after losses ────────────────────
       const acctData = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
       const balance  = parseFloat(acctData?.account?.balance || 0);
       const riskAmt  = balance * (riskPct / 100);
@@ -1405,7 +1842,18 @@ Return EXACTLY 6 lines, no other text:
       if (instr==='USD_JPY') pipVal = 0.01 / price;
       if (instr==='USD_CAD') pipVal = 0.0001 / price;
       if (instr==='XAU_USD') pipVal = 0.1;
-      const units = Math.floor(riskAmt / (slPips * pipVal));
+
+      // Dynamic risk reduction: consecutive losses + Friday/weekend
+      const consecLoss   = getConsecutiveLosses();
+      const timeFactor   = getTimeBasedSizeFactor();
+      const lossFactor   = consecLoss === 1 ? 0.50 : consecLoss >= 2 ? 0.25 : 1.0;
+      const sizeFactor   = Math.min(lossFactor, timeFactor);
+      const sizeReasons  = [];
+      if (consecLoss > 0) sizeReasons.push(`${consecLoss} consec loss`);
+      if (timeFactor < 1) sizeReasons.push(`Friday/weekend`);
+      const sizeNote     = sizeFactor < 1 ? ` [REDUCED to ${(sizeFactor*100).toFixed(0)}% — ${sizeReasons.join(', ')}]` : '';
+
+      const units = Math.floor(riskAmt / (slPips * pipVal) * sizeFactor);
       if (units < 100) continue;
       const lots = (units / 100000).toFixed(2);
 
@@ -1438,8 +1886,8 @@ Entry:       ${price.toFixed(dp)}
 Stop Loss:   ${parsed.stopLoss.toFixed(dp)} (-${slPips.toFixed(1)} pips)
 Take Profit: ${parsed.takeProfit.toFixed(dp)} (+${tpPips.toFixed(1)} pips)
 R:R Ratio:   1:${rr.toFixed(1)}
-Risk:        ${riskPct}% = $${riskAmt.toFixed(0)}
-Size:        ${lots} lots
+Risk:        ${riskPct}% = $${riskAmt.toFixed(0)}${sizeNote}
+Size:        ${lots} lots${sizeFactor < 1 ? ` ⚠️ scaled ${sizeFactor*100}%` : ''}
 Session:     ${session}
 
 Checks:
@@ -1473,6 +1921,14 @@ M5 (Trigger): ${indM5.trend} | Pattern: ${indM5.pattern}`;
 setInterval(runAutoScan, 5 * 60 * 1000);
 // Run once 20s after startup if enabled
 setTimeout(runAutoScan, 20000);
+
+// Reconcile closed trades every 2 minutes
+setInterval(() => { reconcileTrades().catch(() => {}); }, 2 * 60 * 1000);
+setTimeout(() => { reconcileTrades().catch(() => {}); }, 15000); // initial run 15s after start
+
+// Daily DB backup on startup + every 24h
+backupDatabase();
+setInterval(backupDatabase, 24 * 60 * 60 * 1000);
 
 // ── Signal API endpoints ──────────────────────────────────────────────────────
 app.get('/api/autotrade/settings', (req, res) => {
@@ -1535,6 +1991,185 @@ app.post('/api/autotrade/reject/:id', (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// RISK STATUS API — live view of all governor states
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/api/risk/status', async (req, res) => {
+  const keys = getApiKeys();
+  let balance = 0;
+  try {
+    if (keys.oanda_key && keys.oanda_account) {
+      const d = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
+      balance = parseFloat(d?.account?.balance || 0);
+    }
+  } catch {}
+
+  const daily  = getDailyPL();
+  const weekly = getWeeklyPL();
+  const consec = getConsecutiveLosses();
+  const maxDaily  = balance > 0 ? balance * 0.03 : 0;
+  const maxWeekly = balance > 0 ? balance * 0.06 : 0;
+
+  // Open position correlation snapshot
+  const openSigs = db.prepare(`SELECT pair, direction FROM signals WHERE status='EXECUTED' AND closed_at IS NULL`).all();
+  const usdLong  = openSigs.filter(s => USD_CORR_GROUP[s.pair]?.[s.direction] === 'USD_LONG').length;
+  const usdShort = openSigs.filter(s => USD_CORR_GROUP[s.pair]?.[s.direction] === 'USD_SHORT').length;
+
+  const recentEvents = db.prepare(`SELECT * FROM risk_events ORDER BY created_at DESC LIMIT 10`).all();
+
+  res.json({
+    balance: balance.toFixed(2),
+    daily_loss: {
+      realized: daily.realized_pl.toFixed(2),
+      limit:    (-maxDaily).toFixed(2),
+      used_pct: maxDaily > 0 ? Math.abs(Math.min(0, daily.realized_pl) / maxDaily * 100).toFixed(1) : '0',
+      breached: maxDaily > 0 && daily.realized_pl < 0 && Math.abs(daily.realized_pl) >= maxDaily,
+    },
+    weekly_loss: {
+      realized:   weekly.realized_pl.toFixed(2),
+      limit:      (-maxWeekly).toFixed(2),
+      used_pct:   maxWeekly > 0 ? Math.abs(Math.min(0, weekly.realized_pl) / maxWeekly * 100).toFixed(1) : '0',
+      breached:   maxWeekly > 0 && weekly.realized_pl < 0 && Math.abs(weekly.realized_pl) >= maxWeekly,
+      week_start: weekly.week_start,
+    },
+    consecutive_losses: {
+      count:    consec,
+      breached: consec >= 3,
+    },
+    correlation: {
+      usd_long_open:  usdLong,
+      usd_short_open: usdShort,
+      limit: 2,
+      long_breached:  usdLong  >= 2,
+      short_breached: usdShort >= 2,
+    },
+    trading_allowed: maxDaily > 0
+      ? (daily.realized_pl >= 0 || Math.abs(daily.realized_pl) < maxDaily) && consec < 3
+      : consec < 3,
+    recent_events: recentEvents,
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRADE OUTCOMES API — reconciled results with expectancy stats
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/api/trade/outcomes', (req, res) => {
+  const closed = db.prepare(`SELECT * FROM signals WHERE status='CLOSED' ORDER BY closed_at DESC`).all();
+  const wins   = closed.filter(t => (t.realized_pl || 0) > 0);
+  const losses = closed.filter(t => (t.realized_pl || 0) < 0);
+
+  const avgWinPL  = wins.length   ? wins.reduce((s, t)   => s + t.realized_pl, 0) / wins.length   : 0;
+  const avgLossPL = losses.length ? losses.reduce((s, t) => s + t.realized_pl, 0) / losses.length : 0;
+  const winRate   = closed.length ? wins.length / closed.length : 0;
+  const expectancy = closed.length ? (winRate * avgWinPL) + ((1 - winRate) * avgLossPL) : null;
+
+  const avgWinPips  = wins.length   ? wins.reduce((s, t)   => s + parseFloat(t.actual_pips || 0), 0) / wins.length   : 0;
+  const avgLossPips = losses.length ? losses.reduce((s, t) => s + parseFloat(t.actual_pips || 0), 0) / losses.length : 0;
+  const realRR      = avgLossPips < 0 ? Math.abs(avgWinPips / avgLossPips).toFixed(2) : null;
+
+  // Max drawdown from equity curve
+  let peak = 0, maxDD = 0, cum = 0;
+  [...closed].reverse().forEach(t => {
+    cum += (t.realized_pl || 0);
+    if (cum > peak) peak = cum;
+    const dd = peak - cum;
+    if (dd > maxDD) maxDD = dd;
+  });
+
+  res.json({
+    trades: closed,
+    stats: {
+      total:        closed.length,
+      wins:         wins.length,
+      losses:       losses.length,
+      win_rate_pct: closed.length ? Math.round(winRate * 100) : null,
+      avg_win_pl:   avgWinPL.toFixed(2),
+      avg_loss_pl:  avgLossPL.toFixed(2),
+      expectancy_per_trade: expectancy !== null ? expectancy.toFixed(2) : null,
+      real_rr:      realRR,
+      total_pl:     closed.reduce((s, t) => s + (t.realized_pl || 0), 0).toFixed(2),
+      max_drawdown: maxDD.toFixed(2),
+      avg_duration_mins: closed.length
+        ? Math.round(closed.reduce((s, t) => s + (t.duration_mins || 0), 0) / closed.length)
+        : null,
+      consecutive_losses_now: getConsecutiveLosses(),
+    },
+    by_exit_reason: {
+      SL_HIT:  closed.filter(t => t.exit_reason === 'SL_HIT').length,
+      TP_HIT:  closed.filter(t => t.exit_reason === 'TP_HIT').length,
+      MANUAL:  closed.filter(t => t.exit_reason === 'MANUAL').length,
+    },
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FIX 8 — EMERGENCY FLATTEN-ALL + SAFE MODE
+// Closes all open OANDA positions, disables scanner, sends Telegram alert
+// Triggered via: POST /api/emergency/flatten  OR  Telegram message "FLATTEN ALL"
+// ═════════════════════════════════════════════════════════════════════════════
+async function emergencyFlatten(triggeredBy = 'API') {
+  const keys = getApiKeys();
+  console.error(`[EMERGENCY] Flatten-all triggered by: ${triggeredBy}`);
+
+  // 1. Disable scanner immediately
+  const settings = getStorageValue('autotrade_settings') || {};
+  settings.enabled = false;
+  setStorageValue('autotrade_settings', settings);
+
+  let closed = 0, errors = 0;
+  try {
+    const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/openTrades`);
+    const trades = r?.trades || [];
+
+    for (const trade of trades) {
+      try {
+        await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/close`, 'PUT');
+        closed++;
+        console.log(`[EMERGENCY] Closed trade ${trade.id} ${trade.instrument}`);
+      } catch(e) {
+        errors++;
+        console.error(`[EMERGENCY] Failed to close ${trade.id}:`, e.message);
+      }
+    }
+  } catch(e) {
+    console.error('[EMERGENCY] Could not fetch open trades:', e.message);
+  }
+
+  db.prepare(`INSERT INTO risk_events (event_type, detail, action) VALUES (?,?,?)`)
+    .run('EMERGENCY_FLATTEN', `Triggered by ${triggeredBy}. Closed ${closed} position(s).`, 'ALL_CLOSED_SAFE_MODE');
+
+  const msg =
+`🚨 EMERGENCY FLATTEN EXECUTED
+Triggered by: ${triggeredBy}
+Positions closed: ${closed}
+Errors: ${errors}
+Scanner: DISABLED
+
+System is in SAFE MODE.
+Review conditions before re-enabling.`;
+  await sendTelegramMsg(msg).catch(() => {});
+  return { closed, errors };
+}
+
+app.post('/api/emergency/flatten', async (req, res) => {
+  try {
+    const result = await emergencyFlatten('API');
+    res.json({ ok: true, ...result });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Trigger manual reconciliation
+app.post('/api/trade/reconcile', async (req, res) => {
+  try {
+    await reconcileTrades();
+    res.json({ ok: true, msg: 'Reconciliation complete — check /api/trade/outcomes' });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // TRADE HISTORY — Closed trades from OANDA + auto-trade log
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/api/history', async (req, res) => {
@@ -1584,6 +2219,343 @@ app.get('/api/history', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// BACKTEST ENGINE
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/api/backtest', async (req, res) => {
+  const keys = getApiKeys();
+  if (!keys.oanda_key) return res.status(400).json({ error: 'OANDA not configured' });
+
+  const { pair = 'EUR_USD', from, to, minScore = 9, direction = 'BOTH', minConf = 70 } = req.body;
+  const oInstr = pair.replace('/', '_');
+  const pip    = PIP[oInstr] || 0.0001;
+  const dp     = oInstr === 'XAU_USD' ? 2 : 5;
+
+  try {
+    const fromDt = new Date(from);
+    const toDt   = new Date(to);
+    if (isNaN(fromDt) || isNaN(toDt)) return res.status(400).json({ error: 'Invalid date range' });
+
+    // Fetch 14-day warmup before 'from' so indicators have enough history
+    const warmupFrom = new Date(fromDt.getTime() - 14 * 24 * 3600000).toISOString();
+    const toStr      = toDt.toISOString();
+
+    console.log(`[BACKTEST] ${oInstr} ${from} → ${to} | direction=${direction} minScore=${minScore}`);
+
+    const [h4r, h2r, m30r] = await Promise.all([
+      oandaRequest(`/v3/instruments/${oInstr}/candles?granularity=H4&from=${warmupFrom}&to=${toStr}&price=M`),
+      oandaRequest(`/v3/instruments/${oInstr}/candles?granularity=H2&from=${warmupFrom}&to=${toStr}&price=M`),
+      oandaRequest(`/v3/instruments/${oInstr}/candles?granularity=M30&from=${warmupFrom}&to=${toStr}&price=M`),
+    ]);
+
+    const h4All  = h4r?.candles  || [];
+    const h2All  = h2r?.candles  || [];
+    const m30All = m30r?.candles || [];
+
+    if (m30All.length < 30) return res.status(400).json({ error: 'Not enough candle data — try a longer date range' });
+
+    // Precompute timestamps as ms for fast filtering
+    const h4Times  = h4All.map(c  => new Date(c.time).getTime());
+    const h2Times  = h2All.map(c  => new Date(c.time).getTime());
+
+    const signals = [];
+    let skipUntil = 0;
+
+    for (let i = 50; i < m30All.length; i++) {
+      if (i < skipUntil) continue;
+
+      const barMs = new Date(m30All[i].time).getTime();
+      if (barMs < fromDt.getTime()) continue;  // still in warmup
+      if (barMs > toDt.getTime())  break;
+
+      // Slice indicators up to this bar time (walk-forward: no future data)
+      const h4End  = h4Times.findIndex(t => t > barMs);
+      const h2End  = h2Times.findIndex(t => t > barMs);
+      const h4Slice  = (h4End === -1 ? h4All : h4All.slice(0, h4End)).slice(-100);
+      const h2Slice  = (h2End === -1 ? h2All : h2All.slice(0, h2End)).slice(-100);
+      const m30Slice = m30All.slice(Math.max(0, i - 100), i + 1);
+
+      if (h4Slice.length < 26) continue;
+
+      const indH4  = buildIndicators(h4Slice, []);
+      const indH2  = buildIndicators(h2Slice.length > 5 ? h2Slice : h4Slice, h4Slice);
+      const indM30 = buildIndicators(m30Slice, h2Slice);
+
+      const price = parseFloat(m30All[i].mid.c);
+
+      // Determine direction
+      const autoDir = indH4.emaAlignment === 'BULLISH' ? 'BUY'
+                    : indH4.emaAlignment === 'BEARISH' ? 'SELL' : null;
+      const dir = direction === 'BOTH' ? autoDir
+                : direction === 'BUY'  ? (autoDir === 'BUY'  ? 'BUY'  : null)
+                :                        (autoDir === 'SELL' ? 'SELL' : null);
+      if (!dir) continue;
+
+      const utcHour = new Date(m30All[i].time).getUTCHours();
+      const session = utcHour >= 7 && utcHour < 12 ? 'LONDON'
+                    : utcHour >= 12 && utcHour < 17 ? 'NY'
+                    : utcHour >= 0  && utcHour < 7  ? 'ASIAN' : 'OFF_HOURS';
+
+      // Use M30 as M5 proxy (backtest: no M5 candles fetched for speed)
+      const indM5 = indM30;
+
+      const scored = scoreSignal({
+        direction: dir, price, h4: indH4, h2: indH2, m30: indM30, m5: indM5,
+        newsEvents: [],  // no historical news data
+      });
+
+      if (scored.score < minScore) continue;
+
+      const setup = calcTradeSetup({
+        direction: dir, price, h4: indH4, h2: indH2, m30: indM30, m5: indM5,
+        scored, session,
+      });
+
+      if (setup.confidence < minConf) continue;
+
+      // ── Simulate outcome on future M30 OHLC ──────────────────────────
+      const MAX_BARS = 96; // max 2 days forward
+      let result = 'TIMEOUT', exitPrice = price, exitBars = MAX_BARS;
+
+      for (let j = i + 1; j < Math.min(i + MAX_BARS + 1, m30All.length); j++) {
+        const hi = parseFloat(m30All[j].mid.h);
+        const lo = parseFloat(m30All[j].mid.l);
+        if (dir === 'BUY') {
+          if (lo <= setup.stopLoss)   { result = 'LOSS'; exitPrice = setup.stopLoss;   exitBars = j - i; break; }
+          if (hi >= setup.takeProfit) { result = 'WIN';  exitPrice = setup.takeProfit; exitBars = j - i; break; }
+        } else {
+          if (hi >= setup.stopLoss)   { result = 'LOSS'; exitPrice = setup.stopLoss;   exitBars = j - i; break; }
+          if (lo <= setup.takeProfit) { result = 'WIN';  exitPrice = setup.takeProfit; exitBars = j - i; break; }
+        }
+      }
+      if (result === 'TIMEOUT') {
+        const lastIdx = Math.min(i + MAX_BARS, m30All.length - 1);
+        exitPrice = parseFloat(m30All[lastIdx].mid.c);
+      }
+
+      const rawPips = dir === 'BUY'
+        ? (exitPrice - price) / pip
+        : (price - exitPrice) / pip;
+
+      signals.push({
+        i,
+        time:       m30All[i].time?.slice(0, 16).replace('T', ' '),
+        pair:       PAIR_LABELS[oInstr] || oInstr,
+        direction:  dir,
+        score:      scored.score,
+        maxScore:   scored.maxScore,
+        confidence: setup.confidence,
+        entry:      price.toFixed(dp),
+        sl:         setup.stopLoss.toFixed(dp),
+        tp:         setup.takeProfit.toFixed(dp),
+        rr:         setup.rr.toFixed(2),
+        result,
+        exitPrice:  exitPrice.toFixed(dp),
+        exitBars,
+        pips:       rawPips.toFixed(1),
+        session,
+        failedChecks: scored.checks.filter(c => !c.pass).map(c => c.name),
+      });
+
+      // Skip forward past this simulated trade's exit so signals don't overlap
+      skipUntil = i + exitBars + 1;
+    }
+
+    // ── Stats ──────────────────────────────────────────────────────────
+    const won     = signals.filter(s => s.result === 'WIN');
+    const lost    = signals.filter(s => s.result === 'LOSS');
+    const timeout = signals.filter(s => s.result === 'TIMEOUT');
+    const totalPips = signals.reduce((s, t) => s + parseFloat(t.pips), 0);
+    const avgWin  = won.length  ? won.reduce((s, t) => s + parseFloat(t.pips), 0) / won.length  : 0;
+    const avgLoss = lost.length ? lost.reduce((s, t) => s + parseFloat(t.pips), 0) / lost.length : 0;
+    const avgRR   = avgLoss < 0 ? Math.abs(avgWin / avgLoss).toFixed(2) : '—';
+    const winRate = signals.length ? Math.round(won.length / signals.length * 100) : 0;
+
+    // Max drawdown in pips
+    let peak = 0, maxDD = 0, cumPips = 0;
+    signals.forEach(s => {
+      cumPips += parseFloat(s.pips);
+      if (cumPips > peak) peak = cumPips;
+      const dd = peak - cumPips;
+      if (dd > maxDD) maxDD = dd;
+    });
+
+    // Equity curve in pips
+    let cum = 0;
+    const equityCurve = signals.map(s => {
+      cum += parseFloat(s.pips);
+      return { time: s.time, pips: parseFloat(cum.toFixed(1)) };
+    });
+
+    res.json({
+      signals,
+      equityCurve,
+      stats: {
+        total: signals.length, won: won.length, lost: lost.length, timeout: timeout.length,
+        winRate, totalPips: totalPips.toFixed(1), avgWin: avgWin.toFixed(1), avgLoss: avgLoss.toFixed(1),
+        avgRR, maxDD: maxDD.toFixed(1),
+        bestTrade:  won.length  ? Math.max(...won.map(s => parseFloat(s.pips))).toFixed(1)  : '0',
+        worstTrade: lost.length ? Math.min(...lost.map(s => parseFloat(s.pips))).toFixed(1) : '0',
+      },
+    });
+  } catch (e) {
+    console.error('[BACKTEST]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRADE JOURNAL API
+// ═════════════════════════════════════════════════════════════════════════════
+
+// GET /api/journal — closed trades from OANDA merged with our signals, plus stats
+app.get('/api/journal', async (req, res) => {
+  const keys = getApiKeys();
+  if (!keys.oanda_key || !keys.oanda_account) return res.status(400).json({ error: 'OANDA not configured' });
+  try {
+    const count = parseInt(req.query.count || 200);
+    const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=${count}`);
+    const rawTrades = r?.trades || [];
+
+    // Pull our signals for this account (to merge confidence, score)
+    const ourSignals = db.prepare(`SELECT * FROM signals WHERE status='EXECUTED' ORDER BY created_at DESC`).all();
+    const sigMap = {};
+    ourSignals.forEach(s => { if (s.oanda_order_id) sigMap[s.oanda_order_id] = s; });
+
+    // Pull notes
+    const noteRows = db.prepare('SELECT * FROM journal_notes').all();
+    const noteMap = {};
+    noteRows.forEach(n => { noteMap[n.trade_id] = n.note; });
+
+    const trades = rawTrades.map(t => {
+      const sig      = sigMap[t.id] || null;
+      const oInstr   = t.instrument;
+      const pipSize  = PIP[oInstr] || 0.0001;
+      const entry    = parseFloat(t.price);
+      const close    = parseFloat(t.averageClosePrice || t.price);
+      const pl       = parseFloat(t.realizedPL || 0);
+      const units    = Math.abs(parseFloat(t.initialUnits));
+      const isBuy    = parseFloat(t.initialUnits) > 0;
+      const sl       = t.stopLossOrder ? parseFloat(t.stopLossOrder.price) : (sig?.stop_loss || null);
+      const tp       = t.takeProfitOrder ? parseFloat(t.takeProfitOrder.price) : (sig?.take_profit || null);
+      const slPips   = sl ? Math.abs(entry - sl) / pipSize : null;
+      const tpPips   = tp ? Math.abs(tp - entry) / pipSize : null;
+      const rr       = slPips && tpPips ? (tpPips / slPips).toFixed(2) : null;
+      const result   = pl > 0.01 ? 'WIN' : pl < -0.01 ? 'LOSS' : 'BE';
+      const priceDiff = Math.abs(close - entry);
+      const pips     = (priceDiff / pipSize * (pl >= 0 ? 1 : -1)).toFixed(1);
+
+      return {
+        id:           t.id,
+        pair:         PAIR_LABELS[oInstr] || oInstr,
+        direction:    isBuy ? 'BUY' : 'SELL',
+        openTime:     t.openTime?.slice(0, 16).replace('T', ' '),
+        closeTime:    t.closeTime?.slice(0, 16).replace('T', ' '),
+        entryPrice:   entry.toFixed(5),
+        closePrice:   close.toFixed(5),
+        pl:           pl,
+        pips:         pips,
+        sl:           sl ? sl.toFixed(5) : null,
+        tp:           tp ? tp.toFixed(5) : null,
+        rr:           rr,
+        units:        units,
+        result:       result,
+        confidence:   sig?.confidence || null,
+        signal_id:    sig?.id || null,
+        note:         noteMap[t.id] || '',
+      };
+    });
+
+    // Sort by closeTime ascending for equity curve
+    const sorted = [...trades].sort((a, b) => new Date(a.closeTime) - new Date(b.closeTime));
+
+    // Equity curve (cumulative P&L)
+    let cum = 0;
+    const equityCurve = sorted.map(t => {
+      cum += t.pl;
+      return { date: t.closeTime?.slice(0, 10), pl: cum };
+    });
+
+    // Monthly breakdown
+    const monthMap = {};
+    sorted.forEach(t => {
+      const m = t.closeTime?.slice(0, 7) || 'Unknown';
+      if (!monthMap[m]) monthMap[m] = { month: m, pl: 0, trades: 0, won: 0 };
+      monthMap[m].pl     += t.pl;
+      monthMap[m].trades += 1;
+      if (t.result === 'WIN') monthMap[m].won += 1;
+    });
+    const monthlyPL = Object.values(monthMap).sort((a, b) => a.month.localeCompare(b.month));
+
+    // Stats
+    const won   = trades.filter(t => t.result === 'WIN');
+    const lost  = trades.filter(t => t.result === 'LOSS');
+    const be    = trades.filter(t => t.result === 'BE');
+    const winPLs  = won.map(t => t.pl);
+    const lossPLs = lost.map(t => t.pl);
+    const avgWin  = won.length  ? winPLs.reduce((a, b) => a + b, 0)  / won.length  : 0;
+    const avgLoss = lost.length ? lossPLs.reduce((a, b) => a + b, 0) / lost.length : 0;
+    const avgRR   = avgLoss < 0 ? Math.abs(avgWin / avgLoss).toFixed(2) : '—';
+    const totalPL = trades.reduce((s, t) => s + t.pl, 0);
+    const bestTrade  = trades.length ? Math.max(...trades.map(t => t.pl)) : 0;
+    const worstTrade = trades.length ? Math.min(...trades.map(t => t.pl)) : 0;
+    // Max drawdown from equity curve
+    let peak = 0, maxDD = 0, running = 0;
+    sorted.forEach(t => {
+      running += t.pl;
+      if (running > peak) peak = running;
+      const dd = peak - running;
+      if (dd > maxDD) maxDD = dd;
+    });
+    // Current streak
+    let streak = 0;
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (sorted.length === 0) break;
+      const last = sorted[sorted.length - 1];
+      const cur  = sorted[i];
+      if (streak === 0) { streak = cur.result === 'WIN' ? 1 : cur.result === 'LOSS' ? -1 : 0; }
+      else if (streak > 0 && cur.result === 'WIN') streak++;
+      else if (streak < 0 && cur.result === 'LOSS') streak--;
+      else break;
+    }
+
+    res.json({
+      trades,
+      equityCurve,
+      monthlyPL,
+      stats: {
+        total:      trades.length,
+        won:        won.length,
+        lost:       lost.length,
+        be:         be.length,
+        winRate:    trades.length ? Math.round(won.length / trades.length * 100) : 0,
+        totalPL:    totalPL.toFixed(2),
+        avgWin:     avgWin.toFixed(2),
+        avgLoss:    avgLoss.toFixed(2),
+        avgRR,
+        bestTrade:  bestTrade.toFixed(2),
+        worstTrade: worstTrade.toFixed(2),
+        maxDD:      maxDD.toFixed(2),
+        streak,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/journal/note — save a note for a trade
+app.post('/api/journal/note', (req, res) => {
+  const { tradeId, note } = req.body;
+  if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
+  db.prepare(`
+    INSERT INTO journal_notes (trade_id, note, updated_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(trade_id) DO UPDATE SET note=excluded.note, updated_at=CURRENT_TIMESTAMP
+  `).run(String(tradeId), note || '');
+  res.json({ ok: true });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // PUBLIC URL + HEALTH
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/api/url', (req, res) => {
@@ -1592,8 +2564,45 @@ app.get('/api/url', (req, res) => {
   catch { res.json({ url:null, active:false }); }
 });
 
+// FIX 3 — Slippage analytics endpoint
+app.get('/api/execution/slippage', (req, res) => {
+  const rows = db.prepare(`SELECT * FROM execution_log ORDER BY created_at DESC LIMIT 100`).all();
+  if (!rows.length) return res.json({ message: 'No execution data yet', rows: [] });
+
+  const negSlip = rows.filter(r => r.slippage_dir === 'NEGATIVE');
+  const posSlip = rows.filter(r => r.slippage_dir === 'POSITIVE');
+  const avgSlip = rows.reduce((s, r) => s + (r.slippage_pips || 0), 0) / rows.length;
+  const maxSlip = Math.max(...rows.map(r => r.slippage_pips || 0));
+
+  const byPair = {};
+  rows.forEach(r => {
+    if (!byPair[r.pair]) byPair[r.pair] = { count: 0, totalSlip: 0 };
+    byPair[r.pair].count++;
+    byPair[r.pair].totalSlip += r.slippage_pips || 0;
+  });
+  Object.keys(byPair).forEach(p => {
+    byPair[p].avgSlip = (byPair[p].totalSlip / byPair[p].count).toFixed(2);
+  });
+
+  res.json({
+    total_fills: rows.length,
+    avg_slippage_pips: avgSlip.toFixed(2),
+    max_slippage_pips: maxSlip.toFixed(2),
+    negative_slippage: negSlip.length,
+    positive_slippage: posSlip.length,
+    avg_latency_ms: rows.length ? (rows.reduce((s,r) => s+(r.latency_ms||0), 0) / rows.length).toFixed(0) : 0,
+    by_pair: byPair,
+    recent: rows.slice(0, 10),
+  });
+});
+
 app.get('/api/health', (req, res) => {
-  const keys = getApiKeys();
+  const keys   = getApiKeys();
+  const daily  = getDailyPL();
+  const consec = getConsecutiveLosses();
+  const pending = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='PENDING'`).get();
+  const closed  = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get();
+  const blocked = db.prepare(`SELECT COUNT(*) as c FROM risk_events WHERE date(created_at)=date('now')`).get();
   res.json({
     status: 'ok',
     uptime: process.uptime(),
@@ -1606,6 +2615,22 @@ app.get('/api/health', (req, res) => {
       telegram: !!keys.tg_token,
     },
     ai_engine: keys.openai_key ? 'Calc Engine → GPT-4o validation' : 'Rule-Based Calc Engine only',
+    risk_governors: {
+      daily_pl:           daily.realized_pl.toFixed(2),
+      consecutive_losses: consec,
+      circuit_breaker:    consec >= 3,
+      blocks_today:       blocked.c,
+    },
+    infrastructure: {
+      oanda_avg_latency_ms: Math.round(getOandaAvgLatency()),
+      oanda_fail_count:     oandaFailCount,
+      stale_pairs:          Object.keys(priceCache).filter(p => isFeedStale(p)),
+      friday_size_factor:   getTimeBasedSizeFactor(),
+    },
+    signal_counts: {
+      pending:  pending.c,
+      closed_reconciled: closed.c,
+    },
   });
 });
 

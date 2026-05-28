@@ -11,9 +11,9 @@ while true; do
   # Start cloudflared and capture output
   $CLOUDFLARED tunnel --url http://localhost:3001 2>&1 | while IFS= read -r line; do
     echo "$line"
-    # Extract base tunnel URL (only from "Your quick Tunnel" or "INF" startup lines, not error logs)
-    if echo "$line" | grep -qiE "your quick tunnel|https.*trycloudflare\.com[[:space:]]*$|https.*lhr\.life[[:space:]]*$"; then
-      URL=$(echo "$line" | grep -oP 'https://[a-z0-9-]+\.(trycloudflare\.com|lhr\.life)(?=[[:space:]]|$)')
+    # Extract base tunnel URL from cloudflared startup output
+    if echo "$line" | grep -qiE "https://[a-z0-9-]+\.(trycloudflare\.com|lhr\.life)"; then
+      URL=$(echo "$line" | grep -oP 'https://[a-z0-9-]+\.(trycloudflare\.com|lhr\.life)')
       if [ -n "$URL" ]; then
         echo "$URL" > "$URL_FILE"
         echo "[TUNNEL] ✅ Public URL: $URL"

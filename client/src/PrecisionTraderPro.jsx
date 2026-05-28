@@ -13,6 +13,7 @@ const NAV = [
   { id:"alerts",        label:"Alerts",         icon:"◬" },
   { id:"ai",            label:"AI Insights",    icon:"✦" },
   { id:"analytics",     label:"Analytics",      icon:"▦" },
+  { id:"backtest",      label:"Backtest",       icon:"⏪" },
   { id:"settings",      label:"Settings",       icon:"⊙" },
 ];
 
@@ -245,7 +246,35 @@ function MiniChart({ data, width = 120, height = 40, color = "#00ccff" }) {
 function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady, priceAlerts, onSetAlert }) {
   const pl = account ? parseFloat(account.unrealizedPL) : 0;
   const [plHistory, setPlHistory] = useState([]);
+  const [risk, setRisk]           = useState(null);
+  const [infra, setInfra]         = useState(null);
+  const [flattening, setFlattening] = useState(false);
+
   useEffect(() => { if (account) setPlHistory(h => [...h.slice(-30), pl]); }, [pl]);
+
+  useEffect(() => {
+    const load = async () => {
+      const [r, h] = await Promise.all([
+        fetch("/api/risk/status").then(x => x.json()).catch(() => null),
+        fetch("/api/health").then(x => x.json()).catch(() => null),
+      ]);
+      if (r && !r.error) setRisk(r);
+      if (h && h.infrastructure) setInfra(h.infrastructure);
+    };
+    load();
+    const t = setInterval(load, 15000);
+    return () => clearInterval(t);
+  }, []);
+
+  const doFlatten = async () => {
+    if (!window.confirm("EMERGENCY: Close ALL open positions and disable scanner?")) return;
+    setFlattening(true);
+    try {
+      const r = await fetch("/api/emergency/flatten", { method:"POST" }).then(x => x.json());
+      alert(`Flatten complete. Closed: ${r.closed} position(s).`);
+    } catch { alert("Flatten failed — check Telegram"); }
+    setFlattening(false);
+  };
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
@@ -268,6 +297,111 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
           </div>
         ))}
       </div>
+      {/* ── Risk Governor + Infrastructure ─────────────────────────── */}
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr auto", gap:13, alignItems:"start" }}>
+
+        {/* Daily loss governor */}
+        {risk && (
+          <div style={{ ...S.card, borderLeft:`3px solid ${risk.daily_loss.breached?"#ff4466":parseFloat(risk.daily_loss.used_pct)>60?"#ffcc00":"#00ff88"}` }}>
+            <div style={S.title}>Daily Loss Governor</div>
+            <div style={{ height:5, background:"#0d0d1e", borderRadius:3, margin:"8px 0" }}>
+              <div style={{ height:"100%", width:`${Math.min(100, parseFloat(risk.daily_loss.used_pct))}%`,
+                background:risk.daily_loss.breached?"#ff4466":parseFloat(risk.daily_loss.used_pct)>60?"#ffcc00":"#00ff88",
+                borderRadius:3, transition:"width 0.5s" }} />
+            </div>
+            {[
+              ["Used",  `${risk.daily_loss.used_pct}%`,       risk.daily_loss.breached?"#ff4466":"#ffcc00"],
+              ["P&L",   risk.daily_loss.realized,             parseFloat(risk.daily_loss.realized)>=0?"#00ff88":"#ff4466"],
+              ["Limit", risk.daily_loss.limit,                "#ff446699"],
+              ["Status",risk.daily_loss.breached?"⛔ BLOCKED":"✅ CLEAR", risk.daily_loss.breached?"#ff4466":"#00ff88"],
+            ].map(([l,v,c]) => (
+              <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:11, padding:"4px 0", borderBottom:"1px solid #0d0d1e" }}>
+                <span style={{ color:"#444" }}>{l}</span>
+                <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Weekly loss + circuit breaker */}
+        {risk && (
+          <div style={{ ...S.card, borderLeft:`3px solid ${risk.weekly_loss.breached||risk.consecutive_losses.breached?"#ff4466":"#333"}` }}>
+            <div style={S.title}>Weekly + Circuit Breaker</div>
+            <div style={{ height:5, background:"#0d0d1e", borderRadius:3, margin:"8px 0" }}>
+              <div style={{ height:"100%", width:`${Math.min(100, parseFloat(risk.weekly_loss.used_pct))}%`,
+                background:risk.weekly_loss.breached?"#ff4466":parseFloat(risk.weekly_loss.used_pct)>60?"#ffcc00":"#333",
+                borderRadius:3, transition:"width 0.5s" }} />
+            </div>
+            {[
+              ["Weekly P&L",  risk.weekly_loss.realized, parseFloat(risk.weekly_loss.realized)>=0?"#00ff88":"#ff4466"],
+              ["Weekly Limit",risk.weekly_loss.limit,    "#ff446699"],
+              ["Week from",   risk.weekly_loss.week_start,"#666"],
+              ["Consec. Losses", `${risk.consecutive_losses.count} / 3`,
+                risk.consecutive_losses.count>=3?"#ff4466":risk.consecutive_losses.count>=2?"#ffcc00":"#00ff88"],
+              ["Circuit Break", risk.consecutive_losses.breached?"⛔ ACTIVE":"✅ OFF",
+                risk.consecutive_losses.breached?"#ff4466":"#00ff88"],
+            ].map(([l,v,c]) => (
+              <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:11, padding:"4px 0", borderBottom:"1px solid #0d0d1e" }}>
+                <span style={{ color:"#444" }}>{l}</span>
+                <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Infrastructure */}
+        {infra && (
+          <div style={{ ...S.card, borderLeft:`3px solid ${infra.oanda_avg_latency_ms>3000?"#ffcc00":infra.stale_pairs?.length>0?"#ff4466":"#333"}` }}>
+            <div style={S.title}>Infrastructure</div>
+            <div style={{ marginTop:8 }}>
+              {[
+                ["OANDA Latency", `${infra.oanda_avg_latency_ms}ms`,
+                  infra.oanda_avg_latency_ms>5000?"#ff4466":infra.oanda_avg_latency_ms>3000?"#ffcc00":"#00ff88"],
+                ["API Failures",  infra.oanda_fail_count, infra.oanda_fail_count>10?"#ffcc00":"#666"],
+                ["Stale Feeds",   infra.stale_pairs?.length>0?infra.stale_pairs.join(", "):"None",
+                  infra.stale_pairs?.length>0?"#ff4466":"#00ff88"],
+                ["Size Factor",   `${(infra.friday_size_factor*100).toFixed(0)}%`,
+                  infra.friday_size_factor<1?"#ffcc00":"#00ff88"],
+              ].map(([l,v,c]) => (
+                <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:11, padding:"4px 0", borderBottom:"1px solid #0d0d1e" }}>
+                  <span style={{ color:"#444" }}>{l}</span>
+                  <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
+                </div>
+              ))}
+              {risk && (
+                <div style={{ marginTop:10 }}>
+                  <div style={{ fontSize:10, color:"#444", marginBottom:6 }}>Correlation Exposure</div>
+                  {[
+                    ["USD Long", `${risk.correlation.usd_long_open} / 2`, risk.correlation.long_breached?"#ff4466":"#00ff88"],
+                    ["USD Short",`${risk.correlation.usd_short_open} / 2`, risk.correlation.short_breached?"#ff4466":"#00ff88"],
+                  ].map(([l,v,c]) => (
+                    <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:11, padding:"3px 0" }}>
+                      <span style={{ color:"#444" }}>{l}</span>
+                      <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Emergency stop */}
+        <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+          <button onClick={doFlatten} disabled={flattening} style={{
+            padding:"14px 18px", borderRadius:8, border:"2px solid #ff4466",
+            background:flattening?"#330011":"#1a000a", color:"#ff4466",
+            fontFamily:"monospace", fontWeight:900, fontSize:12, cursor:"pointer",
+            letterSpacing:1, lineHeight:1.5, opacity:flattening?0.6:1,
+          }}>
+            {flattening ? "CLOSING..." : "⛔ EMERGENCY\nFLATTEN ALL"}
+          </button>
+          <div style={{ fontSize:10, color:"#333", textAlign:"center", lineHeight:1.4 }}>
+            Closes all positions<br/>+ disables scanner
+          </div>
+        </div>
+      </div>
+
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:13 }}>
         <div style={S.card}>
           <div style={S.title}>Live Prices</div>
@@ -985,61 +1119,239 @@ function Charts({ keys }) {
 }
 
 // ─── JOURNAL ──────────────────────────────────────────────────────────────────
-function Journal({ trades }) {
-  const [notes, setNotes]   = useState({});
+// ─── SVG CHARTS ───────────────────────────────────────────────────────────────
+function EquityCurve({ data }) {
+  if (!data || data.length < 2) return (
+    <div style={{ height:140, display:"flex", alignItems:"center", justifyContent:"center", color:"#2a2a4a", fontSize:12 }}>
+      Not enough data for equity curve
+    </div>
+  );
+  const W = 560, H = 120, PAD = 14;
+  const pls = data.map(d => d.pl);
+  const min = Math.min(...pls, 0), max = Math.max(...pls, 0);
+  const range = max - min || 1;
+  const toX = i => PAD + (i / (data.length - 1)) * (W - PAD * 2);
+  const toY = v => H - PAD - ((v - min) / range) * (H - PAD * 2);
+  const zero = toY(0);
+  const pts = data.map((d, i) => `${toX(i)},${toY(d.pl)}`).join(' ');
+  const last = data[data.length - 1].pl;
+  const color = last >= 0 ? "#00ff88" : "#ff4466";
+  const fillPts = `${toX(0)},${zero} ${pts} ${toX(data.length-1)},${zero}`;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:140, overflow:"visible" }}>
+      <line x1={PAD} y1={zero} x2={W-PAD} y2={zero} stroke="#1a1a30" strokeWidth={1} strokeDasharray="3 3" />
+      <polygon points={fillPts} fill={color} fillOpacity={0.08} />
+      <polyline points={pts} fill="none" stroke={color} strokeWidth={1.5} />
+      <circle cx={toX(data.length-1)} cy={toY(last)} r={3} fill={color} />
+      <text x={PAD} y={10} fill="#2a2a4a" fontSize={9}>${max.toFixed(0)}</text>
+      <text x={PAD} y={H-2} fill="#2a2a4a" fontSize={9}>${min.toFixed(0)}</text>
+    </svg>
+  );
+}
+
+function MonthlyBars({ data }) {
+  if (!data || data.length === 0) return null;
+  const W = 560, H = 80, PAD = 12;
+  const pls = data.map(d => d.pl);
+  const absMax = Math.max(...pls.map(Math.abs), 1);
+  const barW = Math.max(6, Math.floor((W - PAD * 2) / data.length) - 3);
+  const zero = H / 2;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:80 }}>
+      <line x1={PAD} y1={zero} x2={W-PAD} y2={zero} stroke="#1a1a30" strokeWidth={1} />
+      {data.map((d, i) => {
+        const x = PAD + i * ((W - PAD * 2) / data.length);
+        const barH = Math.abs(d.pl) / absMax * (H / 2 - 4);
+        const isPos = d.pl >= 0;
+        return (
+          <g key={d.month}>
+            <rect x={x} y={isPos ? zero - barH : zero} width={barW} height={barH} fill={isPos ? "#00ff88" : "#ff4466"} fillOpacity={0.7} rx={1} />
+            <text x={x + barW / 2} y={H - 1} fill="#2a2a4a" fontSize={7} textAnchor="middle">{d.month?.slice(5)}</text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ─── JOURNAL ──────────────────────────────────────────────────────────────────
+function Journal() {
+  const [data, setData]     = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [filter, setFilter] = useState("ALL");
   const [editId, setEditId] = useState(null);
   const [editText, setEditText] = useState("");
-  const [filter, setFilter] = useState("ALL");
+  const [saving, setSaving] = useState(false);
 
-  useEffect(() => { loadJournalNotes().then(setNotes); }, []);
-
-  const saveNote = (id) => {
-    const updated = { ...notes, [id]: editText };
-    setNotes(updated); saveJournalNotes(updated); setEditId(null);
+  const load = async () => {
+    setLoading(true);
+    try {
+      const r = await fetch('/api/journal?count=200');
+      if (r.ok) setData(await r.json());
+    } catch {}
+    setLoading(false);
   };
 
-  const filtered = filter === "ALL" ? trades : trades.filter(t => parseFloat(t.currentUnits) > 0 === (filter === "BUY"));
+  useEffect(() => { load(); }, []);
+
+  const saveNote = async (tradeId) => {
+    setSaving(true);
+    await fetch('/api/journal/note', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tradeId, note: editText }),
+    });
+    setData(prev => ({
+      ...prev,
+      trades: prev.trades.map(t => t.id === tradeId ? { ...t, note: editText } : t),
+    }));
+    setEditId(null);
+    setSaving(false);
+  };
+
+  const trades  = data?.trades  || [];
+  const stats   = data?.stats   || {};
+  const equity  = data?.equityCurve || [];
+  const monthly = data?.monthlyPL   || [];
+
+  const filtered = filter === "ALL"  ? trades
+    : filter === "WIN"  ? trades.filter(t => t.result === "WIN")
+    : filter === "LOSS" ? trades.filter(t => t.result === "LOSS")
+    : filter === "BUY"  ? trades.filter(t => t.direction === "BUY")
+    : trades.filter(t => t.direction === "SELL");
+
+  const plColor = v => parseFloat(v) >= 0 ? "#00ff88" : "#ff4466";
+  const resColor = r => r === "WIN" ? "#00ff88" : r === "LOSS" ? "#ff4466" : "#ffcc00";
+
+  const StatCard = ({ label, value, sub, color }) => (
+    <div style={{ ...S.card, flex:1, minWidth:110, textAlign:"center", padding:"13px 10px" }}>
+      <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:2, marginBottom:5, textTransform:"uppercase" }}>{label}</div>
+      <div style={{ fontSize:22, fontWeight:900, color: color || "#ccc", fontFamily:"monospace" }}>{value}</div>
+      {sub && <div style={{ fontSize:10, color:"#333", marginTop:3 }}>{sub}</div>}
+    </div>
+  );
+
+  const streakStr = stats.streak > 0 ? `+${stats.streak}W` : stats.streak < 0 ? `${stats.streak}L` : "—";
+  const streakColor = stats.streak > 0 ? "#00ff88" : stats.streak < 0 ? "#ff4466" : "#555";
 
   return (
-    <div>
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:18 }}>
+    <div style={{ padding:"0 2px" }}>
+      {/* Header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
         <div style={S.ph}>Trade Journal</div>
-        <div style={{ display:"flex", gap:7 }}>
-          {["ALL","BUY","SELL"].map(f => (
-            <button key={f} onClick={() => setFilter(f)} style={{ padding:"5px 13px", borderRadius:6, border:`1px solid ${filter===f?"#00ccff":"#13132b"}`, background:filter===f?"#001a2e":"transparent", color:filter===f?"#00ccff":"#333", cursor:"pointer", fontSize:11, fontWeight:700 }}>
-              {f}
-            </button>
-          ))}
-        </div>
+        <button onClick={load} disabled={loading} style={{ ...S.btn, padding:"8px 16px", color:"#00ccff", border:"1px solid #00ccff44", background:"#001a2e", fontSize:11 }}>
+          {loading ? "Loading..." : "↻ Refresh"}
+        </button>
       </div>
-      {filtered.length === 0 && <div style={{ ...S.card, textAlign:"center", padding:60, color:"#2a2a4a" }}>Execute trades to build your journal</div>}
-      <div style={{ display:"flex", flexDirection:"column", gap:9 }}>
+
+      {/* Stats cards */}
+      {stats.total > 0 && (
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
+          <StatCard label="Win Rate"  value={`${stats.winRate}%`}  sub={`${stats.won}W / ${stats.lost}L`} color={stats.winRate >= 50 ? "#00ff88" : "#ff4466"} />
+          <StatCard label="Avg R:R"   value={stats.avgRR}          sub="reward:risk"                       color="#00ccff" />
+          <StatCard label="Total P&L" value={`$${parseFloat(stats.totalPL) >= 0 ? "+" : ""}${stats.totalPL}`} color={plColor(stats.totalPL)} />
+          <StatCard label="Best Trade" value={`+$${stats.bestTrade}`}  sub="single trade"                 color="#00ff88" />
+          <StatCard label="Worst"     value={`-$${Math.abs(stats.worstTrade).toFixed(2)}`} sub="single trade" color="#ff4466" />
+          <StatCard label="Max DD"    value={`-$${stats.maxDD}`}   sub="drawdown"                         color="#ff8844" />
+          <StatCard label="Streak"    value={streakStr}            sub="current"                          color={streakColor} />
+          <StatCard label="Trades"    value={stats.total}          sub={`${stats.be} breakeven`}          color="#ccc" />
+        </div>
+      )}
+
+      {/* Charts row */}
+      {equity.length > 1 && (
+        <div style={{ display:"flex", gap:10, marginBottom:14 }}>
+          <div style={{ ...S.card, flex:2, padding:"12px 14px" }}>
+            <div style={{ fontSize:10, color:"#2a2a4a", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Equity Curve</div>
+            <EquityCurve data={equity} />
+          </div>
+          {monthly.length > 0 && (
+            <div style={{ ...S.card, flex:1, padding:"12px 14px" }}>
+              <div style={{ fontSize:10, color:"#2a2a4a", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Monthly P&L</div>
+              <MonthlyBars data={monthly} />
+              <div style={{ display:"flex", flexDirection:"column", gap:3, marginTop:8 }}>
+                {monthly.slice(-4).map(m => (
+                  <div key={m.month} style={{ display:"flex", justifyContent:"space-between", fontSize:10 }}>
+                    <span style={{ color:"#333" }}>{m.month}</span>
+                    <span style={{ color:plColor(m.pl), fontFamily:"monospace" }}>{m.pl >= 0 ? "+" : ""}${m.pl.toFixed(0)}</span>
+                    <span style={{ color:"#2a2a4a" }}>{m.won}/{m.trades}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Filter bar */}
+      <div style={{ display:"flex", gap:6, marginBottom:10 }}>
+        {["ALL","WIN","LOSS","BUY","SELL"].map(f => (
+          <button key={f} onClick={() => setFilter(f)} style={{ padding:"5px 12px", borderRadius:6, border:`1px solid ${filter===f?"#00ccff44":"#13132b"}`, background:filter===f?"#001a2e":"transparent", color:filter===f?"#00ccff":"#333", cursor:"pointer", fontSize:10, fontWeight:700 }}>
+            {f} {f !== "ALL" ? `(${f==="WIN"?stats.won:f==="LOSS"?stats.lost:f==="BUY"?trades.filter(t=>t.direction==="BUY").length:trades.filter(t=>t.direction==="SELL").length})` : `(${trades.length})`}
+          </button>
+        ))}
+      </div>
+
+      {/* Trade table */}
+      {loading && <div style={{ ...S.card, textAlign:"center", padding:40, color:"#2a2a4a" }}>Loading journal...</div>}
+      {!loading && filtered.length === 0 && (
+        <div style={{ ...S.card, textAlign:"center", padding:60, color:"#2a2a4a" }}>
+          {trades.length === 0 ? "Execute trades on OANDA to build your journal" : "No trades match this filter"}
+        </div>
+      )}
+      <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
         {filtered.map(t => {
-          const pl = parseFloat(t.unrealizedPL), u = parseFloat(t.currentUnits);
-          const side = u > 0 ? "BUY" : "SELL";
-          const note = notes[t.id] || "";
+          const isEdit = editId === t.id;
           return (
-            <div key={t.id} style={{ ...S.card, borderLeft:`3px solid ${pl>=0?"#00ff88":"#ff4466"}` }}>
-              <div style={{ display:"flex", alignItems:"center", gap:12 }}>
-                <span style={{ fontWeight:800, color:"#ccc", minWidth:65 }}>{PAIR_LABELS[t.instrument] || t.instrument}</span>
-                <span style={{ ...S.badge, color:side==="BUY"?"#00ff88":"#ff4466", background:side==="BUY"?"#003322":"#330011" }}>{side}</span>
-                <span style={{ fontSize:11, color:"#2a2a4a", flex:1 }}>Entry {parseFloat(t.price).toFixed(5)} · {Math.abs(u).toLocaleString()} units</span>
-                <span style={{ fontFamily:"monospace", color:pl>=0?"#00ff88":"#ff4466", fontWeight:700 }}>{pl >= 0 ? "+" : ""}{pl.toFixed(2)}</span>
-                <button onClick={() => { setEditId(t.id); setEditText(note); }} style={{ ...S.btn, padding:"4px 10px", background:"transparent", border:"1px solid #13132b", color:"#333", fontSize:10 }}>
-                  {note ? "Edit note" : "Add note"}
+            <div key={t.id} style={{ ...S.card, borderLeft:`3px solid ${resColor(t.result)}`, padding:"11px 14px" }}>
+              {/* Main row */}
+              <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+                <span style={{ fontWeight:800, color:"#ccc", minWidth:62, fontSize:12 }}>{t.pair}</span>
+                <span style={{ ...S.badge, color:t.direction==="BUY"?"#00ff88":"#ff4466", background:t.direction==="BUY"?"#003322":"#330011", fontSize:9 }}>{t.direction}</span>
+                <span style={{ ...S.badge, color:resColor(t.result), background:"#07071a", fontSize:9 }}>{t.result}</span>
+                {t.confidence && <span style={{ ...S.badge, color:"#00ccff", background:"#001a2e", fontSize:9 }}>{t.confidence}%</span>}
+                <span style={{ fontFamily:"monospace", color:plColor(t.pl), fontWeight:700, minWidth:72, fontSize:12 }}>
+                  {t.pl >= 0 ? "+" : ""}${t.pl.toFixed(2)}
+                </span>
+                <span style={{ fontFamily:"monospace", fontSize:10, color:"#333", minWidth:48 }}>{t.pips > 0 ? "+" : ""}{t.pips}p</span>
+                {t.rr && <span style={{ fontSize:10, color:"#555" }}>RR {t.rr}</span>}
+                <span style={{ fontSize:10, color:"#2a2a4a", flex:1 }}>
+                  {t.openTime?.slice(5)} → {t.closeTime?.slice(5)}
+                </span>
+                <button onClick={() => { setEditId(isEdit ? null : t.id); setEditText(t.note); }}
+                  style={{ ...S.btn, padding:"3px 9px", background:"transparent", border:"1px solid #13132b", color:"#333", fontSize:9 }}>
+                  {t.note ? "Edit" : "+ Note"}
                 </button>
               </div>
-              {note && editId !== t.id && (
-                <div style={{ marginTop:9, padding:"8px 11px", background:"#07071a", borderRadius:7, fontSize:12, color:"#555", fontStyle:"italic", lineHeight:1.6 }}>
-                  📝 {note}
+              {/* Price row */}
+              <div style={{ display:"flex", gap:16, marginTop:6, fontSize:10, color:"#2a2a4a" }}>
+                <span>Entry {t.entryPrice}</span>
+                <span>Exit {t.closePrice}</span>
+                {t.sl && <span>SL {t.sl}</span>}
+                {t.tp && <span>TP {t.tp}</span>}
+                <span>{t.units?.toLocaleString()} units</span>
+              </div>
+              {/* Note display */}
+              {t.note && !isEdit && (
+                <div style={{ marginTop:8, padding:"7px 10px", background:"#07071a", borderRadius:6, fontSize:11, color:"#555", fontStyle:"italic", lineHeight:1.6 }}>
+                  {t.note}
                 </div>
               )}
-              {editId === t.id && (
+              {/* Note edit */}
+              {isEdit && (
                 <div style={{ marginTop:9, display:"flex", gap:8 }}>
-                  <textarea value={editText} onChange={e => setEditText(e.target.value)} rows={2} style={{ ...S.inp, flex:1, resize:"vertical", fontSize:12 }} placeholder="Add trading notes, rationale, lessons..." />
+                  <textarea value={editText} onChange={e => setEditText(e.target.value)} rows={2}
+                    style={{ ...S.inp, flex:1, resize:"vertical", fontSize:11 }}
+                    placeholder="Notes, rationale, lessons learned..." />
                   <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
-                    <button onClick={() => saveNote(t.id)} style={{ ...S.btn, padding:"7px 14px", color:"#00ff88", border:"1px solid #00ff8833", background:"#003322", fontSize:11 }}>Save</button>
-                    <button onClick={() => setEditId(null)} style={{ ...S.btn, padding:"7px 14px", color:"#555", border:"1px solid #13132b", background:"transparent", fontSize:11 }}>Cancel</button>
+                    <button onClick={() => saveNote(t.id)} disabled={saving}
+                      style={{ ...S.btn, padding:"6px 13px", color:"#00ff88", border:"1px solid #00ff8833", background:"#003322", fontSize:10 }}>
+                      {saving ? "..." : "Save"}
+                    </button>
+                    <button onClick={() => setEditId(null)}
+                      style={{ ...S.btn, padding:"6px 13px", color:"#555", border:"1px solid #13132b", background:"transparent", fontSize:10 }}>
+                      Cancel
+                    </button>
                   </div>
                 </div>
               )}
@@ -1337,21 +1649,28 @@ function AIInsights({ prices }) {
 
 // ─── ANALYTICS ────────────────────────────────────────────────────────────────
 function Analytics({ account, trades: openTrades }) {
-  const [history, setHistory] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [daily,   setDaily]   = useState(null);
-  const [autoLog, setAutoLog] = useState([]);
+  const [history,  setHistory]  = useState(null);
+  const [loading,  setLoading]  = useState(true);
+  const [daily,    setDaily]    = useState(null);
+  const [autoLog,  setAutoLog]  = useState([]);
+  const [outcomes, setOutcomes] = useState(null);
+  const [slippage, setSlippage] = useState(null);
+  const [atab,     setAtab]     = useState("performance");
 
   const load = async () => {
     setLoading(true);
-    const [h, d, a] = await Promise.all([
+    const [h, d, a, o, sl] = await Promise.all([
       fetch("/api/history?count=100").then(r => r.json()).catch(() => null),
       fetch("/api/trade/daily").then(r => r.json()).catch(() => null),
       fetch("/api/autotrade/log").then(r => r.json()).catch(() => []),
+      fetch("/api/trade/outcomes").then(r => r.json()).catch(() => null),
+      fetch("/api/execution/slippage").then(r => r.json()).catch(() => null),
     ]);
     if (h && !h.error) setHistory(h);
     if (d) setDaily(d);
     setAutoLog(a || []);
+    if (o && !o.error) setOutcomes(o);
+    if (sl && !sl.error) setSlippage(sl);
     setLoading(false);
   };
   useEffect(() => { load(); }, []);
@@ -1376,10 +1695,234 @@ function Analytics({ account, trades: openTrades }) {
     <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <div style={S.ph}>Trading Analytics</div>
-        <button onClick={load} style={{ ...S.btn, color:"#00ccff", border:"1px solid #00ccff44", background:"#001a2e", padding:"6px 14px" }}>
-          ↻ Refresh
-        </button>
+        <button onClick={load} style={{ ...S.btn, color:"#00ccff", border:"1px solid #00ccff44", background:"#001a2e", padding:"6px 14px" }}>↻ Refresh</button>
       </div>
+
+      {/* Tab bar */}
+      <div style={{ display:"flex", gap:4, borderBottom:"1px solid #13132b", paddingBottom:0 }}>
+        {[
+          { id:"performance", label:"Performance" },
+          { id:"outcomes",    label:"Trade Outcomes" },
+          { id:"execution",   label:"Execution Quality" },
+        ].map(t => (
+          <div key={t.id} onClick={() => setAtab(t.id)} style={{
+            padding:"8px 18px", fontSize:11, fontWeight:atab===t.id?700:400, cursor:"pointer",
+            color:atab===t.id?"#00ccff":"#333", borderBottom:atab===t.id?"2px solid #00ccff":"2px solid transparent",
+            letterSpacing:1, textTransform:"uppercase",
+          }}>{t.label}</div>
+        ))}
+      </div>
+
+      {/* ── TRADE OUTCOMES TAB ──────────────────────────────────────────── */}
+      {atab === "outcomes" && (
+        <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+          {(!outcomes || outcomes.stats?.total === 0) && (
+            <div style={{ ...S.card, textAlign:"center", padding:"40px 20px" }}>
+              <div style={{ fontSize:28, marginBottom:12 }}>📊</div>
+              <div style={{ color:"#bbb", fontSize:13, marginBottom:8 }}>No reconciled trade outcomes yet</div>
+              <div style={{ color:"#444", fontSize:11 }}>Trades execute → OANDA closes them → reconciliation auto-syncs every 2 min</div>
+            </div>
+          )}
+          {outcomes && outcomes.stats?.total > 0 && (() => {
+            const s = outcomes.stats;
+            return (
+              <>
+                {/* KPIs */}
+                <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:11 }}>
+                  {[
+                    { l:"Win Rate",       v: s.win_rate_pct != null ? `${s.win_rate_pct}%` : "—",
+                      c: s.win_rate_pct>=50?"#00ff88":"#ff4466" },
+                    { l:"Expectancy/Trade", v: s.expectancy_per_trade ? `${parseFloat(s.expectancy_per_trade)>=0?"+":""}$${s.expectancy_per_trade}` : "—",
+                      c: parseFloat(s.expectancy_per_trade||0)>=0?"#00ff88":"#ff4466" },
+                    { l:"Real R:R",       v: s.real_rr ? `1:${s.real_rr}` : "—", c:"#ff88ff" },
+                    { l:"Total P&L",      v: `${parseFloat(s.total_pl)>=0?"+":""}$${s.total_pl}`,
+                      c: parseFloat(s.total_pl)>=0?"#00ff88":"#ff4466" },
+                  ].map(k => (
+                    <div key={k.l} style={S.card}>
+                      <div style={S.title}>{k.l}</div>
+                      <div style={{ fontSize:22, fontFamily:"monospace", color:k.c, fontWeight:800, marginTop:4 }}>{k.v}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Second row */}
+                <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:11 }}>
+                  {[
+                    { l:"Wins",          v: s.wins,    c:"#00ff88" },
+                    { l:"Losses",        v: s.losses,  c:"#ff4466" },
+                    { l:"Max Drawdown",  v: `$${s.max_drawdown}`, c:"#ffcc00" },
+                    { l:"Avg Duration",  v: s.avg_duration_mins ? `${s.avg_duration_mins}m` : "—", c:"#bbb" },
+                  ].map(k => (
+                    <div key={k.l} style={S.card}>
+                      <div style={S.title}>{k.l}</div>
+                      <div style={{ fontSize:20, fontFamily:"monospace", color:k.c, fontWeight:800, marginTop:4 }}>{k.v}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Exit reason breakdown */}
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:13 }}>
+                  <div style={S.card}>
+                    <div style={S.title}>Exit Reasons</div>
+                    {[
+                      ["TP Hit",  outcomes.by_exit_reason?.TP_HIT,  "#00ff88"],
+                      ["SL Hit",  outcomes.by_exit_reason?.SL_HIT,  "#ff4466"],
+                      ["Manual",  outcomes.by_exit_reason?.MANUAL,  "#ffcc00"],
+                    ].map(([l, v, c]) => {
+                      const total = s.total || 1;
+                      const pct = Math.round((v||0) / total * 100);
+                      return (
+                        <div key={l} style={{ marginBottom:10 }}>
+                          <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
+                            <span style={{ color:"#888" }}>{l}</span>
+                            <span style={{ color:c, fontFamily:"monospace" }}>{v||0} ({pct}%)</span>
+                          </div>
+                          <div style={{ height:4, background:"#0d0d1e", borderRadius:2 }}>
+                            <div style={{ height:"100%", width:`${pct}%`, background:c, borderRadius:2 }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Closed trades list */}
+                  <div style={{ ...S.card, maxHeight:280, overflowY:"auto" }}>
+                    <div style={S.title}>Closed Trades ({s.total})</div>
+                    {outcomes.trades.map(t => {
+                      const win = (t.realized_pl||0) > 0;
+                      const dp  = t.pair?.includes("JPY")||t.pair?.includes("XAU") ? 2 : 5;
+                      return (
+                        <div key={t.id} style={{ padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
+                          <div style={{ display:"flex", justifyContent:"space-between" }}>
+                            <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                              <span style={{ fontWeight:800, color:"#ccc" }}>{t.pair}</span>
+                              <span style={{ ...S.badge, color:t.direction==="BUY"?"#00ff88":"#ff4466",
+                                background:t.direction==="BUY"?"#003322":"#330011" }}>{t.direction}</span>
+                              <span style={{ ...S.badge, color:win?"#00ff88":"#ff4466",
+                                background:win?"#003322":"#330011" }}>{t.exit_reason?.replace("_"," ") || "?"}</span>
+                            </div>
+                            <span style={{ color:win?"#00ff88":"#ff4466", fontFamily:"monospace", fontWeight:700 }}>
+                              {(t.realized_pl||0)>=0?"+":""}${parseFloat(t.realized_pl||0).toFixed(2)}
+                            </span>
+                          </div>
+                          <div style={{ color:"#333", marginTop:3 }}>
+                            {t.actual_pips ? `${parseFloat(t.actual_pips)>=0?"+":""}${t.actual_pips} pips` : ""}
+                            {t.duration_mins ? ` · ${t.duration_mins}m` : ""}
+                            {t.confidence ? ` · ${t.confidence}% conf` : ""}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* ── EXECUTION QUALITY TAB ────────────────────────────────────────── */}
+      {atab === "execution" && (
+        <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+          {(!slippage || slippage.total_fills === 0) && (
+            <div style={{ ...S.card, textAlign:"center", padding:"40px 20px" }}>
+              <div style={{ fontSize:28, marginBottom:12 }}>⚡</div>
+              <div style={{ color:"#bbb", fontSize:13, marginBottom:8 }}>No execution data yet</div>
+              <div style={{ color:"#444", fontSize:11 }}>Fill quality metrics appear after first executed trade</div>
+            </div>
+          )}
+          {slippage && slippage.total_fills > 0 && (
+            <>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:11 }}>
+                {[
+                  { l:"Total Fills",      v: slippage.total_fills,  c:"#ccc" },
+                  { l:"Avg Slippage",     v: `${slippage.avg_slippage_pips} pips`,
+                    c: parseFloat(slippage.avg_slippage_pips)>2?"#ff4466":parseFloat(slippage.avg_slippage_pips)>1?"#ffcc00":"#00ff88" },
+                  { l:"Max Slippage",     v: `${slippage.max_slippage_pips} pips`,
+                    c: parseFloat(slippage.max_slippage_pips)>5?"#ff4466":"#ffcc00" },
+                  { l:"Avg Latency",      v: `${slippage.avg_latency_ms}ms`,
+                    c: parseInt(slippage.avg_latency_ms)>3000?"#ffcc00":parseInt(slippage.avg_latency_ms)>5000?"#ff4466":"#00ff88" },
+                ].map(k => (
+                  <div key={k.l} style={S.card}>
+                    <div style={S.title}>{k.l}</div>
+                    <div style={{ fontSize:22, fontFamily:"monospace", color:k.c, fontWeight:800, marginTop:4 }}>{k.v}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:13 }}>
+                {/* Slippage direction */}
+                <div style={S.card}>
+                  <div style={S.title}>Fill Direction</div>
+                  <div style={{ marginTop:12 }}>
+                    {[
+                      ["Positive slippage (better fill)", slippage.positive_slippage, "#00ff88"],
+                      ["Negative slippage (worse fill)",  slippage.negative_slippage, "#ff4466"],
+                    ].map(([l, v, c]) => {
+                      const pct = Math.round((v||0) / slippage.total_fills * 100);
+                      return (
+                        <div key={l} style={{ marginBottom:14 }}>
+                          <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:5 }}>
+                            <span style={{ color:"#666" }}>{l}</span>
+                            <span style={{ color:c, fontFamily:"monospace" }}>{v} ({pct}%)</span>
+                          </div>
+                          <div style={{ height:6, background:"#0d0d1e", borderRadius:3 }}>
+                            <div style={{ height:"100%", width:`${pct}%`, background:c, borderRadius:3 }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div style={{ fontSize:11, color:"#444", marginTop:8, padding:"8px 0", borderTop:"1px solid #0d0d1e" }}>
+                      Positive = filled better than market price (rare)<br/>
+                      Negative = filled worse than expected (normal)
+                    </div>
+                  </div>
+                </div>
+
+                {/* Slippage by pair */}
+                <div style={S.card}>
+                  <div style={S.title}>Slippage by Pair</div>
+                  {Object.entries(slippage.by_pair || {}).map(([pair, ps]) => (
+                    <div key={pair} style={{ display:"flex", justifyContent:"space-between", padding:"6px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
+                      <span style={{ color:"#888", fontWeight:700 }}>{pair}</span>
+                      <div style={{ display:"flex", gap:12, fontFamily:"monospace" }}>
+                        <span style={{ color:"#444" }}>{ps.count} fills</span>
+                        <span style={{ color:parseFloat(ps.avgSlip)>2?"#ff4466":parseFloat(ps.avgSlip)>1?"#ffcc00":"#00ff88" }}>
+                          avg {ps.avgSlip} pips
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Recent fills */}
+              <div style={S.card}>
+                <div style={S.title}>Recent Fills</div>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr", gap:6, fontSize:10, color:"#333", padding:"6px 0", borderBottom:"1px solid #0d0d1e", marginBottom:4 }}>
+                  {["Pair","Session","Expected","Actual","Slippage","Direction"].map(h => <div key={h}>{h}</div>)}
+                </div>
+                {(slippage.recent || []).map((f, i) => (
+                  <div key={i} style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr", gap:6, fontSize:11, padding:"5px 0", borderBottom:"1px solid #0a0a18" }}>
+                    <span style={{ color:"#bbb", fontWeight:700 }}>{f.pair}</span>
+                    <span style={{ color:"#555" }}>{f.session}</span>
+                    <span style={{ fontFamily:"monospace", color:"#888" }}>{parseFloat(f.expected_px||0).toFixed(5)}</span>
+                    <span style={{ fontFamily:"monospace", color:"#888" }}>{parseFloat(f.actual_px||0).toFixed(5)}</span>
+                    <span style={{ fontFamily:"monospace", color:parseFloat(f.slippage_pips)>2?"#ff4466":"#888" }}>
+                      {parseFloat(f.slippage_pips||0).toFixed(1)}p
+                    </span>
+                    <span style={{ color:f.slippage_dir==="NEGATIVE"?"#ff4466":"#00ff88" }}>{f.slippage_dir}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── PERFORMANCE TAB ─────────────────────────────────────────────── */}
+      {atab === "performance" && (
+      <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
 
       {/* Top KPI row */}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:11 }}>
@@ -1540,6 +2083,206 @@ function Analytics({ account, trades: openTrades }) {
           );
         })}
       </div>
+      </div>
+      )}
+    </div>
+  );
+}
+
+// ─── BACKTEST ─────────────────────────────────────────────────────────────────
+const PAIRS_BT = ["EUR_USD","GBP_USD","USD_JPY","XAU_USD","AUD_USD","USD_CAD"];
+
+function BtEquityCurve({ data }) {
+  if (!data || data.length < 2) return null;
+  const W = 600, H = 130, PAD = 16;
+  const pips = data.map(d => d.pips);
+  const min  = Math.min(...pips, 0), max = Math.max(...pips, 0);
+  const range = max - min || 1;
+  const toX = i => PAD + (i / (data.length - 1)) * (W - PAD * 2);
+  const toY = v => H - PAD - ((v - min) / range) * (H - PAD * 2);
+  const zero = toY(0);
+  const pts  = data.map((d, i) => `${toX(i)},${toY(d.pips)}`).join(' ');
+  const last = data[data.length - 1].pips;
+  const col  = last >= 0 ? "#00ff88" : "#ff4466";
+  const fill = `${toX(0)},${zero} ${pts} ${toX(data.length - 1)},${zero}`;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:130 }}>
+      <line x1={PAD} y1={zero} x2={W-PAD} y2={zero} stroke="#1a1a30" strokeWidth={1} strokeDasharray="3 3" />
+      <polygon points={fill} fill={col} fillOpacity={0.07} />
+      <polyline points={pts} fill="none" stroke={col} strokeWidth={1.5} />
+      <circle cx={toX(data.length-1)} cy={toY(last)} r={3} fill={col} />
+      <text x={PAD} y={12} fill="#2a2a4a" fontSize={9}>{max.toFixed(0)}p</text>
+      <text x={PAD} y={H-3} fill="#2a2a4a" fontSize={9}>{min.toFixed(0)}p</text>
+    </svg>
+  );
+}
+
+function Backtest() {
+  const today    = new Date().toISOString().slice(0, 10);
+  const monthAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+  const [pair,    setPair]    = useState("EUR_USD");
+  const [from,    setFrom]    = useState(monthAgo);
+  const [to,      setTo]      = useState(today);
+  const [dir,     setDir]     = useState("BOTH");
+  const [minSc,   setMinSc]   = useState(9);
+  const [minConf, setMinConf] = useState(70);
+  const [loading, setLoading] = useState(false);
+  const [result,  setResult]  = useState(null);
+  const [error,   setError]   = useState(null);
+  const [expand,  setExpand]  = useState(null);
+
+  const run = async () => {
+    setLoading(true); setError(null); setResult(null);
+    try {
+      const r = await fetch('/api/backtest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pair, from, to, direction: dir, minScore: minSc, minConf }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'Backtest failed');
+      setResult(d);
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const s     = result?.stats || {};
+  const sigs  = result?.signals || [];
+  const curve = result?.equityCurve || [];
+
+  const resColor = r => r === 'WIN' ? '#00ff88' : r === 'LOSS' ? '#ff4466' : '#ffcc00';
+  const plColor  = v => parseFloat(v) >= 0 ? '#00ff88' : '#ff4466';
+
+  const inp = { ...S.inp, padding:"7px 10px", fontSize:11 };
+  const lbl = { fontSize:10, color:"#2a2a4a", marginBottom:4, letterSpacing:1, textTransform:"uppercase" };
+
+  return (
+    <div style={{ padding:"0 2px" }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+        <div style={S.ph}>Backtest Engine</div>
+        <div style={{ fontSize:11, color:"#2a2a4a" }}>Walk-forward · M30 scan · SL/TP simulation</div>
+      </div>
+
+      {/* Config panel */}
+      <div style={{ ...S.card, marginBottom:14 }}>
+        <div style={{ display:"flex", gap:12, flexWrap:"wrap", alignItems:"flex-end" }}>
+          <div style={{ flex:"1 1 120px" }}>
+            <div style={lbl}>Pair</div>
+            <select value={pair} onChange={e => setPair(e.target.value)} style={inp}>
+              {PAIRS_BT.map(p => <option key={p} value={p}>{p.replace('_','/')}</option>)}
+            </select>
+          </div>
+          <div style={{ flex:"1 1 120px" }}>
+            <div style={lbl}>From</div>
+            <input type="date" value={from} onChange={e => setFrom(e.target.value)} style={inp} />
+          </div>
+          <div style={{ flex:"1 1 120px" }}>
+            <div style={lbl}>To</div>
+            <input type="date" value={to}   onChange={e => setTo(e.target.value)}   style={inp} />
+          </div>
+          <div style={{ flex:"1 1 100px" }}>
+            <div style={lbl}>Direction</div>
+            <select value={dir} onChange={e => setDir(e.target.value)} style={inp}>
+              <option value="BOTH">Both</option>
+              <option value="BUY">BUY only</option>
+              <option value="SELL">SELL only</option>
+            </select>
+          </div>
+          <div style={{ flex:"1 1 90px" }}>
+            <div style={lbl}>Min Score (/12)</div>
+            <input type="number" min={6} max={12} value={minSc} onChange={e => setMinSc(+e.target.value)} style={inp} />
+          </div>
+          <div style={{ flex:"1 1 90px" }}>
+            <div style={lbl}>Min Conf %</div>
+            <input type="number" min={50} max={95} value={minConf} onChange={e => setMinConf(+e.target.value)} style={inp} />
+          </div>
+          <button onClick={run} disabled={loading}
+            style={{ ...S.btn, padding:"9px 22px", color:"#00ccff", border:"1px solid #00ccff44", background:"#001a2e", fontWeight:700, fontSize:12, flexShrink:0 }}>
+            {loading ? "Running..." : "▶ Run Backtest"}
+          </button>
+        </div>
+        {loading && (
+          <div style={{ marginTop:12, fontSize:11, color:"#2a2a4a" }}>
+            Fetching candles from OANDA and replaying signals... this takes 5-15 seconds.
+          </div>
+        )}
+      </div>
+
+      {error && <div style={{ ...S.card, color:"#ff4466", marginBottom:14 }}>{error}</div>}
+
+      {result && (
+        <>
+          {/* Stats row */}
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
+            {[
+              { label:"Signals",   value:s.total,           color:"#ccc" },
+              { label:"Win Rate",  value:`${s.winRate}%`,   color:s.winRate >= 50 ? "#00ff88" : "#ff4466" },
+              { label:"Total Pips",value:`${s.totalPips > 0 ? "+" : ""}${s.totalPips}p`, color:plColor(s.totalPips) },
+              { label:"Avg Win",   value:`+${s.avgWin}p`,   color:"#00ff88" },
+              { label:"Avg Loss",  value:`${s.avgLoss}p`,   color:"#ff4466" },
+              { label:"Avg R:R",   value:s.avgRR,           color:"#00ccff" },
+              { label:"Max DD",    value:`-${s.maxDD}p`,    color:"#ff8844" },
+              { label:"Won/Lost",  value:`${s.won}/${s.lost}`, color:"#ccc" },
+            ].map(({ label, value, color }) => (
+              <div key={label} style={{ ...S.card, flex:1, minWidth:80, textAlign:"center", padding:"11px 8px" }}>
+                <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:2, marginBottom:4, textTransform:"uppercase" }}>{label}</div>
+                <div style={{ fontSize:18, fontWeight:900, color, fontFamily:"monospace" }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Equity curve */}
+          {curve.length > 1 && (
+            <div style={{ ...S.card, marginBottom:14, padding:"14px 16px" }}>
+              <div style={{ fontSize:10, color:"#2a2a4a", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Equity Curve (pips)</div>
+              <BtEquityCurve data={curve} />
+            </div>
+          )}
+
+          {/* Signal list */}
+          {sigs.length === 0 && (
+            <div style={{ ...S.card, textAlign:"center", padding:40, color:"#2a2a4a" }}>
+              No signals met the criteria — try lowering minScore or minConf
+            </div>
+          )}
+          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+            {sigs.map((s, idx) => {
+              const isOpen = expand === idx;
+              return (
+                <div key={idx} style={{ ...S.card, borderLeft:`3px solid ${resColor(s.result)}`, padding:"10px 14px" }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:9, cursor:"pointer" }} onClick={() => setExpand(isOpen ? null : idx)}>
+                    <span style={{ fontSize:10, color:"#2a2a4a", minWidth:115, fontFamily:"monospace" }}>{s.time}</span>
+                    <span style={{ fontWeight:800, color:"#ccc", minWidth:60, fontSize:11 }}>{s.pair}</span>
+                    <span style={{ ...S.badge, color:s.direction==="BUY"?"#00ff88":"#ff4466", background:s.direction==="BUY"?"#003322":"#330011", fontSize:9 }}>{s.direction}</span>
+                    <span style={{ ...S.badge, color:resColor(s.result), background:"#07071a", fontSize:9 }}>{s.result}</span>
+                    <span style={{ ...S.badge, color:"#00ccff", background:"#001a2e", fontSize:9 }}>{s.score}/{s.maxScore}</span>
+                    <span style={{ ...S.badge, color:"#aaa", background:"#0a0a1e", fontSize:9 }}>{s.confidence}%</span>
+                    <span style={{ fontFamily:"monospace", color:plColor(s.pips), fontWeight:700, minWidth:60, fontSize:11 }}>
+                      {s.pips > 0 ? "+" : ""}{s.pips}p
+                    </span>
+                    <span style={{ fontSize:10, color:"#333" }}>RR {s.rr}</span>
+                    <span style={{ fontSize:10, color:"#2a2a4a", flex:1 }}>{s.session}</span>
+                    <span style={{ fontSize:10, color:"#2a2a4a" }}>{isOpen ? "▲" : "▼"}</span>
+                  </div>
+                  {isOpen && (
+                    <div style={{ marginTop:10, display:"flex", gap:16, flexWrap:"wrap", fontSize:10 }}>
+                      <div style={{ color:"#2a2a4a" }}>Entry <span style={{ color:"#ccc" }}>{s.entry}</span></div>
+                      <div style={{ color:"#2a2a4a" }}>Exit <span style={{ color:"#ccc" }}>{s.exitPrice}</span></div>
+                      <div style={{ color:"#2a2a4a" }}>SL <span style={{ color:"#ff4466" }}>{s.sl}</span></div>
+                      <div style={{ color:"#2a2a4a" }}>TP <span style={{ color:"#00ff88" }}>{s.tp}</span></div>
+                      <div style={{ color:"#2a2a4a" }}>Bars to exit <span style={{ color:"#ccc" }}>{s.exitBars}</span></div>
+                      {s.failedChecks.length > 0 && (
+                        <div style={{ color:"#ff446699" }}>Failed: {s.failedChecks.join(", ")}</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1708,11 +2451,12 @@ export default function App() {
     opportunities:<Opportunities prices={prices} keys={keys} addAlert={addAlert} />,
     trading:      <LiveTrading account={account} trades={trades} prices={prices} keys={keys} addAlert={addAlert} refresh={refresh} />,
     charts:       <Charts keys={keys} />,
-    journal:      <Journal trades={trades} />,
+    journal:      <Journal />,
     news:         <News />,
     alerts:       <Alerts alerts={sessionAlerts} keys={keys} priceAlerts={priceAlerts} setPriceAlerts={setPriceAlerts} />,
     ai:           <AIInsights prices={prices} />,
     analytics:    <Analytics account={account} trades={trades} />,
+    backtest:     <Backtest />,
     settings:     <Settings keys={keys} setKeys={k => { setKeys(k); saveKeys(k); }} aiReady={aiReady} />,
   };
 

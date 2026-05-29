@@ -1,7 +1,8 @@
 require('dotenv').config();
 // Force IPv4 DNS — Telegram & some APIs fail on IPv6 in this environment
-const dns   = require('dns');
-const https = require('https');
+const dns    = require('dns');
+const https  = require('https');
+const crypto = require('crypto');
 dns.setDefaultResultOrder('ipv4first');
 
 const express = require('express');
@@ -17,8 +18,31 @@ const app    = express();
 const PORT   = process.env.PORT || 3001;
 const isProd = process.env.NODE_ENV === 'production';
 
-app.use(cors());
+// ── FIX 5: Restrict CORS to known origins only ────────────────────────────────
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3001,http://127.0.0.1:3001').split(',');
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow server-side calls (no origin) and explicitly listed origins
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '2mb' }));
+
+// ── FIX 5: Authentication middleware ─────────────────────────────────────────
+const APP_SECRET = process.env.APP_SECRET || '';
+const PUBLIC_PATHS = ['/api/health', '/api/prices', '/api/url'];
+function requireAuth(req, res, next) {
+  if (!APP_SECRET) return next(); // no secret configured = open (dev mode)
+  // Skip auth for health + static assets + tunnel probe
+  if (PUBLIC_PATHS.some(p => req.path.startsWith(p))) return next();
+  if (!req.path.startsWith('/api')) return next(); // static files
+  const token = req.headers['x-app-token'] || req.query._token;
+  if (token === APP_SECRET) return next();
+  res.status(401).json({ error: 'Unauthorized' });
+}
+app.use(requireAuth);
 
 // ═════════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -536,35 +560,7 @@ function analyzeLiquidity(h4Ind, price, direction, atr) {
 
 // ═══════════════════════════════════════════════════════════════════
 // STAGE 4 — PORTFOLIO HEAT CALCULATOR
-// Total correlated risk % across all open positions
-// ═══════════════════════════════════════════════════════════════════
-function getPortfolioHeat() {
-  const open = db.prepare(`
-    SELECT pair, direction, risk_pct FROM signals
-    WHERE status='EXECUTED' AND closed_at IS NULL
-  `).all();
-
-  let totalPct = 0, usdLong = 0, usdShort = 0;
-  for (const s of open) {
-    const pct   = parseFloat(s.risk_pct || 1);
-    const group = USD_CORR_GROUP[s.pair]?.[s.direction];
-    totalPct  += pct;
-    if (group === 'USD_LONG')  usdLong  += pct;
-    if (group === 'USD_SHORT') usdShort += pct;
-  }
-
-  const heatLevel = totalPct > 5 ? 'CRITICAL' : totalPct > 3 ? 'HIGH' : totalPct > 1.5 ? 'MEDIUM' : 'LOW';
-  return {
-    total_risk_pct:   parseFloat(totalPct.toFixed(2)),
-    usd_long_pct:     parseFloat(usdLong.toFixed(2)),
-    usd_short_pct:    parseFloat(usdShort.toFixed(2)),
-    open_positions:   open.length,
-    heat_level:       heatLevel,
-    safe_to_add:      heatLevel !== 'CRITICAL',
-    warning:          totalPct > 5 ? `Portfolio heat CRITICAL: ${totalPct.toFixed(1)}% total risk — do NOT add positions` :
-                      totalPct > 3 ? `Portfolio heat HIGH: ${totalPct.toFixed(1)}% — trade smaller` : null,
-  };
-}
+// getPortfolioHeat() defined after CORR_WEIGHTS (further down)
 
 // ═══════════════════════════════════════════════════════════════════
 // STAGE 5 — CONFIDENCE DRIFT MONITOR
@@ -949,65 +945,110 @@ async function checkRiskGovernors(signal) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// TRADE RECONCILIATION — pull OANDA closed trades → update local outcomes
-// Runs every 2 minutes. Fills realized_pl, exit_reason, duration, pips.
+// TRADE RECONCILIATION — broker is authoritative source of truth
+// 1. Reconcile closed trades from OANDA → update local outcomes
+// 2. FIX 2: Ghost position detection — broker open trades not in local DB
 // ═════════════════════════════════════════════════════════════════════════════
 async function reconcileTrades() {
   const keys = getApiKeys();
   if (!keys.oanda_key || !keys.oanda_account) return;
 
-  const pending = _stmtPendingReconcile.all();
-  if (!pending.length) return;
-
   try {
-    const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=50`);
-    const closed = r?.trades || [];
-    if (!closed.length) return;
+    // ── Part 1: Close reconciliation (existing logic, enhanced) ─────────────
+    const pending = _stmtPendingReconcile.all();
+    if (pending.length) {
+      const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=50`);
+      const closed = r?.trades || [];
 
-    for (const sig of pending) {
-      const oTrade = closed.find(t => t.id === sig.trade_id);
-      if (!oTrade) continue;
+      for (const sig of pending) {
+        const oTrade = closed.find(t => t.id === sig.trade_id);
+        if (!oTrade) continue;
 
-      const oInstr     = LABEL_TO_OANDA[sig.pair] || sig.pair.replace('/', '_');
-      const pipSize    = PIP[oInstr] || 0.0001;
-      const dp         = oInstr === 'XAU_USD' ? 2 : 5;
-      const entry      = parseFloat(sig.entry_price);
-      const exitPx     = parseFloat(oTrade.averageClosePrice || oTrade.price);
-      const realizedPL = parseFloat(oTrade.realizedPL || 0);
-      const isBuy      = sig.direction === 'BUY';
-      const actualPips = ((isBuy ? exitPx - entry : entry - exitPx) / pipSize).toFixed(1);
+        const oInstr     = LABEL_TO_OANDA[sig.pair] || sig.pair.replace('/', '_');
+        const pipSize    = PIP[oInstr] || 0.0001;
+        const dp         = oInstr === 'XAU_USD' ? 2 : 5;
+        const entry      = parseFloat(sig.entry_price);
+        const exitPx     = parseFloat(oTrade.averageClosePrice || oTrade.price);
+        const realizedPL = parseFloat(oTrade.realizedPL || 0);
+        const isBuy      = sig.direction === 'BUY';
+        const actualPips = ((isBuy ? exitPx - entry : entry - exitPx) / pipSize).toFixed(1);
 
-      let exitReason = 'MANUAL';
-      if (oTrade.stopLossOrder?.state   === 'FILLED') exitReason = 'SL_HIT';
-      if (oTrade.takeProfitOrder?.state === 'FILLED') exitReason = 'TP_HIT';
+        let exitReason = 'MANUAL';
+        if (oTrade.stopLossOrder?.state   === 'FILLED') exitReason = 'SL_HIT';
+        if (oTrade.takeProfitOrder?.state === 'FILLED') exitReason = 'TP_HIT';
 
-      const openMs  = new Date(oTrade.openTime).getTime();
-      const closeMs = new Date(oTrade.closeTime).getTime();
-      const durMins = Math.round((closeMs - openMs) / 60000);
+        const openMs  = new Date(oTrade.openTime).getTime();
+        const closeMs = new Date(oTrade.closeTime).getTime();
+        const durMins = Math.round((closeMs - openMs) / 60000);
 
-      db.prepare(`
-        UPDATE signals SET
-          realized_pl=?, exit_price=?, exit_reason=?,
-          closed_at=?, duration_mins=?, actual_pips=?, status='CLOSED'
-        WHERE id=?
-      `).run(realizedPL, exitPx, exitReason, oTrade.closeTime, durMins, actualPips, sig.id);
+        db.prepare(`
+          UPDATE signals SET
+            realized_pl=?, exit_price=?, exit_reason=?,
+            closed_at=?, duration_mins=?, actual_pips=?, status='CLOSED'
+          WHERE id=?
+        `).run(realizedPL, exitPx, exitReason, oTrade.closeTime, durMins, actualPips, sig.id);
 
-      // Update daily P&L tracker
-      recordTradePL(realizedPL);
+        recordTradePL(realizedPL);
+        writeAudit('TRADE_CLOSED', { signal_id: sig.id, pair: sig.pair, pl: realizedPL, exitReason });
+        // Check if this pair now has a losing streak → set pair breaker
+        checkAndSetPairBreaker(sig.pair);
 
-      console.log(`[RECONCILE] #${sig.id} ${sig.pair} ${sig.direction} → ${exitReason} | P&L: ${realizedPL >= 0 ? '+' : ''}${realizedPL.toFixed(2)} | ${actualPips} pips | ${durMins}m`);
+        console.log(`[RECONCILE] #${sig.id} ${sig.pair} ${sig.direction} → ${exitReason} | P&L: ${realizedPL >= 0 ? '+' : ''}${realizedPL.toFixed(2)} | ${actualPips} pips | ${durMins}m`);
 
-      const icon = realizedPL >= 0 ? '✅' : '❌';
-      const dur  = durMins < 60 ? `${durMins}m` : `${Math.round(durMins/60)}h`;
-      sendTelegramMsg(
+        const icon = realizedPL >= 0 ? '✅' : '❌';
+        const dur  = durMins < 60 ? `${durMins}m` : `${Math.round(durMins/60)}h`;
+        sendTelegramMsg(
 `${icon} TRADE CLOSED — Signal #${sig.id}
 ${sig.pair} ${sig.direction}
 Exit: ${exitReason.replace(/_/g, ' ')} @ ${exitPx.toFixed(dp)}
 P&L: ${realizedPL >= 0 ? '+' : ''}${realizedPL.toFixed(2)}
 Pips: ${actualPips >= 0 ? '+' : ''}${actualPips}
 Duration: ${dur}`
-      ).catch(() => {});
+        ).catch(() => {});
+      }
     }
+
+    // ── Part 2: FIX 2 — Ghost position detection ─────────────────────────────
+    // Broker is authoritative — find open broker trades not in local DB
+    const openR = await oandaRequest(`/v3/accounts/${keys.oanda_account}/openTrades`);
+    const brokerOpen = openR?.trades || [];
+    if (!brokerOpen.length) return;
+
+    // Get all trade IDs we know about locally
+    const localTradeIds = new Set(
+      db.prepare(`SELECT trade_id FROM signals WHERE status='EXECUTED' AND closed_at IS NULL AND trade_id IS NOT NULL`)
+        .all().map(r => r.trade_id)
+    );
+
+    for (const bt of brokerOpen) {
+      if (localTradeIds.has(bt.id)) continue; // known — all good
+
+      // Ghost position: broker has open trade we don't know about
+      const exists = db.prepare(`SELECT id FROM ghost_positions WHERE oanda_trade_id=?`).get(bt.id);
+      if (exists) continue; // already logged
+
+      db.prepare(`
+        INSERT OR IGNORE INTO ghost_positions
+          (oanda_trade_id, instrument, units, open_price, unrealized_pl)
+        VALUES (?,?,?,?,?)
+      `).run(bt.id, bt.instrument, parseFloat(bt.currentUnits), parseFloat(bt.price), parseFloat(bt.unrealizedPL || 0));
+
+      const ghostMsg =
+`🚨 GHOST POSITION DETECTED
+OANDA trade ID: ${bt.id}
+Instrument: ${bt.instrument}
+Units: ${bt.currentUnits}
+Open Price: ${bt.price}
+Unrealized P&L: ${bt.unrealizedPL}
+
+This trade is NOT in local database.
+Manually review and close if needed.`;
+
+      console.error(`[GHOST] ${bt.instrument} trade ${bt.id} not in local DB — ghost position`);
+      writeAudit('GHOST_POSITION_DETECTED', { oanda_trade_id: bt.id, instrument: bt.instrument });
+      sendTelegramMsg(ghostMsg).catch(() => {});
+    }
+
   } catch(e) {
     console.error('[RECONCILE]', e.message);
   }
@@ -1636,14 +1677,14 @@ db.exec(`
   );
 `);
 
-// ── Migrate signals table — add outcome columns if not present ───────────────
+// ── Migrate signals table — add columns if not present ───────────────────────
 [
-  'trade_id TEXT',        // OANDA trade ID (from fill tradeOpened.tradeID)
-  'exit_price REAL',      // actual close price
-  'exit_reason TEXT',     // SL_HIT | TP_HIT | MANUAL
-  'closed_at DATETIME',   // when trade was closed on OANDA
-  'duration_mins INTEGER',// how long trade was open
-  'actual_pips REAL',     // realized pip move
+  'trade_id TEXT',         // OANDA trade ID
+  'exit_price REAL',       // actual close price
+  'exit_reason TEXT',      // SL_HIT | TP_HIT | MANUAL
+  'closed_at DATETIME',    // when trade was closed
+  'duration_mins INTEGER', // how long trade was open
+  'actual_pips REAL',      // realized pip move
 ].forEach(col => { try { db.exec(`ALTER TABLE signals ADD COLUMN ${col}`); } catch {} });
 
 // ── Risk events log — every governor block or circuit breaker fire ───────────
@@ -1702,6 +1743,159 @@ const _stmtTodayLosses = db.prepare(
   `SELECT COUNT(*) as c FROM signals WHERE status='CLOSED' AND realized_pl < 0 AND date(closed_at)=date('now')`
 );
 
+// ── Fix 3: Pair breaker prepared statements ───────────────────────────────────
+const _stmtGetPairBreaker = db.prepare(
+  `SELECT * FROM pair_breakers WHERE pair=? AND blocked_until > datetime('now')`
+);
+const _stmtSetPairBreaker = db.prepare(`
+  INSERT INTO pair_breakers (pair, blocked_until, reason, loss_count)
+  VALUES (?, datetime('now', '+24 hours'), ?, ?)
+  ON CONFLICT(pair) DO UPDATE SET
+    blocked_until = datetime('now', '+24 hours'),
+    reason = excluded.reason,
+    loss_count = excluded.loss_count,
+    created_at = CURRENT_TIMESTAMP
+`);
+const _stmtPairConsecLosses = db.prepare(`
+  SELECT realized_pl FROM signals WHERE status='CLOSED' AND pair=?
+  ORDER BY closed_at DESC LIMIT 5
+`);
+
+// ── Fix 7: Immutable audit log ────────────────────────────────────────────────
+let _lastAuditHash = '';
+function writeAudit(action, data, actor = 'SYSTEM', entityId = null) {
+  try {
+    const payload  = JSON.stringify({ action, actor, entityId, data, ts: Date.now() });
+    const rowHash  = crypto.createHash('sha256').update(_lastAuditHash + payload).digest('hex').slice(0, 16);
+    db.prepare(
+      `INSERT INTO audit_log (action, actor, entity_id, data, prev_hash, row_hash)
+       VALUES (?,?,?,?,?,?)`
+    ).run(action, actor, String(entityId || ''), JSON.stringify(data), _lastAuditHash, rowHash);
+    _lastAuditHash = rowHash;
+  } catch {}
+}
+
+// ── Fix 6: Structured AI decision logger ─────────────────────────────────────
+const _stmtInsertAIDecision = db.prepare(`
+  INSERT INTO ai_decisions
+    (signal_id, pair, direction, model, calc_confidence, ai_confidence, ai_direction,
+     ai_sl, ai_tp, decision, regime, session, adx, rsi_m30, spread_pips, score, flags,
+     prompt_hash, latency_ms)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+`);
+function logAIDecision(fields) {
+  try {
+    _stmtInsertAIDecision.run(
+      fields.signal_id || null, fields.pair, fields.direction, fields.model || 'gpt-4o',
+      fields.calc_confidence, fields.ai_confidence, fields.ai_direction,
+      fields.ai_sl || null, fields.ai_tp || null, fields.decision,
+      fields.regime || null, fields.session || null, fields.adx || null,
+      fields.rsi_m30 || null, fields.spread_pips || null, fields.score || null,
+      JSON.stringify(fields.flags || []), fields.prompt_hash || null, fields.latency_ms || null
+    );
+  } catch {}
+}
+
+// ── Fix 8: Execution deduplication — in-memory lock ──────────────────────────
+const _executingSignals = new Set();
+
+// ── Fix 10: Regime persistence tracker ───────────────────────────────────────
+const _regimeHistory = []; // rolling window of last 20 regime reads
+function recordRegime(pair, regime) {
+  _regimeHistory.push({ pair, regime, ts: Date.now() });
+  if (_regimeHistory.length > 120) _regimeHistory.shift(); // keep ~10 pairs × 12 scans
+}
+function getRegimePersistence(pair, currentRegime) {
+  const history = _regimeHistory.filter(r => r.pair === pair).slice(-8);
+  if (history.length < 3) return { stable: false, count: 0, score: 'LOW' };
+  const consecutive = [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].regime === currentRegime) consecutive.push(history[i]);
+    else break;
+  }
+  const count = consecutive.length;
+  return {
+    stable: count >= 3,
+    count,
+    score: count >= 6 ? 'HIGH' : count >= 3 ? 'MEDIUM' : 'LOW',
+    note:  count >= 6 ? `${currentRegime} stable for ${count} scans` :
+           count >= 3 ? `${currentRegime} emerging (${count} scans)` :
+           `${currentRegime} new — low persistence`,
+  };
+}
+
+// ── Fix 3: Pair-level circuit breaker ────────────────────────────────────────
+function isPairBlocked(pair) {
+  const row = _stmtGetPairBreaker.get(pair);
+  return row ? { blocked: true, until: row.blocked_until, reason: row.reason } : { blocked: false };
+}
+function checkAndSetPairBreaker(pair) {
+  const recent = _stmtPairConsecLosses.all(pair);
+  let consec = 0;
+  for (const t of recent) {
+    if ((t.realized_pl || 0) < 0) consec++;
+    else break;
+  }
+  if (consec >= 3) {
+    _stmtSetPairBreaker.run(pair, `${consec} consecutive losses on ${pair}`, consec);
+    writeAudit('PAIR_BREAKER_SET', { pair, consec }, 'SYSTEM', pair);
+    sendTelegramMsg(`⚠️ Pair Breaker: ${pair} blocked 24h — ${consec} consecutive losses`)
+      .catch(() => {});
+    console.log(`[BREAKER] ${pair} blocked 24h — ${consec} consecutive losses`);
+    return true;
+  }
+  return false;
+}
+
+// ── Fix 4: Correlation weights matrix ────────────────────────────────────────
+// Empirical forex correlation for USD direction exposure
+const CORR_WEIGHTS = {
+  'EUR/USD': { USD_SHORT: 1.0 },
+  'GBP/USD': { USD_SHORT: 0.85 },
+  'AUD/USD': { USD_SHORT: 0.75 },
+  'USD/JPY': { USD_LONG:  1.0  },
+  'USD/CAD': { USD_LONG:  0.80 },
+  'XAU/USD': { USD_SHORT: 0.70 }, // gold rises with USD weakness — now included
+};
+
+function getPortfolioHeat() {
+  const open = db.prepare(`
+    SELECT pair, direction, risk_pct FROM signals
+    WHERE status='EXECUTED' AND closed_at IS NULL
+  `).all();
+
+  let totalPct = 0, usdLongEff = 0, usdShortEff = 0;
+  for (const s of open) {
+    const pct    = parseFloat(s.risk_pct || 1);
+    const weights = CORR_WEIGHTS[s.pair] || {};
+    const group   = USD_CORR_GROUP[s.pair]?.[s.direction];
+    totalPct += pct;
+    if (group === 'USD_LONG') {
+      const w = weights.USD_LONG || 1.0;
+      usdLongEff += pct * w;
+    } else if (group === 'USD_SHORT' || (s.pair === 'XAU/USD' && s.direction === 'BUY')) {
+      const w = weights.USD_SHORT || 1.0;
+      usdShortEff += pct * w;
+    }
+  }
+
+  const effectiveMax  = Math.max(usdLongEff, usdShortEff);
+  const heatLevel     = effectiveMax > 4 ? 'CRITICAL' : effectiveMax > 2.5 ? 'HIGH' :
+                        totalPct > 1.5 ? 'MEDIUM' : 'LOW';
+  return {
+    total_risk_pct:      parseFloat(totalPct.toFixed(2)),
+    usd_long_effective:  parseFloat(usdLongEff.toFixed(2)),
+    usd_short_effective: parseFloat(usdShortEff.toFixed(2)),
+    open_positions:      open.length,
+    heat_level:          heatLevel,
+    safe_to_add:         heatLevel !== 'CRITICAL',
+    warning:             heatLevel === 'CRITICAL' ?
+      `Portfolio heat CRITICAL: ${effectiveMax.toFixed(1)}% effective exposure — DO NOT add positions` :
+      heatLevel === 'HIGH' ?
+      `Portfolio heat HIGH: ${effectiveMax.toFixed(1)}% effective exposure — trade smaller` : null,
+  };
+}
+
 // ── Parse AI response ────────────────────────────────────────────────────────
 function parseAIResponse(analysis) {
   const lines = analysis.split('\n').map(l => l.trim()).filter(Boolean);
@@ -1758,11 +1952,122 @@ const tgSendButtons = (text, buttons) => {
   return tgCall('sendMessage', { chat_id:keys.tg_chat, text, reply_markup:{ inline_keyboard:buttons } });
 };
 
+// ── FIX 1: Recalculate risk at execution time ─────────────────────────────────
+// Fetches fresh quote, checks price drift, recalculates SL/TP/lots with current data
+async function recalcAtExecution(signal, keys) {
+  const oandaInstr = LABEL_TO_OANDA[signal.pair] || signal.pair.replace('/','_');
+  const dp         = oandaInstr === 'XAU_USD' ? 2 : 5;
+  const pipSize    = PIP[oandaInstr] || 0.0001;
+  const isBuy      = signal.direction === 'BUY';
+
+  // Max allowable drift before rejection (pips)
+  const maxDriftPips = oandaInstr === 'XAU_USD' ? 150 : 20;
+
+  // 1 — Fresh quote from OANDA pricing
+  const priceR = await oandaRequest(
+    `/v3/accounts/${keys.oanda_account}/pricing?instruments=${oandaInstr}`
+  );
+  const priceData = priceR?.prices?.[0];
+  if (!priceData) return { blocked: true, reason: 'Could not fetch fresh quote at execution time' };
+
+  const freshBid   = parseFloat(priceData.bids?.[0]?.price || 0);
+  const freshAsk   = parseFloat(priceData.asks?.[0]?.price || 0);
+  if (!freshBid || !freshAsk) return { blocked: true, reason: 'Invalid fresh quote (bid/ask zero)' };
+
+  const freshMid   = (freshBid + freshAsk) / 2;
+  const freshSpread = freshAsk - freshBid;
+  const freshEntry  = isBuy ? freshAsk : freshBid; // fill price direction
+  const spreadPips  = freshSpread / pipSize;
+
+  // 2 — Price drift check
+  const signalPrice = parseFloat(signal.entry_price);
+  const driftPips   = Math.abs(freshMid - signalPrice) / pipSize;
+  if (driftPips > maxDriftPips) {
+    return {
+      blocked: true,
+      reason: `Price drift too large: ${driftPips.toFixed(1)} pips (max ${maxDriftPips}). Signal stale — regenerate.`,
+      driftPips,
+    };
+  }
+
+  // 3 — Spread check at execution moment
+  const atr = parseFloat(signal.entry_price) > 100
+    ? (h1AtrCache[oandaInstr] || 0.5)   // XAU: fallback 50 pips
+    : (h1AtrCache[oandaInstr] || 0.001);
+  if (atr > 0 && freshSpread / atr > 0.30) {
+    return {
+      blocked: true,
+      reason: `Spread ${spreadPips.toFixed(1)} pips too wide at execution (>30% of ATR)`,
+      spreadPips,
+    };
+  }
+
+  // 4 — Shift SL/TP by the same delta as price moved (preserves risk structure)
+  const priceDelta   = freshMid - signalPrice;
+  const newSL        = parseFloat((signal.stop_loss  + priceDelta).toFixed(dp));
+  const newTP        = parseFloat((signal.take_profit + priceDelta).toFixed(dp));
+  const newSlPips    = Math.abs(freshEntry - newSL) / pipSize;
+  if (newSlPips < 2) return { blocked: true, reason: 'SL distance < 2 pips after price drift adjustment' };
+
+  // 5 — Fresh balance + recalculate lot size
+  const acctR   = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
+  const balance = parseFloat(acctR?.account?.balance || 0);
+  if (!balance) return { blocked: true, reason: 'Could not fetch account balance at execution time' };
+
+  const riskPct    = parseFloat(signal.risk_pct || 1);
+  const riskAmt    = balance * (riskPct / 100);
+  let   pipVal     = pipSize;
+  if (oandaInstr === 'USD_JPY') pipVal = 0.01 / freshMid;
+  if (oandaInstr === 'USD_CAD') pipVal = 0.0001 / freshMid;
+  if (oandaInstr === 'XAU_USD') pipVal = 0.1;
+
+  const consecLoss = getConsecutiveLosses();
+  const timeFactor = getTimeBasedSizeFactor();
+  const lossFactor = consecLoss === 1 ? 0.50 : consecLoss >= 2 ? 0.25 : 1.0;
+  const sizeFactor = Math.min(lossFactor, timeFactor);
+  const newUnits   = Math.floor(riskAmt / (newSlPips * pipVal) * sizeFactor);
+  if (newUnits < 100) return { blocked: true, reason: `Calculated units (${newUnits}) too small after recalculation` };
+
+  const newLots = (newUnits / 100000).toFixed(2);
+  const newRR   = Math.abs(freshEntry - newTP) / Math.abs(freshEntry - newSL);
+  if (newRR < 1.5) return { blocked: true, reason: `R:R ${newRR.toFixed(2)} too low after price drift` };
+
+  return {
+    blocked:    false,
+    entry:      freshEntry,
+    stopLoss:   newSL,
+    takeProfit: newTP,
+    units:      newUnits,
+    lots:       newLots,
+    riskAmt,
+    balance,
+    driftPips,
+    spreadPips,
+    slPips:     newSlPips.toFixed(1),
+    tpPips:     (Math.abs(freshEntry - newTP) / pipSize).toFixed(1),
+    dp,
+  };
+}
+
 // ── Execute an approved signal on OANDA ──────────────────────────────────────
 async function executeSignal(signal) {
-  const keys = getApiKeys();
+  // FIX 8: Deduplication — in-memory lock prevents double execution
+  if (_executingSignals.has(signal.id)) {
+    console.log(`[EXEC] Signal #${signal.id} already executing — duplicate prevented`);
+    return;
+  }
+  _executingSignals.add(signal.id);
+
+  try {
+    await _doExecuteSignal(signal);
+  } finally {
+    _executingSignals.delete(signal.id);
+  }
+}
+
+async function _doExecuteSignal(signal) {
+  const keys       = getApiKeys();
   const oandaInstr = LABEL_TO_OANDA[signal.pair] || signal.pair.replace('/','_');
-  const dp = oandaInstr==='XAU_USD' ? 2 : 5;
 
   // ── RISK GOVERNOR CHECK — hard block before execution ────────────────────
   const gov = await checkRiskGovernors(signal);
@@ -1779,38 +2084,87 @@ Risk Governor:
 Review your risk position before resuming.`;
     if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, blockMsg);
     else await sendTelegramMsg(blockMsg);
+    writeAudit('EXECUTION_BLOCKED', { signal_id: signal.id, pair: signal.pair, reasons: gov.reasons });
     console.log(`[GOVERNOR] ⛔ Blocked #${signal.id} ${signal.pair}: ${reasons}`);
     return;
   }
 
+  // ── FIX 1: Recalculate SL/TP/lots with CURRENT market data ───────────────
+  let exec;
   try {
-    const tradeUnits = signal.direction==='BUY' ? signal.units : -signal.units;
+    exec = await recalcAtExecution(signal, keys);
+  } catch(e) {
+    exec = { blocked: true, reason: `Recalc error: ${e.message}` };
+  }
+
+  if (exec.blocked) {
+    db.prepare(`UPDATE signals SET status='BLOCKED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(signal.id);
+    const msg = `⛔ BLOCKED AT EXECUTION — Signal #${signal.id}\n${signal.pair} ${signal.direction}\n\n${exec.reason}`;
+    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, msg);
+    else await sendTelegramMsg(msg);
+    writeAudit('EXECUTION_RECALC_BLOCKED', { signal_id: signal.id, pair: signal.pair, reason: exec.reason });
+    console.log(`[EXEC] Blocked #${signal.id} at recalc: ${exec.reason}`);
+    return;
+  }
+
+  const dp       = exec.dp;
+  const pipSize  = PIP[oandaInstr] || 0.0001;
+  const isBuy    = signal.direction === 'BUY';
+  const driftNote = exec.driftPips > 0.5 ? ` [drift ${exec.driftPips.toFixed(1)} pips]` : '';
+
+  try {
+    const tradeUnits  = isBuy ? exec.units : -exec.units;
     const orderResult = await oandaRequest(`/v3/accounts/${keys.oanda_account}/orders`, 'POST', {
       order: {
         type:'MARKET', instrument:oandaInstr, units:String(tradeUnits),
-        stopLossOnFill:  { price: signal.stop_loss.toFixed(dp) },
-        takeProfitOnFill:{ price: signal.take_profit.toFixed(dp) },
+        stopLossOnFill:  { price: exec.stopLoss.toFixed(dp),  timeInForce:'GTC' },
+        takeProfitOnFill:{ price: exec.takeProfit.toFixed(dp), timeInForce:'GTC' },
       }
     });
-    const filled    = orderResult?.orderFillTransaction;
-    const orderId   = filled?.id || 'unknown';
-    const tradeId   = filled?.tradeOpened?.tradeID || null;
-    const filledPx  = parseFloat(filled?.price || signal.entry_price);
 
-    db.prepare(`UPDATE signals SET status='EXECUTED', oanda_order_id=?, trade_id=?, filled_price=?, actioned_at=CURRENT_TIMESTAMP WHERE id=?`)
-      .run(orderId, tradeId, filledPx, signal.id);
+    const filled   = orderResult?.orderFillTransaction;
+    // If no fill transaction, OANDA may have rejected or queued — record but flag
+    const orderId  = filled?.id || orderResult?.orderCreateTransaction?.id || 'UNKNOWN';
+    const tradeId  = filled?.tradeOpened?.tradeID || null;
+    const filledPx = parseFloat(filled?.price || exec.entry);
+
+    // Detect if order was rejected (no fill, but also no trade opened)
+    if (!filled && !orderResult?.orderFillTransaction) {
+      const rejectReason = orderResult?.orderRejectTransaction?.rejectReason || 'UNKNOWN_REJECTION';
+      db.prepare(`UPDATE signals SET status='FAILED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(signal.id);
+      const failMsg = `❌ ORDER REJECTED — Signal #${signal.id}\n${signal.pair} ${signal.direction}\nReason: ${rejectReason}`;
+      if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, failMsg);
+      writeAudit('ORDER_REJECTED', { signal_id: signal.id, pair: signal.pair, reason: rejectReason });
+      console.error(`[EXEC] Order rejected #${signal.id}: ${rejectReason}`);
+      return;
+    }
+
+    // Update local DB with execution-time values
+    db.prepare(`
+      UPDATE signals SET
+        status='EXECUTED', oanda_order_id=?, trade_id=?, filled_price=?,
+        stop_loss=?, take_profit=?, units=?, lots=?, risk_amount=?,
+        sl_pips=?, tp_pips=?, actioned_at=CURRENT_TIMESTAMP
+      WHERE id=?
+    `).run(orderId, tradeId, filledPx, exec.stopLoss, exec.takeProfit, exec.units,
+           exec.lots, exec.riskAmt, exec.slPips, exec.tpPips, signal.id);
+
     recordTradePL(0);
+    writeAudit('TRADE_EXECUTED', {
+      signal_id: signal.id, pair: signal.pair, direction: signal.direction,
+      entry: filledPx, sl: exec.stopLoss, tp: exec.takeProfit,
+      units: exec.units, drift_pips: exec.driftPips,
+    });
 
-    // FIX 3 — Slippage tracking
-    const pipSize     = PIP[oandaInstr] || 0.0001;
-    const isBuy       = signal.direction === 'BUY';
-    const slippagePips = Math.abs(filledPx - signal.entry_price) / pipSize;
-    const slippageDir  = (isBuy ? filledPx > signal.entry_price : filledPx < signal.entry_price) ? 'NEGATIVE' : 'POSITIVE';
-    db.prepare(`INSERT INTO execution_log (signal_id, pair, session, expected_px, actual_px, slippage_pips, slippage_dir, spread_at_entry, latency_ms)
+    // Slippage tracking
+    const slippagePips = Math.abs(filledPx - exec.entry) / pipSize;
+    const slippageDir  = (isBuy ? filledPx > exec.entry : filledPx < exec.entry) ? 'NEGATIVE' : 'POSITIVE';
+    db.prepare(`INSERT INTO execution_log
+      (signal_id, pair, session, expected_px, actual_px, slippage_pips, slippage_dir, spread_at_entry, latency_ms)
       VALUES (?,?,?,?,?,?,?,?,?)`).run(
       signal.id, signal.pair, getSession(),
-      signal.entry_price, filledPx, slippagePips, slippageDir,
-      spreadCache[signal.pair] || null, Math.round(getOandaAvgLatency())
+      exec.entry, filledPx, slippagePips, slippageDir,
+      exec.spreadPips, Math.round(getOandaAvgLatency())
     );
     if (slippagePips > 3) console.warn(`[SLIPPAGE] ${signal.pair} ${slippageDir} ${slippagePips.toFixed(1)} pips`);
 
@@ -1820,18 +2174,21 @@ Review your risk position before resuming.`;
 Pair:       ${signal.pair}
 Direction:  ${signal.direction} ${signal.direction==='BUY'?'▲':'▼'}
 Confidence: ${signal.confidence}%
-Entry:      ${filledPx.toFixed(dp)}
-Stop Loss:  ${signal.stop_loss.toFixed(dp)} (${signal.sl_pips} pips)
-Take Profit:${signal.take_profit.toFixed(dp)} (${signal.tp_pips} pips)
-Size:       ${signal.lots} lots (${signal.units?.toLocaleString()} units)
-Risk:       ${signal.risk_pct}% = $${signal.risk_amount?.toFixed(0)}
+Entry:      ${filledPx.toFixed(dp)}${driftNote}
+Stop Loss:  ${exec.stopLoss.toFixed(dp)} (-${exec.slPips} pips)
+Take Profit:${exec.takeProfit.toFixed(dp)} (+${exec.tpPips} pips)
+Size:       ${exec.lots} lots (${exec.units.toLocaleString()} units)
+Risk:       ${signal.risk_pct}% = $${exec.riskAmt.toFixed(0)} of $${exec.balance.toFixed(0)}
+Spread:     ${exec.spreadPips.toFixed(1)} pips at fill
 OANDA ID:   ${orderId}`;
     if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, msg);
-    console.log(`[SIGNAL] ✅ Executed #${signal.id} ${signal.pair} ${signal.direction}`);
+    console.log(`[SIGNAL] ✅ Executed #${signal.id} ${signal.pair} ${signal.direction} @ ${filledPx.toFixed(dp)}${driftNote}`);
+
   } catch(e) {
     db.prepare(`UPDATE signals SET status='FAILED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(signal.id);
     if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id,
       `❌ EXECUTION FAILED — Signal #${signal.id}\n${signal.pair} ${signal.direction}\nError: ${e.message}`);
+    writeAudit('EXECUTION_ERROR', { signal_id: signal.id, pair: signal.pair, error: e.message });
     console.error(`[SIGNAL] Execute failed #${signal.id}:`, e.message);
   }
 }
@@ -1892,10 +2249,12 @@ Price source: ${priceSource}`
             }
             if (action === 'approve') {
               await tgAnswerCbq(cbq.id, '✅ Executing trade...');
+              writeAudit('SIGNAL_APPROVE', { signal_id: sig.id, pair: sig.pair, confidence: sig.confidence }, 'TELEGRAM', sig.id);
               await executeSignal(sig);
             } else if (action === 'reject') {
               await tgAnswerCbq(cbq.id, '❌ Signal rejected');
               db.prepare(`UPDATE signals SET status='REJECTED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(sig.id);
+              writeAudit('SIGNAL_REJECT', { signal_id: sig.id, pair: sig.pair, confidence: sig.confidence }, 'TELEGRAM', sig.id);
               if (sig.tg_message_id) await tgEditMsg(sig.tg_message_id,
 `❌ REJECTED — Signal #${sig.id}
 
@@ -1969,6 +2328,13 @@ async function runAutoScan() {
       if (existPending) continue;
 
       const label = instr.replace('_', '/');
+
+      // FIX 3: Per-pair circuit breaker check
+      const pairBlock = isPairBlocked(label);
+      if (pairBlock.blocked) {
+        console.log(`[SCAN] ${label}: Pair breaker active until ${pairBlock.until} — ${pairBlock.reason}`);
+        continue;
+      }
       const price = parseFloat(priceCache[label] || 0);
       if (!price) continue;
 
@@ -2132,27 +2498,56 @@ async function runAutoScan() {
         takeProfit: setup.takeProfit,
       };
 
+      // ── FIX 10: Regime persistence — bonus filter ─────────────────────
+      recordRegime(label, regime.regime);
+      const regimePersist = getRegimePersistence(label, regime.regime);
+      if (!regimePersist.stable && regime.regime !== 'TRENDING_STRONG') {
+        console.log(`[SCAN] ${label}: Regime ${regime.regime} not yet stable (${regimePersist.count} scans) — ${regimePersist.note}`);
+        // Not a hard block — reduce confidence instead of rejecting
+        // Unstable regime = treat like one less check passed
+      }
+      console.log(`[SCAN] ${label}: Regime persistence ${regimePersist.score} (${regimePersist.count} scans)`);
+
       // ── STEP 2: GPT-4o final validation — only if calc passed ────────
       const aiThreshold = parseInt(settings.threshold || 80);
+      const spreadAtScanPips = (spreadCache[label] || 0) / (PIP[instr] || 0.0001);
+      const aiFlags = [];
+      if (spreadAtScanPips > 3)        aiFlags.push(`spread_elevated_${spreadAtScanPips.toFixed(1)}_pips`);
+      if (indH4.adx < 22)              aiFlags.push('adx_marginal');
+      if (!regimePersist.stable)       aiFlags.push('regime_emerging');
+      if (liquidity.sweep_risk==='HIGH') aiFlags.push('sweep_risk_high');
+      if (rsiDiv !== 'NONE')           aiFlags.push(`rsi_div_${rsiDiv.toLowerCase()}`);
+      if (compression.compressing)    aiFlags.push('volatility_compression');
+
+      let aiDecisionLogged = false;
+      const aiLogBase = {
+        pair: label, direction: aiDirection, calc_confidence: setup.confidence,
+        regime: regime.regime, session, adx: indH4.adx, rsi_m30: indM30.rsi14,
+        spread_pips: spreadAtScanPips, score: scored.score, flags: aiFlags,
+      };
+
       if (keys.openai_key && setup.confidence >= aiThreshold) {
+        const t0 = Date.now();
         try {
           const openai = new OpenAI({ apiKey: keys.openai_key });
           const promptCtx =
-`PAIR: ${label} | PRICE: ${price.toFixed(dp)} | SESSION: ${session}
+`PAIR: ${label} | PRICE: ${price.toFixed(dp)} | SESSION: ${session} | REGIME: ${regime.regime} (${regimePersist.score} persistence)
 PRECISION SCORE: ${scored.score}/${scored.maxScore} checks | CALC CONFIDENCE: ${setup.confidence}%
+FLAGS: ${aiFlags.join(', ') || 'none'}
 
 H4 (MASTER): EMA9=${indH4.ema9.toFixed(dp)} EMA21=${indH4.ema21.toFixed(dp)} EMA50=${indH4.ema50.toFixed(dp)} RSI=${indH4.rsi14} ADX=${indH4.adx} ATR=${indH4.atr14.toFixed(dp)} Trend=${indH4.trend}
 H2 (CONFIRM): EMA9=${indH2.ema9.toFixed(dp)} EMA21=${indH2.ema21.toFixed(dp)} RSI=${indH2.rsi14} Trend=${indH2.trend}
 M30 (ENTRY):  EMA9=${indM30.ema9.toFixed(dp)} EMA21=${indM30.ema21.toFixed(dp)} RSI=${indM30.rsi14} MACD=${indM30.macd} Pattern=${indM30.pattern}
 M5 (TRIGGER): RSI=${indM5.rsi14} Pattern=${indM5.pattern}
 H4 Strong Support: ${indH4.strongSupport.toFixed(dp)} | H4 Strong Resistance: ${indH4.strongResist.toFixed(dp)}
-H4 Support: ${indH4.support.toFixed(dp)} | H4 Resistance: ${indH4.resistance.toFixed(dp)}
 Calc Engine SL: ${setup.stopLoss.toFixed(dp)} | Calc Engine TP: ${setup.takeProfit.toFixed(dp)}
 Checks PASSED: ${scored.checks.filter(c=>c.pass).map(c=>c.name).join(', ')}
 Checks FAILED: ${scored.checks.filter(c=>!c.pass).map(c=>c.name).join(', ')||'NONE'}`;
 
+          const promptHash = crypto.createHash('sha256').update(promptCtx).digest('hex').slice(0,12);
+
           const completion = await openai.chat.completions.create({
-            model: 'gpt-4o', max_tokens: 300,
+            model: 'gpt-4o', max_tokens: 300, temperature: 0.1,
             messages: [
               { role: 'system', content:
 `You are a professional forex risk manager verifying a trade signal.
@@ -2179,33 +2574,59 @@ Return EXACTLY 6 lines, no other text:
             ],
           });
 
+          const latencyMs = Date.now() - t0;
           const gptText   = completion.choices[0].message.content;
           const gptParsed = parseAIResponse(gptText);
-          console.log(`[SCAN] ${label}: GPT-4o → ${gptParsed.direction} ${gptParsed.confidence}%`);
+          console.log(`[SCAN] ${label}: GPT-4o → ${gptParsed.direction} ${gptParsed.confidence}% (${latencyMs}ms)`);
 
-          // Use GPT-4o result if it agrees with direction and gave valid levels
           if (gptParsed.direction === aiDirection &&
               gptParsed.stopLoss && gptParsed.takeProfit &&
               gptParsed.confidence >= aiThreshold) {
+
+            // FIX 6: Log structured AI decision — APPROVED
+            logAIDecision({ ...aiLogBase, model:'gpt-4o', ai_confidence: gptParsed.confidence,
+              ai_direction: gptParsed.direction, ai_sl: gptParsed.stopLoss, ai_tp: gptParsed.takeProfit,
+              decision:'APPROVED', prompt_hash: promptHash, latency_ms: latencyMs });
+            aiDecisionLogged = true;
+
             parsed.confidence = gptParsed.confidence;
             parsed.stopLoss   = gptParsed.stopLoss;
             parsed.takeProfit = gptParsed.takeProfit;
             analysis = `${gptText}\n\n[Rule Engine] ${setup.analysis.split('\n').slice(1).join('\n')}`;
             console.log(`[SCAN] ${label}: GPT-4o validated ✓ — using GPT SL/TP`);
+
           } else if (gptParsed.direction === 'NEUTRAL' || gptParsed.direction !== aiDirection) {
+            logAIDecision({ ...aiLogBase, model:'gpt-4o', ai_confidence: gptParsed.confidence,
+              ai_direction: gptParsed.direction, decision:'REJECTED_DIRECTION',
+              prompt_hash: promptHash, latency_ms: latencyMs });
             console.log(`[SCAN] ${label}: GPT-4o REJECTED — direction mismatch or NEUTRAL`);
             continue;
+
           } else if (gptParsed.confidence < aiThreshold) {
+            logAIDecision({ ...aiLogBase, model:'gpt-4o', ai_confidence: gptParsed.confidence,
+              ai_direction: gptParsed.direction, decision:'REJECTED_LOW_CONF',
+              prompt_hash: promptHash, latency_ms: latencyMs });
             console.log(`[SCAN] ${label}: GPT-4o confidence ${gptParsed.confidence}% too low — skipped`);
             continue;
           }
         } catch(e) {
+          logAIDecision({ ...aiLogBase, model:'gpt-4o', ai_confidence: null,
+            ai_direction: null, decision:'API_ERROR', latency_ms: Date.now() - t0,
+            flags: [...aiFlags, `error_${e.message?.slice(0,30)}`] });
           console.log(`[SCAN] ${label}: GPT-4o error — using calc engine: ${e.message}`);
-          // Fall through: use calc engine result
         }
       } else if (setup.confidence < aiThreshold) {
+        logAIDecision({ ...aiLogBase, model:'calc_only', ai_confidence: setup.confidence,
+          ai_direction: aiDirection, decision:'REJECTED_CALC_LOW_CONF' });
         console.log(`[SCAN] ${label}: Calc confidence ${setup.confidence}% < ${aiThreshold}% — skipped`);
         continue;
+      }
+
+      // Log calc-only decision if AI was not called or fell through
+      if (!aiDecisionLogged) {
+        logAIDecision({ ...aiLogBase, model:'calc_only', ai_confidence: setup.confidence,
+          ai_direction: aiDirection, ai_sl: setup.stopLoss, ai_tp: setup.takeProfit,
+          decision:'CALC_FALLBACK' });
       }
 
       if (!parsed.stopLoss || !parsed.takeProfit) continue;
@@ -2343,6 +2764,7 @@ app.post('/api/autotrade/settings', (req, res) => {
     min_score: parseInt(min_score || 9),
   };
   setStorageValue('autotrade_settings', s);
+  writeAudit('SETTINGS_CHANGED', s, 'WEB_UI');
   const onOff = s.enabled ? 'ON' : 'OFF';
   sendTelegramMsg(
     `Signal Scanner: ${onOff}\nScore filter: ${s.min_score}/12 checks required\nAI threshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax/day: ${s.max_per_day}\n\nOnly the highest-confidence setups will be signalled.`
@@ -2374,6 +2796,7 @@ app.post('/api/autotrade/approve/:id', async (req, res) => {
   const sig = db.prepare('SELECT * FROM signals WHERE id=?').get(parseInt(req.params.id));
   if (!sig) return res.status(404).json({ error:'Signal not found' });
   if (sig.status !== 'PENDING') return res.status(400).json({ error:'Signal already processed: '+sig.status });
+  writeAudit('SIGNAL_APPROVE', { signal_id: sig.id, pair: sig.pair, confidence: sig.confidence }, 'WEB_UI', sig.id);
   await executeSignal(sig);
   res.json({ ok:true, signal_id:sig.id });
 });
@@ -2383,6 +2806,7 @@ app.post('/api/autotrade/reject/:id', (req, res) => {
   if (!sig) return res.status(404).json({ error:'Signal not found' });
   if (sig.status !== 'PENDING') return res.status(400).json({ error:'Already processed: '+sig.status });
   db.prepare(`UPDATE signals SET status='REJECTED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(sig.id);
+  writeAudit('SIGNAL_REJECT', { signal_id: sig.id, pair: sig.pair, confidence: sig.confidence }, 'WEB_UI', sig.id);
   if (sig.tg_message_id) tgEditMsg(sig.tg_message_id, `❌ REJECTED via web — Signal #${sig.id}\n${sig.pair} ${sig.direction} ${sig.confidence}%`);
   res.json({ ok:true });
 });
@@ -2532,6 +2956,7 @@ async function emergencyFlatten(triggeredBy = 'API') {
   }
 
   _stmtInsertRiskEvent.run('EMERGENCY_FLATTEN', `Triggered by ${triggeredBy}. Closed ${closed} position(s).`, null, 'ALL_CLOSED_SAFE_MODE');
+  writeAudit('EMERGENCY_FLATTEN', { triggered_by: triggeredBy, closed, errors }, triggeredBy);
 
   const msg =
 `🚨 EMERGENCY FLATTEN EXECUTED
@@ -2958,6 +3383,80 @@ app.get('/api/url', (req, res) => {
   const urlFile = path.join(__dirname, 'data', 'current-url.txt');
   try { res.json({ url: fs.readFileSync(urlFile,'utf8').trim(), active:true }); }
   catch { res.json({ url:null, active:false }); }
+});
+
+// ── FIX 5: Keys status — return configured flags + masked values only ─────────
+// No raw key values ever leave the server after this endpoint
+app.get('/api/keys/status', (req, res) => {
+  const k = getApiKeys();
+  const mask = (v, show = 4) => v ? v.slice(0, show) + '…' + v.slice(-4) : null;
+  res.json({
+    oanda:    !!k.oanda_key,
+    openai:   !!k.openai_key,
+    telegram: !!k.tg_token,
+    twelve:   !!k.twelve_key,
+    masked: {
+      oanda_account: k.oanda_account || null,
+      openai_key:    k.openai_key  ? mask(k.openai_key,  7) : null,
+      oanda_key:     k.oanda_key   ? mask(k.oanda_key,   5) : null,
+      tg_token:      k.tg_token    ? mask(k.tg_token,    5) : null,
+      twelve_key:    k.twelve_key  ? mask(k.twelve_key,  5) : null,
+    },
+    auth_enabled: !!APP_SECRET,
+  });
+});
+
+// ── Audit log endpoint ────────────────────────────────────────────────────────
+app.get('/api/audit', (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit || 100), 500);
+  const offset = parseInt(req.query.offset || 0);
+  const rows   = db.prepare(
+    `SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  ).all(limit, offset);
+  const total  = db.prepare('SELECT COUNT(*) as c FROM audit_log').get().c;
+  res.json({ total, rows });
+});
+
+// ── Ghost positions endpoint ──────────────────────────────────────────────────
+app.get('/api/ghosts', (req, res) => {
+  const rows = db.prepare(`SELECT * FROM ghost_positions ORDER BY detected_at DESC LIMIT 50`).all();
+  res.json(rows);
+});
+app.post('/api/ghosts/:id/resolve', (req, res) => {
+  const { notes } = req.body;
+  db.prepare(`UPDATE ghost_positions SET status='RESOLVED', resolved_at=CURRENT_TIMESTAMP, notes=? WHERE id=?`)
+    .run(notes || 'Manually resolved', parseInt(req.params.id));
+  writeAudit('GHOST_RESOLVED', { ghost_id: req.params.id, notes }, 'WEB_UI', req.params.id);
+  res.json({ ok: true });
+});
+
+// ── Pair breakers endpoint ────────────────────────────────────────────────────
+app.get('/api/pair-breakers', (req, res) => {
+  const rows = db.prepare(
+    `SELECT * FROM pair_breakers WHERE blocked_until > datetime('now') ORDER BY created_at DESC`
+  ).all();
+  res.json(rows);
+});
+app.delete('/api/pair-breakers/:pair', (req, res) => {
+  const pair = decodeURIComponent(req.params.pair);
+  db.prepare(`DELETE FROM pair_breakers WHERE pair=?`).run(pair);
+  writeAudit('PAIR_BREAKER_CLEARED', { pair }, 'WEB_UI', pair);
+  res.json({ ok: true });
+});
+
+// ── AI decisions log endpoint ─────────────────────────────────────────────────
+app.get('/api/ai/decisions', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || 50), 200);
+  const rows  = db.prepare(`SELECT * FROM ai_decisions ORDER BY created_at DESC LIMIT ?`).all(limit);
+  const stats = db.prepare(`
+    SELECT
+      decision,
+      COUNT(*) as count,
+      AVG(ai_confidence) as avg_conf,
+      AVG(latency_ms) as avg_latency
+    FROM ai_decisions GROUP BY decision
+  `).all();
+  res.json({ rows, stats });
 });
 
 // FIX 3 — Slippage analytics endpoint

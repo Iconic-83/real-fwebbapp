@@ -17,10 +17,16 @@ const NAV = [
   { id:"settings",      label:"Settings",       icon:"⊙" },
 ];
 
+// ─── FIX 5: Auth token — sent on every API call if configured ────────────────
+function getAuthHeaders() {
+  const token = localStorage.getItem("ptp_auth_token") || "";
+  return token ? { "X-App-Token": token } : {};
+}
+
 // ─── STORAGE API  (backend SQLite — persistent across devices) ────────────────
 async function storageGet(key) {
   try {
-    const r = await fetch(`/api/storage/${key}`);
+    const r = await fetch(`/api/storage/${key}`, { headers: getAuthHeaders() });
     const d = await r.json();
     return d.value ? JSON.parse(d.value) : null;
   } catch { return null; }
@@ -29,7 +35,7 @@ async function storageSet(key, value) {
   try {
     await fetch(`/api/storage/${key}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
       body: JSON.stringify({ value: JSON.stringify(value) }),
     });
   } catch {}
@@ -43,60 +49,61 @@ async function loadPriceAlerts()    { return (await storageGet("ptp_price_alerts
 async function savePriceAlerts(a)   { await storageSet("ptp_price_alerts", a); }
 
 // ─── BACKEND API HELPERS ──────────────────────────────────────────────────────
-// All real API calls go through the Express backend (keys are server-side)
+// All real API calls go through the Express backend — keys NEVER leave the server
+
+async function apiFetch(path, opts = {}) {
+  const r = await fetch(path, {
+    ...opts,
+    headers: { "Content-Type": "application/json", ...getAuthHeaders(), ...(opts.headers || {}) },
+  });
+  if (r.status === 401) throw new Error("Unauthorized — check app password in Settings");
+  return r;
+}
 
 async function oandaFetch(path, opts = {}) {
-  // Proxy OANDA through backend — keys never exposed to browser
-  const r = await fetch(`/api/oanda${path}`, {
-    ...opts,
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-  });
+  const r = await apiFetch(`/api/oanda${path}`, opts);
   if (r.ok) return r.json();
   const err = await r.json().catch(() => ({}));
   throw new Error(err.errorMessage || err.error || "OANDA request failed");
 }
 
 async function fetchPrices() {
-  const r = await fetch("/api/prices");
+  const r = await fetch("/api/prices"); // public endpoint — no auth header needed
   if (!r.ok) throw new Error("Price fetch failed");
   return r.json();
 }
 
-async function sendTelegram(msg, keys) {
-  if (!keys.tg_token || !keys.tg_chat) return;
-  return fetch(`https://api.telegram.org/bot${keys.tg_token}/sendMessage`, {
+// FIX 5: Telegram messages now go through backend only — token never in browser
+async function sendTelegramViaBackend(msg) {
+  return apiFetch("/api/telegram/send", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: keys.tg_chat, text: msg, parse_mode: "HTML" }),
+    body: JSON.stringify({ message: msg }),
   });
 }
 
 async function getPositionSize(pair, entry, stopLoss, riskPct) {
-  const r = await fetch("/api/trade/size", {
+  const r = await apiFetch("/api/trade/size", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pair, entryPrice: entry, stopLossPrice: stopLoss, riskPercent: riskPct }),
   });
   return r.json();
 }
 
 async function getDailyStatus() {
-  const r = await fetch("/api/trade/daily");
+  const r = await apiFetch("/api/trade/daily");
   return r.json();
 }
 
 async function recordPL(pl) {
-  await fetch("/api/trade/record", {
+  await apiFetch("/api/trade/record", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pl }),
   });
 }
 
 async function aiAnalyze(pairLabel, price, systemContext = "") {
-  const r = await fetch("/api/ai/analyze", {
+  const r = await apiFetch("/api/ai/analyze", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pair: pairLabel, price, systemContext }),
   });
   const d = await r.json();
@@ -105,7 +112,7 @@ async function aiAnalyze(pairLabel, price, systemContext = "") {
 }
 
 async function fetchNewsCalendar() {
-  const r = await fetch("/api/news");
+  const r = await apiFetch("/api/news");
   if (!r.ok) throw new Error("News fetch failed");
   return r.json();
 }
@@ -117,17 +124,21 @@ function useOanda(keys) {
   const [connected, setConnected] = useState(false);
 
   const load = useCallback(async () => {
-    if (!keys.oanda_key || !keys.oanda_account) return;
+    // keys.oanda_key is now a masked boolean indicator from /api/keys/status
+    // Actual key stays server-side; frontend just checks if configured
+    if (!keys.oanda && !keys.oanda_key) return; // support both old and new key format
+    const acct = keys.oanda_account || keys.masked?.oanda_account;
+    if (!acct) return;
     try {
       const [a, t] = await Promise.all([
-        oandaFetch(`/v3/accounts/${keys.oanda_account}/summary`),
-        oandaFetch(`/v3/accounts/${keys.oanda_account}/openTrades`),
+        oandaFetch(`/v3/accounts/${acct}/summary`),
+        oandaFetch(`/v3/accounts/${acct}/openTrades`),
       ]);
       setAccount(a?.account || null);
       setTrades(t?.trades || []);
       setConnected(true);
     } catch { setConnected(false); }
-  }, [keys.oanda_key, keys.oanda_account]);
+  }, [keys.oanda, keys.oanda_key, keys.oanda_account, keys.masked?.oanda_account]);
 
   useEffect(() => {
     load();
@@ -737,7 +748,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
         const filled = r.orderFillTransaction;
         setStatus({ ok:true, msg:`✓ Filled @ ${parseFloat(filled.price).toFixed(5)}` });
         addAlert({ type:"TRADE", icon:"✅", title:`${PAIR_LABELS[pair]} ${dir} Executed`, detail:`${units} units @ ${filled.price}`, color:"#00ff88" });
-        sendTelegram(`🚀 <b>TRADE EXECUTED</b>\nPair: ${PAIR_LABELS[pair]}\nDirection: ${dir}\nUnits: ${units}\nPrice: ${filled.price}`, keys);
+        sendTelegramViaBackend(`🚀 TRADE EXECUTED\nPair: ${PAIR_LABELS[pair]}\nDirection: ${dir}\nUnits: ${units}\nPrice: ${filled.price}`);
         refresh();
       } else {
         setStatus({ ok:false, msg:r.errorMessage || r.orderRejectTransaction?.rejectReason || "Order rejected" });
@@ -1424,7 +1435,7 @@ function Alerts({ alerts, keys, priceAlerts, setPriceAlerts }) {
 
   const test = async () => {
     setTesting(true);
-    try { await sendTelegram("🤖 <b>Precision Trader Pro</b>\nTelegram connected ✓", keys); alert("Test message sent!"); }
+    try { await sendTelegramViaBackend("PrecisionTraderPro — Telegram connected ✓"); alert("Test message sent!"); }
     catch(e) { alert("Telegram error: " + e.message); }
     setTesting(false);
   };
@@ -2291,10 +2302,14 @@ function Backtest() {
 function Settings({ keys, setKeys, aiReady }) {
   const [local, setLocal] = useState(keys);
   const [saved, setSaved] = useState(false);
+  const [authToken, setAuthToken] = useState(localStorage.getItem("ptp_auth_token") || "");
 
   const save = async () => {
     setKeys(local);
     await saveKeys(local);
+    // Save auth token to localStorage (not to server)
+    if (authToken) localStorage.setItem("ptp_auth_token", authToken);
+    else localStorage.removeItem("ptp_auth_token");
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -2311,7 +2326,26 @@ function Settings({ keys, setKeys, aiReady }) {
     <div>
       <div style={S.ph}>Settings & API Keys</div>
       <div style={{ ...S.card, marginBottom:13, padding:"10px 15px", fontSize:12, color:"#555", borderLeft:"3px solid #ffcc00" }}>
-        ⚠ Keys are stored in the server database — secure and accessible from any device.
+        ⚠ Keys are stored in the server database — never exposed to browser. Set APP_SECRET in server .env to enable password protection.
+      </div>
+      {/* FIX 5: App password for authenticated access */}
+      <div style={{ ...S.card, marginBottom:13, borderLeft:"3px solid #00ccff" }}>
+        <div style={S.title}>App Password (Auth Token)</div>
+        <div style={{ fontSize:11, color:"#444", marginBottom:8 }}>
+          If APP_SECRET is set in server .env, enter it here to authenticate all API requests.
+          Stored in browser localStorage only — never sent to server as a key.
+        </div>
+        <label style={S.lbl}>App Password</label>
+        <input
+          type="password"
+          value={authToken}
+          onChange={e => setAuthToken(e.target.value)}
+          style={{ ...S.inp, marginBottom:4 }}
+          placeholder="Leave empty if no APP_SECRET configured"
+        />
+        <div style={{ fontSize:10, color: keys.auth_enabled ? "#00ff88" : "#333" }}>
+          {keys.auth_enabled ? "✓ Server auth is enabled" : "○ Server auth not configured"}
+        </div>
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
         <div style={{ ...S.card, gridColumn:"1/-1", borderLeft:"3px solid #00ff88", background:"#001a0e" }}>
@@ -2388,10 +2422,15 @@ export default function App() {
   const [priceAlerts, setPriceAlerts]     = useState([]);
   const [time, setTime]   = useState(new Date());
 
-  // Load persisted keys and alerts on mount
+  // FIX 5: Load keys status (configured flags only) + alerts on mount
   useEffect(() => {
-    Promise.all([loadKeys(), loadPriceAlerts()]).then(([k, pa]) => {
-      setKeys(k || {});
+    Promise.all([
+      fetch("/api/keys/status", { headers: getAuthHeaders() }).then(r => r.ok ? r.json() : {}).catch(() => ({})),
+      loadKeys(),        // still load for settings display
+      loadPriceAlerts(),
+    ]).then(([status, rawKeys, pa]) => {
+      // Merge: use status flags for connection checks, rawKeys for settings display
+      setKeys({ ...rawKeys, ...status });
       setPriceAlerts(pa || []);
       setKeysLoaded(true);
     });
@@ -2401,7 +2440,7 @@ export default function App() {
 
   const { account, trades, connected:oConn, refresh } = useOanda(keysLoaded ? keys : {});
   const { prices, prevPrices, connected:tConn }        = useTwelve(keysLoaded ? keys : {});
-  const aiReady = !!(keys.claude_key || keys.openai_key);
+  const aiReady = !!(keys.openai || keys.openai_key);
 
   useEffect(() => { const t = setInterval(() => setTime(new Date()), 1000); return () => clearInterval(t); }, []);
   useEffect(() => { if (oConn || tConn) setPage("dashboard"); }, [oConn, tConn]);
@@ -2416,7 +2455,7 @@ export default function App() {
       const triggered = (a.dir === "ABOVE" && cur >= a.price) || (a.dir === "BELOW" && cur <= a.price);
       if (triggered) {
         addAlert({ type:"PRICE", icon:"◬", title:`${PAIR_LABELS[a.pair]} Alert Triggered`, detail:`Price ${a.dir==="ABOVE"?"reached above":"fell below"} ${a.price.toFixed(5)} — Current: ${cur.toFixed(5)}`, color:"#ffcc00" });
-        sendTelegram(`◬ <b>PRICE ALERT</b>\n${PAIR_LABELS[a.pair]} ${a.dir} ${a.price.toFixed(5)}\nCurrent: ${cur.toFixed(5)}`, keys);
+        sendTelegramViaBackend(`PRICE ALERT: ${PAIR_LABELS[a.pair]} ${a.dir} ${a.price.toFixed(5)} — Current: ${cur.toFixed(5)}`);
         const updated = priceAlerts.map(x => x.id === a.id ? { ...x, active:false } : x);
         setPriceAlerts(updated); savePriceAlerts(updated);
       }

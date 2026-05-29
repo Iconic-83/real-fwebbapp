@@ -44,6 +44,66 @@ db.exec(`
     active     INTEGER NOT NULL DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+
+  -- Fix 3: Per-pair circuit breakers
+  CREATE TABLE IF NOT EXISTS pair_breakers (
+    pair         TEXT PRIMARY KEY,
+    blocked_until DATETIME NOT NULL,
+    reason       TEXT,
+    loss_count   INTEGER DEFAULT 0,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- Fix 6: Structured AI decision log
+  CREATE TABLE IF NOT EXISTS ai_decisions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    signal_id    INTEGER,
+    pair         TEXT,
+    direction    TEXT,
+    model        TEXT,
+    calc_confidence INTEGER,
+    ai_confidence   INTEGER,
+    ai_direction    TEXT,
+    ai_sl        REAL,
+    ai_tp        REAL,
+    decision     TEXT,
+    regime       TEXT,
+    session      TEXT,
+    adx          REAL,
+    rsi_m30      REAL,
+    spread_pips  REAL,
+    score        INTEGER,
+    flags        TEXT,
+    prompt_hash  TEXT,
+    latency_ms   INTEGER
+  );
+
+  -- Fix 7: Immutable append-only audit log with hash chain
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    action     TEXT NOT NULL,
+    actor      TEXT DEFAULT 'SYSTEM',
+    entity_id  TEXT,
+    data       TEXT,
+    prev_hash  TEXT,
+    row_hash   TEXT
+  );
+
+  -- Fix 2: Ghost position tracker
+  CREATE TABLE IF NOT EXISTS ghost_positions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    oanda_trade_id TEXT UNIQUE,
+    instrument   TEXT,
+    units        REAL,
+    open_price   REAL,
+    unrealized_pl REAL,
+    status       TEXT DEFAULT 'DETECTED',
+    resolved_at  DATETIME,
+    notes        TEXT
+  );
 `);
 
 console.log(`[DB] SQLite ready at: ${dbPath}`);

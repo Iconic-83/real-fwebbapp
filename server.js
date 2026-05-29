@@ -3662,10 +3662,10 @@ app.get('/api/health', (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SERVE REACT APP (production)
+// SERVE REACT APP — always serve if dist folder exists (dev or prod)
 // ═════════════════════════════════════════════════════════════════════════════
-if (isProd) {
-  const clientDist = path.join(__dirname, 'client', 'dist');
+const clientDist = path.join(__dirname, 'client', 'dist');
+if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
 }

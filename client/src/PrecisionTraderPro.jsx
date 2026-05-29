@@ -124,21 +124,17 @@ function useOanda(keys) {
   const [connected, setConnected] = useState(false);
 
   const load = useCallback(async () => {
-    // keys.oanda_key is now a masked boolean indicator from /api/keys/status
-    // Actual key stays server-side; frontend just checks if configured
-    if (!keys.oanda && !keys.oanda_key) return; // support both old and new key format
-    const acct = keys.oanda_account || keys.masked?.oanda_account;
-    if (!acct) return;
+    if (!keys.oanda_key || !keys.oanda_account) return;
     try {
       const [a, t] = await Promise.all([
-        oandaFetch(`/v3/accounts/${acct}/summary`),
-        oandaFetch(`/v3/accounts/${acct}/openTrades`),
+        oandaFetch(`/v3/accounts/${keys.oanda_account}/summary`),
+        oandaFetch(`/v3/accounts/${keys.oanda_account}/openTrades`),
       ]);
       setAccount(a?.account || null);
       setTrades(t?.trades || []);
       setConnected(true);
     } catch { setConnected(false); }
-  }, [keys.oanda, keys.oanda_key, keys.oanda_account, keys.masked?.oanda_account]);
+  }, [keys.oanda_key, keys.oanda_account]);
 
   useEffect(() => {
     load();
@@ -2417,25 +2413,25 @@ export default function App() {
   const [priceAlerts, setPriceAlerts]     = useState([]);
   const [time, setTime]   = useState(new Date());
 
-  // FIX 5: Load keys status (configured flags only) + alerts on mount
+  // Load keys + alerts on mount — simple, no extra API dependency
   useEffect(() => {
-    Promise.all([
-      fetch("/api/keys/status", { headers: getAuthHeaders() }).then(r => r.ok ? r.json() : {}).catch(() => ({})),
-      loadKeys(),        // still load for settings display
-      loadPriceAlerts(),
-    ]).then(([status, rawKeys, pa]) => {
-      // Merge: use status flags for connection checks, rawKeys for settings display
-      setKeys({ ...rawKeys, ...status });
-      setPriceAlerts(pa || []);
-      setKeysLoaded(true);
-    });
+    Promise.all([loadKeys(), loadPriceAlerts()])
+      .then(([k, pa]) => {
+        setKeys(k || {});
+        setPriceAlerts(pa || []);
+        setKeysLoaded(true);
+      })
+      .catch(() => {
+        // Even on error, show the app
+        setKeysLoaded(true);
+      });
   }, []);
 
   const addAlert = a => setSessionAlerts(p => [...p, { ...a, time:new Date().toLocaleTimeString() }]);
 
   const { account, trades, connected:oConn, refresh } = useOanda(keysLoaded ? keys : {});
   const { prices, prevPrices, connected:tConn }        = useTwelve(keysLoaded ? keys : {});
-  const aiReady = !!(keys.openai || keys.openai_key);
+  const aiReady = !!(keys.claude_key || keys.openai_key);
 
   useEffect(() => { const t = setInterval(() => setTime(new Date()), 1000); return () => clearInterval(t); }, []);
   useEffect(() => { if (oConn || tConn) setPage("dashboard"); }, [oConn, tConn]);
@@ -2470,10 +2466,13 @@ export default function App() {
 
   if (!keysLoaded) {
     return (
-      <div style={{ display:"flex", height:"100vh", alignItems:"center", justifyContent:"center", background:"#06061a", color:"#2a2a4a", fontFamily:"monospace", fontSize:13, letterSpacing:2, flexDirection:"column", gap:12 }}>
-        <div style={{ fontSize:24, color:"#00ccff" }}>P</div>
-        <div>PRECISION TRADER PRO</div>
-        <div style={{ fontSize:11 }}>Connecting to server...</div>
+      <div style={{ display:"flex", height:"100vh", alignItems:"center", justifyContent:"center", background:"#06061a", fontFamily:"monospace", flexDirection:"column", gap:16 }}>
+        <div style={{ fontSize:48, color:"#00ff88", fontWeight:900, letterSpacing:4 }}>P</div>
+        <div style={{ fontSize:14, color:"#ccc", letterSpacing:4 }}>PRECISION TRADER PRO</div>
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:8 }}>
+          <div style={{ width:8, height:8, borderRadius:"50%", background:"#00ccff", animation:"pulse 1.2s infinite" }} />
+          <span style={{ fontSize:12, color:"#00ccff", letterSpacing:2 }}>Connecting to server...</span>
+        </div>
       </div>
     );
   }

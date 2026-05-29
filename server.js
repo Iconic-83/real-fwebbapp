@@ -18,13 +18,18 @@ const app    = express();
 const PORT   = process.env.PORT || 3001;
 const isProd = process.env.NODE_ENV === 'production';
 
-// ── FIX 5: Restrict CORS to known origins only ────────────────────────────────
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3001,http://127.0.0.1:3001').split(',');
+// ── CORS — allow same-origin tunnel access + localhost ───────────────────────
+// Vite adds crossorigin to module scripts so browser sends Origin even for
+// same-origin requests. Must allow the tunnel host or JS bundle gets 500.
+const EXTRA_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow server-side calls (no origin) and explicitly listed origins
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    cb(new Error('Not allowed by CORS'));
+    if (!origin) return cb(null, true); // server-side / curl
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) return cb(null, true);
+    if (origin.endsWith('.trycloudflare.com')) return cb(null, true);
+    if (origin.endsWith('.loca.lt')) return cb(null, true);
+    if (EXTRA_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error('CORS: origin not allowed'));
   },
   credentials: true,
 }));

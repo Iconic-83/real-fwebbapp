@@ -338,6 +338,304 @@ function buildIndicators(candles, refCandles = []) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// STAGE 1 — MARKET REGIME CLASSIFIER
+// Returns regime type + tradeability flag based on ADX, EMA slope, ATR
+// ═══════════════════════════════════════════════════════════════════
+function classifyRegime(h4Ind, m30Ind) {
+  const adx      = h4Ind.adx;
+  const emaSlope = Math.abs(h4Ind.emaSlope || 0);
+  const macdSlope= h4Ind.macdSlope || 0;
+  const rsi      = m30Ind.rsi14;
+
+  // Strong trend — ideal for trend-following entries
+  if (adx >= 28 && emaSlope >= 2.0) {
+    return { regime:'TRENDING_STRONG', tradeable:true, note:'Strong directional momentum — ideal entry conditions' };
+  }
+  // Moderate trend — acceptable with confirmation
+  if (adx >= 20 && emaSlope >= 1.0) {
+    return { regime:'TRENDING', tradeable:true, note:'Moderate trend — entry acceptable with full confirmation' };
+  }
+  // Choppy — ADX low AND flat EMA
+  if (adx < 20 && emaSlope < 1.0) {
+    return { regime:'CHOPPY', tradeable:false, note:'Flat EMA + weak ADX — trend-following systems fail here' };
+  }
+  // Ranging — very low ADX
+  if (adx < 15) {
+    return { regime:'RANGING', tradeable:false, note:'Price ranging without direction — false signals likely' };
+  }
+  // High volatility — ADX high but momentum reversing
+  if (adx >= 25 && Math.abs(macdSlope) > 0 && rsi > 75) {
+    return { regime:'VOLATILE_EXHAUSTION', tradeable:false, note:'High volatility + RSI exhaustion — momentum reversal risk' };
+  }
+  return { regime:'MIXED', tradeable:true, note:'Mixed conditions — proceed with extra caution' };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 1 — CANDLE QUALITY INSPECTOR
+// Rejects: manipulation spikes, doji exhaustion, abnormal wicks
+// ═══════════════════════════════════════════════════════════════════
+function inspectCandleQuality(candles, atr) {
+  if (!candles || candles.length < 3 || !atr) return { ok:true, issues:[] };
+  const issues = [];
+
+  // Check last 3 candles for abnormal expansion
+  const last3 = candles.slice(-3);
+  let expandCount = 0;
+  for (const c of last3) {
+    const range = parseFloat(c.mid.h) - parseFloat(c.mid.l);
+    if (range > atr * 2.5) expandCount++;
+  }
+  if (expandCount >= 2) issues.push('Candle expansion: 2+ candles exceed 2.5×ATR (spike/news residue)');
+
+  // Check last candle wick dominance
+  const last  = last3[last3.length - 1];
+  const co    = parseFloat(last.mid.o), cc = parseFloat(last.mid.c);
+  const ch    = parseFloat(last.mid.h), cl = parseFloat(last.mid.l);
+  const body  = Math.abs(cc - co);
+  const range = ch - cl;
+  if (range > 0 && body / range < 0.15) {
+    issues.push('Doji/spinning top: body < 15% of range — strong indecision');
+  }
+
+  // Check for exhaustion wick (wick > 3× body)
+  const upperWick = ch - Math.max(co, cc);
+  const lowerWick = Math.min(co, cc) - cl;
+  if (body > 0 && (upperWick > body * 3 || lowerWick > body * 3)) {
+    issues.push('Exhaustion wick: wick > 3× body — possible rejection or trap');
+  }
+
+  return { ok: issues.length === 0, issues };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 2 — RSI DIVERGENCE DETECTOR
+// Bullish div: price lower low + RSI higher low (hidden strength)
+// Bearish div: price higher high + RSI lower high (hidden weakness)
+// ═══════════════════════════════════════════════════════════════════
+function detectRSIDivergence(candles, direction) {
+  if (candles.length < 20) return 'NONE';
+  const recent = candles.slice(-20);
+  const closes = recent.map(c => parseFloat(c.mid.c));
+  const highs  = recent.map(c => parseFloat(c.mid.h));
+  const lows   = recent.map(c => parseFloat(c.mid.l));
+
+  const quickRSI = (arr) => {
+    if (arr.length < 15) return 50;
+    let g = 0, l = 0;
+    for (let i = arr.length - 14; i < arr.length; i++) {
+      const d = arr[i] - arr[i-1];
+      if (d > 0) g += d; else l += Math.abs(d);
+    }
+    const ag = g / 14, al = l / 14;
+    return al === 0 ? 100 : parseFloat((100 - 100 / (1 + ag/al)).toFixed(1));
+  };
+
+  const rsiNow  = quickRSI(closes);
+  const rsiPrev = quickRSI(closes.slice(0, -5));
+
+  if (direction === 'BUY') {
+    const lowNow  = Math.min(...lows.slice(-5));
+    const lowPrev = Math.min(...lows.slice(-15, -5));
+    if (lowNow < lowPrev && rsiNow > rsiPrev + 4) return 'BULLISH_DIVERGENCE';  // positive — price weak, RSI strong
+    if (lowNow > lowPrev && rsiNow > rsiPrev + 2) return 'BULLISH_HIDDEN_DIV';  // trend continuation
+  } else {
+    const highNow  = Math.max(...highs.slice(-5));
+    const highPrev = Math.max(...highs.slice(-15, -5));
+    if (highNow > highPrev && rsiNow < rsiPrev - 4) return 'BEARISH_DIVERGENCE'; // positive — price strong, RSI weak
+    if (highNow < highPrev && rsiNow < rsiPrev - 2) return 'BEARISH_HIDDEN_DIV'; // trend continuation
+  }
+  return 'NONE';
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 2 — COMPRESSION DETECTOR (volatility squeeze → expansion)
+// Institutional systems love entering AFTER a compression period
+// ═══════════════════════════════════════════════════════════════════
+function detectCompression(candles) {
+  if (candles.length < 30) return { compressing:false, ratio:1 };
+  const recentATR   = calcATR(candles.slice(-8),  8);
+  const historicATR = calcATR(candles.slice(-28, -8), 14);
+  if (!historicATR || !recentATR) return { compressing:false, ratio:1 };
+  const ratio = recentATR / historicATR;
+  return {
+    compressing: ratio < 0.70,
+    ratio:       parseFloat(ratio.toFixed(2)),
+    note:        ratio < 0.70 ? 'Volatility squeeze active — breakout imminent' : null,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 2 — MACD MOMENTUM WEAKENING DETECTOR
+// Detects when price continues but momentum fades (fake breakout)
+// ═══════════════════════════════════════════════════════════════════
+function detectMomentumWeakening(h4Ind, m30Ind) {
+  const issues = [];
+  // H4 MACD slope decreasing despite trend
+  if (h4Ind.macdSlope < -0.000005 && h4Ind.trend === 'BULLISH') {
+    issues.push('H4 MACD histogram declining while price bullish — momentum fade');
+  }
+  if (h4Ind.macdSlope > 0.000005 && h4Ind.trend === 'BEARISH') {
+    issues.push('H4 MACD histogram rising while price bearish — momentum fade');
+  }
+  // M30 RSI diverging from H4 direction
+  if (h4Ind.trend === 'BULLISH' && m30Ind.rsi14 > 70) {
+    issues.push('M30 RSI overbought while H4 bullish — exhaustion risk');
+  }
+  if (h4Ind.trend === 'BEARISH' && m30Ind.rsi14 < 30) {
+    issues.push('M30 RSI oversold while H4 bearish — exhaustion risk');
+  }
+  return { weakening: issues.length > 0, issues };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 2 — LIQUIDITY INTELLIGENCE
+// Identifies likely stop cluster zones and sweep probability
+// ═══════════════════════════════════════════════════════════════════
+function analyzeLiquidity(h4Ind, price, direction, atr) {
+  const pip = atr > 1 ? 0.1 : 0.0001; // XAU vs forex
+  const resistGap  = ((h4Ind.strongResist - price) / price) * 100;
+  const supportGap = ((price - h4Ind.strongSupport) / price) * 100;
+  const nearSupport = price - h4Ind.strongSupport < atr * 1.5;
+  const nearResist  = h4Ind.strongResist - price < atr * 1.5;
+
+  let sweepRisk = 'LOW';
+  let note = '';
+
+  if (direction === 'BUY') {
+    if (nearSupport) {
+      sweepRisk = 'HIGH';
+      note = 'Price near strong support — BUY stops cluster just below, sweep likely before move up';
+    } else if (resistGap < 0.3) {
+      sweepRisk = 'HIGH';
+      note = 'Strong resistance directly above — liquidity void, not a high-probability entry';
+    } else {
+      note = `Support ${supportGap.toFixed(2)}% away, resistance ${resistGap.toFixed(2)}% away — clear path`;
+    }
+  } else {
+    if (nearResist) {
+      sweepRisk = 'HIGH';
+      note = 'Price near strong resistance — SELL stops cluster just above, sweep likely before move down';
+    } else if (supportGap < 0.3) {
+      sweepRisk = 'HIGH';
+      note = 'Strong support directly below — liquidity void, not a high-probability entry';
+    } else {
+      note = `Resistance ${resistGap.toFixed(2)}% away, support ${supportGap.toFixed(2)}% away — clear path`;
+    }
+  }
+
+  return {
+    sweep_risk:    sweepRisk,
+    support_gap:   supportGap.toFixed(2) + '%',
+    resist_gap:    resistGap.toFixed(2) + '%',
+    stop_pool:     direction === 'BUY' ? 'BELOW_SUPPORT' : 'ABOVE_RESISTANCE',
+    target_pool:   direction === 'BUY' ? 'ABOVE_RESISTANCE' : 'BELOW_SUPPORT',
+    note,
+    favorable:     sweepRisk === 'LOW',
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 4 — PORTFOLIO HEAT CALCULATOR
+// Total correlated risk % across all open positions
+// ═══════════════════════════════════════════════════════════════════
+function getPortfolioHeat() {
+  const open = db.prepare(`
+    SELECT pair, direction, risk_pct FROM signals
+    WHERE status='EXECUTED' AND closed_at IS NULL
+  `).all();
+
+  let totalPct = 0, usdLong = 0, usdShort = 0;
+  for (const s of open) {
+    const pct   = parseFloat(s.risk_pct || 1);
+    const group = USD_CORR_GROUP[s.pair]?.[s.direction];
+    totalPct  += pct;
+    if (group === 'USD_LONG')  usdLong  += pct;
+    if (group === 'USD_SHORT') usdShort += pct;
+  }
+
+  const heatLevel = totalPct > 5 ? 'CRITICAL' : totalPct > 3 ? 'HIGH' : totalPct > 1.5 ? 'MEDIUM' : 'LOW';
+  return {
+    total_risk_pct:   parseFloat(totalPct.toFixed(2)),
+    usd_long_pct:     parseFloat(usdLong.toFixed(2)),
+    usd_short_pct:    parseFloat(usdShort.toFixed(2)),
+    open_positions:   open.length,
+    heat_level:       heatLevel,
+    safe_to_add:      heatLevel !== 'CRITICAL',
+    warning:          totalPct > 5 ? `Portfolio heat CRITICAL: ${totalPct.toFixed(1)}% total risk — do NOT add positions` :
+                      totalPct > 3 ? `Portfolio heat HIGH: ${totalPct.toFixed(1)}% — trade smaller` : null,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 5 — CONFIDENCE DRIFT MONITOR
+// Detects AI/calc engine confidence inflation over time
+// ═══════════════════════════════════════════════════════════════════
+function checkConfidenceDrift() {
+  const recent = db.prepare(`
+    SELECT confidence FROM signals WHERE created_at >= datetime('now','-7 days') ORDER BY created_at DESC LIMIT 20
+  `).all();
+  const allTime = db.prepare(`SELECT AVG(confidence) as avg, COUNT(*) as cnt FROM signals`).get();
+  if (recent.length < 5 || !allTime?.cnt || allTime.cnt < 10) return { drift:false, recent_avg:null };
+
+  const recentAvg = recent.reduce((s, r) => s + r.confidence, 0) / recent.length;
+  const allAvg    = parseFloat(allTime.avg);
+  const drift     = recentAvg > allAvg + 12; // >12 point inflation = drift
+
+  return {
+    drift,
+    recent_avg:    parseFloat(recentAvg.toFixed(1)),
+    all_time_avg:  parseFloat(allAvg.toFixed(1)),
+    gap:           parseFloat((recentAvg - allAvg).toFixed(1)),
+    warning:       drift ? `Confidence inflation: recent avg ${recentAvg.toFixed(0)}% vs historical ${allAvg.toFixed(0)}%` : null,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 5 — SIGNAL FREQUENCY ANOMALY DETECTOR
+// Detects sudden spike in signal count (system behaving oddly)
+// ═══════════════════════════════════════════════════════════════════
+function checkSignalFrequencyAnomaly() {
+  const today = _stmtTodaySent.get().c;
+  const week  = db.prepare(`
+    SELECT date(created_at) as day, COUNT(*) as c FROM signals
+    WHERE created_at >= date('now','-7 days') GROUP BY date(created_at)
+  `).all();
+  if (week.length < 3) return { anomaly:false, today, avg_per_day:null };
+
+  const avg     = week.reduce((s, r) => s + r.c, 0) / week.length;
+  const anomaly = avg > 0 && today > avg * 4;
+  return {
+    anomaly,
+    today,
+    avg_per_day: parseFloat(avg.toFixed(1)),
+    warning:     anomaly ? `Signal frequency spike: ${today} today vs avg ${avg.toFixed(1)}/day` : null,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STAGE 4 — DRAWDOWN VELOCITY MONITOR
+// Detects rapidly accelerating drawdown (system degradation signal)
+// ═══════════════════════════════════════════════════════════════════
+function checkDrawdownVelocity() {
+  const recent = db.prepare(`
+    SELECT realized_pl FROM signals WHERE status='CLOSED'
+    AND closed_at >= datetime('now','-72 hours') ORDER BY closed_at ASC
+  `).all();
+  if (recent.length < 2) return { velocity:'NORMAL', daily_rate:0 };
+
+  const totalLoss = recent.filter(t => t.realized_pl < 0).reduce((s, t) => s + t.realized_pl, 0);
+  const dailyRate = Math.abs(totalLoss) / 3;
+  const velocity  = dailyRate > 50 ? 'RAPID' : dailyRate > 20 ? 'ELEVATED' : 'NORMAL';
+
+  return {
+    velocity,
+    daily_rate:    parseFloat(dailyRate.toFixed(2)),
+    total_loss_3d: parseFloat(Math.abs(totalLoss).toFixed(2)),
+    warning:       velocity !== 'NORMAL' ? `DD velocity ${velocity}: losing ~${dailyRate.toFixed(0)}/day over last 3 days` : null,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // 12-CHECK PRECISION SCORING ENGINE — top-down: H4 → H2 → M30 → M5
 // Each check = 1 point. Signal only fires if score >= minScore
 // ═══════════════════════════════════════════════════════════════════
@@ -1646,6 +1944,17 @@ async function runAutoScan() {
   const session = getSession();
   console.log(`[SCAN] Starting precision scan — session: ${session}`);
 
+  // ── Pre-scan system health checks ────────────────────────────────────────
+  const ddVelocity = checkDrawdownVelocity();
+  if (ddVelocity.velocity === 'RAPID') {
+    console.log(`[SCAN] ⛔ Rapid drawdown detected — ${ddVelocity.warning}`);
+    autoScanning = false; return; // halt scan during rapid DD
+  }
+  const freqCheck = checkSignalFrequencyAnomaly();
+  if (freqCheck.anomaly) console.log(`[SCAN] ⚠️ ${freqCheck.warning}`);
+  const confDrift = checkConfidenceDrift();
+  if (confDrift.drift) console.log(`[SCAN] ⚠️ ${confDrift.warning}`);
+
   // Pre-fetch news for blackout check
   const currentNews = newsCache || [];
 
@@ -1735,6 +2044,35 @@ async function runAutoScan() {
         continue;
       }
 
+      // ── STAGE 1: Market Regime — reject RANGING / CHOPPY ─────────────
+      const regime = classifyRegime(indH4, indM30);
+      if (!regime.tradeable) {
+        console.log(`[SCAN] ${label}: Regime ${regime.regime} — ${regime.note}`);
+        continue;
+      }
+      console.log(`[SCAN] ${label}: Regime ${regime.regime} ✓`);
+
+      // ── STAGE 1: Candle Quality — reject spike/doji/exhaustion ───────
+      const candleQuality = inspectCandleQuality(h4cc, indH4.atr14);
+      if (!candleQuality.ok) {
+        console.log(`[SCAN] ${label}: Candle quality fail — ${candleQuality.issues.join('; ')}`);
+        continue;
+      }
+
+      // ── STAGE 2: Momentum weakening check ────────────────────────────
+      const momentum = detectMomentumWeakening(indH4, indM30);
+      if (momentum.weakening) {
+        console.log(`[SCAN] ${label}: Momentum weakening — ${momentum.issues.join('; ')}`);
+        continue;
+      }
+
+      // ── STAGE 4: Portfolio heat check — don't add risk to hot book ───
+      const heat = getPortfolioHeat();
+      if (!heat.safe_to_add) {
+        console.log(`[SCAN] ${label}: Portfolio heat CRITICAL (${heat.total_risk_pct}%) — scan blocked`);
+        continue;
+      }
+
       // ── FILTER 3: W1 trend — no counter-trend trades ──────────────────
       if (w1c.length >= 5) {
         const w1closes = w1c.map(c => parseFloat(c.mid.c));
@@ -1745,6 +2083,21 @@ async function runAutoScan() {
           console.log(`[SCAN] ${label}: W1 ${w1trend} — counter-trend ${aiDirection} rejected`);
           continue;
         }
+      }
+
+      // ── STAGE 2: Supplementary intelligence (logged, not blocking) ───
+      const rsiDiv     = detectRSIDivergence(m30cc, aiDirection);
+      const compression= detectCompression(h4cc);
+      const liquidity  = analyzeLiquidity(indH4, price, aiDirection, indH4.atr14);
+
+      if (liquidity.sweep_risk === 'HIGH') {
+        console.log(`[SCAN] ${label}: Liquidity warning — ${liquidity.note}`);
+      }
+      if (compression.compressing) {
+        console.log(`[SCAN] ${label}: Compression detected (ATR ratio ${compression.ratio}) — breakout potential ✓`);
+      }
+      if (rsiDiv !== 'NONE') {
+        console.log(`[SCAN] ${label}: RSI divergence: ${rsiDiv}`);
       }
 
       // ── Run 12-check scoring engine ───────────────────────────────────
@@ -1918,7 +2271,7 @@ Return EXACTLY 6 lines, no other text:
 
       const tgText =
 `🎯 HIGH-PRECISION SIGNAL #${signalId}
-Score: ${scored.score}/${scored.maxScore} checks passed
+Score: ${scored.score}/${scored.maxScore} checks | Regime: ${regime.regime}
 
 Pair:        ${label}
 Direction:   ${parsed.direction} ${dirArrow}
@@ -1938,14 +2291,17 @@ ${failedStr ? failedStr : ''}
 H4 (Master):  ${indH4.emaAlignment} | RSI ${indH4.rsi14} | ADX ${indH4.adx}
 H2 (Confirm): ${indH2.trend} | RSI ${indH2.rsi14}
 M30 (Entry):  ${indM30.trend} | RSI ${indM30.rsi14} | MACD ${indM30.macd}
-M5 (Trigger): ${indM5.trend} | Pattern: ${indM5.pattern}`;
+M5 (Trigger): ${indM5.trend} | Pattern: ${indM5.pattern}
+${rsiDiv !== 'NONE' ? `RSI Signal: ${rsiDiv}` : ''}
+${compression.compressing ? `Compression: ✓ Squeeze detected (${compression.ratio}x ATR)` : ''}
+${liquidity.sweep_risk === 'HIGH' ? `⚠️ Liquidity: ${liquidity.note}` : `Liquidity: ${liquidity.note}`}`;
 
       const r = await tgSendButtons(tgText, [[
         { text:'✅ APPROVE', callback_data:`approve_${signalId}` },
         { text:'❌ REJECT',  callback_data:`reject_${signalId}`  },
       ]]);
       if (r?.result?.message_id) {
-        db.prepare(`UPDATE signals SET tg_message_id=? WHERE id=?`).run(r.result.message_id, signalId);
+        db.prepare('UPDATE signals SET tg_message_id=? WHERE id=?').run(r.result.message_id, signalId);
       }
       console.log(`[SCAN] ✅ Signal #${signalId}: ${label} ${parsed.direction} ${parsed.confidence}% score=${scored.score}/${scored.maxScore}`);
 
@@ -2634,6 +2990,134 @@ app.get('/api/execution/slippage', (req, res) => {
     by_pair: byPair,
     recent: rows.slice(0, 10),
   });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INTELLIGENCE API — full institutional pre-trade report
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/api/intelligence', async (req, res) => {
+  const keys = getApiKeys();
+
+  // Portfolio heat
+  const heat = getPortfolioHeat();
+
+  // System health
+  const ddVel    = checkDrawdownVelocity();
+  const confDrift= checkConfidenceDrift();
+  const freqAnom = checkSignalFrequencyAnomaly();
+
+  // Session + news
+  const session  = getSession();
+  const newsCount= newsCache.filter(n => {
+    if (n.impact !== 'HIGH') return false;
+    const nowMin = new Date().getUTCHours() * 60 + new Date().getUTCMinutes();
+    const [hh, mm] = (n.time || '99:99').split(':').map(Number);
+    const diff = nowMin - (hh * 60 + mm);
+    return diff >= -45 && diff <= 30;
+  }).length;
+
+  // Infrastructure
+  const avgLat  = getOandaAvgLatency();
+  const daily   = getDailyPL();
+  const consec  = getConsecutiveLosses();
+
+  // Recent signal quality
+  const recentSignals = db.prepare(`
+    SELECT pair, direction, confidence, status, realized_pl, created_at
+    FROM signals ORDER BY created_at DESC LIMIT 10
+  `).all();
+  const closedRecent  = recentSignals.filter(s => s.status === 'CLOSED');
+  const winRate7d     = closedRecent.length
+    ? Math.round(closedRecent.filter(s => s.realized_pl > 0).length / closedRecent.length * 100) : null;
+
+  // Per-pair win rates (all time)
+  const pairStats = db.prepare(`
+    SELECT pair,
+      COUNT(*) as total,
+      SUM(CASE WHEN realized_pl > 0 THEN 1 ELSE 0 END) as wins,
+      AVG(confidence) as avg_conf,
+      ROUND(AVG(realized_pl), 2) as avg_pl
+    FROM signals WHERE status='CLOSED'
+    GROUP BY pair ORDER BY total DESC
+  `).all();
+
+  // Per-session win rates
+  const sessionStats = db.prepare(`
+    SELECT
+      CASE
+        WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 7  AND 11 THEN 'LONDON'
+        WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 12 AND 16 THEN 'NY'
+        WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 0  AND 6  THEN 'ASIAN'
+        ELSE 'OFF_HOURS'
+      END as sess,
+      COUNT(*) as total,
+      SUM(CASE WHEN realized_pl > 0 THEN 1 ELSE 0 END) as wins,
+      ROUND(AVG(realized_pl), 2) as avg_pl
+    FROM signals WHERE status='CLOSED'
+    GROUP BY sess
+  `).all();
+
+  res.json({
+    timestamp: new Date().toISOString(),
+
+    // Stage 1 — Market Environment
+    environment: {
+      session,
+      session_tradeable: ['LONDON','NY'].includes(session),
+      high_impact_news_now: newsCount > 0,
+      news_blackout: newsCount > 0 ? `${newsCount} HIGH-impact event(s) within ±45 min — DO NOT TRADE` : 'Clear',
+      oanda_latency_ms: Math.round(avgLat),
+      feed_healthy: avgLat < 3000 || avgLat === 0,
+    },
+
+    // Stage 4 — Risk
+    risk: {
+      daily_pl:          daily.realized_pl.toFixed(2),
+      consecutive_losses: consec,
+      circuit_breaker:   consec >= 3,
+      drawdown_velocity: ddVel,
+      portfolio_heat:    heat,
+    },
+
+    // Stage 5 — Statistical intelligence
+    statistics: {
+      win_rate_7d:    winRate7d,
+      recent_signals: recentSignals.length,
+      by_pair:        pairStats.map(p => ({
+        pair: p.pair, total: p.total,
+        win_rate: p.total ? Math.round(p.wins / p.total * 100) : null,
+        avg_conf: parseFloat((p.avg_conf || 0).toFixed(1)),
+        avg_pl:   p.avg_pl,
+      })),
+      by_session: sessionStats.map(s => ({
+        session: s.sess, total: s.total,
+        win_rate: s.total ? Math.round(s.wins / s.total * 100) : null,
+        avg_pl:   s.avg_pl,
+      })),
+    },
+
+    // Stage 5 — AI governance
+    ai_governance: {
+      confidence_drift:    confDrift,
+      signal_frequency:    freqAnom,
+    },
+
+    // System verdict
+    verdict: {
+      safe_to_trade: !newsCount && consec < 3 && ddVel.velocity !== 'RAPID' && heat.safe_to_add,
+      blockers: [
+        newsCount > 0 ? 'High-impact news active' : null,
+        consec >= 3 ? `Circuit breaker: ${consec} consecutive losses` : null,
+        ddVel.velocity === 'RAPID' ? ddVel.warning : null,
+        !heat.safe_to_add ? heat.warning : null,
+      ].filter(Boolean),
+    },
+  });
+});
+
+// Portfolio heat endpoint
+app.get('/api/portfolio/heat', (req, res) => {
+  res.json(getPortfolioHeat());
 });
 
 app.get('/api/health', (req, res) => {

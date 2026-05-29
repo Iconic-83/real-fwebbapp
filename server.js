@@ -1807,7 +1807,10 @@ function recordRegime(pair, regime) {
 }
 function getRegimePersistence(pair, currentRegime) {
   const history = _regimeHistory.filter(r => r.pair === pair).slice(-8);
-  if (history.length < 3) return { stable: false, count: 0, score: 'LOW' };
+  if (history.length < 3) return {
+    stable: false, count: history.length, score: 'LOW',
+    note: `${currentRegime} too new — only ${history.length} reading(s), need 3+`,
+  };
   const consecutive = [];
   for (let i = history.length - 1; i >= 0; i--) {
     if (history[i].regime === currentRegime) consecutive.push(history[i]);
@@ -1991,13 +1994,14 @@ async function recalcAtExecution(signal, keys) {
   }
 
   // 3 — Spread check at execution moment
-  const atr = parseFloat(signal.entry_price) > 100
-    ? (h1AtrCache[oandaInstr] || 0.5)   // XAU: fallback 50 pips
-    : (h1AtrCache[oandaInstr] || 0.001);
+  // ATR from scan cache, fallback to SL distance / 2.0 (SL is ~1.5-2× ATR by design)
+  const slDistRaw   = Math.abs(parseFloat(signal.stop_loss) - signalPrice);
+  const atrFallback = slDistRaw > 0 ? slDistRaw / 1.8 : pipSize * 15;
+  const atr = h1AtrCache[oandaInstr] || atrFallback;
   if (atr > 0 && freshSpread / atr > 0.30) {
     return {
       blocked: true,
-      reason: `Spread ${spreadPips.toFixed(1)} pips too wide at execution (>30% of ATR)`,
+      reason: `Spread ${spreadPips.toFixed(1)} pips too wide at execution (>30% of ATR ${(atr/pipSize).toFixed(1)} pips)`,
       spreadPips,
     };
   }

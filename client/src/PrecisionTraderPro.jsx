@@ -767,9 +767,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
         await recordPL(realized);
         getDailyStatus().then(setDaily);
         addAlert({ type:"CLOSE", icon:"🔒", title:"Trade Closed", detail:`Realized P&L: ${realized >= 0 ? '+' : ''}${realized.toFixed(2)}`, color:"#00ccff" });
-        fetch("/api/telegram/send", { method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({ message:`🔒 <b>TRADE CLOSED</b>\nP&L: ${realized >= 0 ? '+' : ''}${realized.toFixed(2)}\nPair: ${PAIR_LABELS[pair]}` })
-        });
+        sendTelegramViaBackend(`TRADE CLOSED\nP&L: ${realized >= 0 ? '+' : ''}${realized.toFixed(2)}\nPair: ${PAIR_LABELS[pair]}`);
         refresh();
       }
     } catch {}
@@ -990,11 +988,8 @@ function Opportunities({ prices, keys, addAlert }) {
       const top = [...results].sort((a, b) => b.conf - a.conf)[0];
       const slLine = top.sl ? `SL: ${top.sl}` : '';
       const tpLine = top.tp ? `TP: ${top.tp}` : '';
-      // Send to Telegram with full signal
-      fetch("/api/telegram/send", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ message: `🔍 <b>AI MARKET SCAN — PrecisionTraderPro</b>\n\n📊 Top Signal: <b>${top.label}</b>\n📈 Bias: <b>${top.bias}</b>\n🎯 Confidence: <b>${top.conf}%</b>\n💰 Price: ${top.price}\n${slLine ? `🛑 ${slLine}\n` : ''}${tpLine ? `✅ ${tpLine}\n` : ''}\nReal candle data used ✓` })
-      });
+      // Send to Telegram via backend (auth-aware)
+      sendTelegramViaBackend(`AI MARKET SCAN\nTop: ${top.label} ${top.bias} ${top.conf}%\nPrice: ${top.price}\n${slLine}\n${tpLine}`);
       addAlert({ type:"SCAN", icon:"◈", title:"AI Scan Complete", detail:`Best: ${top.label} ${top.bias} ${top.conf}%`, color:"#00ccff" });
     }
     setScanning(false);

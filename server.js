@@ -23,24 +23,32 @@ app.use(express.json({ limit: '2mb' }));
 // ═════════════════════════════════════════════════════════════════════════════
 // HELPERS
 // ═════════════════════════════════════════════════════════════════════════════
+
+// Prepared once — storage table created in db.js before this runs
+const _stmtGetStorage = db.prepare('SELECT value FROM storage WHERE key = ?');
+const _stmtSetStorage = db.prepare(`
+  INSERT INTO storage (key, value, updated_at)
+  VALUES (?, ?, CURRENT_TIMESTAMP)
+  ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+`);
+
 function getStorageValue(key) {
-  const row = db.prepare('SELECT value FROM storage WHERE key = ?').get(key);
+  const row = _stmtGetStorage.get(key);
   if (!row) return null;
   try { return JSON.parse(row.value); } catch { return row.value; }
 }
 
 function setStorageValue(key, value) {
   const v = typeof value === 'string' ? value : JSON.stringify(value);
-  db.prepare(`
-    INSERT INTO storage (key, value, updated_at)
-    VALUES (?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-  `).run(key, v);
+  _stmtSetStorage.run(key, v);
 }
 
+// API keys cached for 30 s — avoid DB round-trip on every request
+let _keysCache = null, _keysCacheAt = 0;
 function getApiKeys() {
+  if (_keysCache && (Date.now() - _keysCacheAt) < 30000) return _keysCache;
   const stored = getStorageValue('ptp_keys') || {};
-  return {
+  _keysCache = {
     openai_key:    process.env.OPENAI_API_KEY    || stored.openai_key    || '',
     claude_key:    process.env.ANTHROPIC_API_KEY  || stored.claude_key   || '',
     oanda_key:     process.env.OANDA_API_KEY      || stored.oanda_key     || '',
@@ -49,7 +57,10 @@ function getApiKeys() {
     tg_token:      process.env.TELEGRAM_TOKEN     || stored.tg_token      || '',
     tg_chat:       process.env.TELEGRAM_CHAT_ID   || stored.tg_chat       || '',
   };
+  _keysCacheAt = Date.now();
+  return _keysCache;
 }
+function invalidateKeysCache() { _keysCache = null; }
 
 // OANDA instrument map (label → OANDA format)
 const LABEL_TO_OANDA = {
@@ -535,7 +546,6 @@ function getSession() {
   if (h >= 0  && h < 7)  return 'ASIAN';
   if (h >= 7  && h < 12) return 'LONDON';
   if (h >= 12 && h < 17) return 'NY';
-  if (h >= 12 && h < 17) return 'LONDON+NY';
   return 'OFF_HOURS';
 }
 
@@ -553,22 +563,21 @@ const USD_CORR_GROUP = {
   // XAU/USD omitted — standalone asset, no USD correlation limit
 };
 
+const _stmtWeeklyPL = db.prepare(`
+  SELECT COALESCE(SUM(realized_pl), 0) as total, COUNT(*) as cnt
+  FROM signals WHERE status='CLOSED' AND date(closed_at) >= ?
+`);
+
 function getWeeklyPL() {
   const now = new Date();
   const daysFromMonday = now.getUTCDay() === 0 ? 6 : now.getUTCDay() - 1;
   const monday = new Date(now.getTime() - daysFromMonday * 86400000).toISOString().slice(0, 10);
-  const row = db.prepare(`
-    SELECT COALESCE(SUM(realized_pl), 0) as total, COUNT(*) as cnt
-    FROM signals WHERE status='CLOSED' AND date(closed_at) >= ?
-  `).get(monday);
+  const row = _stmtWeeklyPL.get(monday);
   return { realized_pl: row?.total || 0, trade_count: row?.cnt || 0, week_start: monday };
 }
 
 function getConsecutiveLosses() {
-  const recent = db.prepare(`
-    SELECT realized_pl FROM signals WHERE status='CLOSED'
-    ORDER BY closed_at DESC LIMIT 10
-  `).all();
+  const recent = _stmtConsecLosses.all();
   let count = 0;
   for (const t of recent) {
     if ((t.realized_pl || 0) < 0) count++;
@@ -580,9 +589,7 @@ function getConsecutiveLosses() {
 function getCorrelatedOpenCount(pair, direction) {
   const myGroup = USD_CORR_GROUP[pair]?.[direction];
   if (!myGroup) return 0;
-  const open = db.prepare(
-    `SELECT pair, direction FROM signals WHERE status='EXECUTED' AND closed_at IS NULL`
-  ).all();
+  const open = _stmtOpenTrades.all();
   return open.filter(s => USD_CORR_GROUP[s.pair]?.[s.direction] === myGroup).length;
 }
 
@@ -621,9 +628,7 @@ async function checkRiskGovernors(signal) {
 
   // FIX 10 — Extended kill switches
   // 4. 5 losing trades today regardless of streak
-  const todayLosses = db.prepare(`
-    SELECT COUNT(*) as c FROM signals WHERE status='CLOSED' AND realized_pl < 0 AND date(closed_at)=date('now')
-  `).get();
+  const todayLosses = _stmtTodayLosses.get();
   if (todayLosses.c >= 5)
     blocks.push(`5 losing trades today — daily loss count kill switch`);
 
@@ -638,8 +643,7 @@ async function checkRiskGovernors(signal) {
 
   if (blocks.length > 0) {
     blocks.forEach(detail => {
-      db.prepare(`INSERT INTO risk_events (event_type, detail, blocked_pair, action) VALUES (?,?,?,?)`)
-        .run('GOVERNOR_BLOCK', detail, signal?.pair || null, 'BLOCKED_EXECUTION');
+      _stmtInsertRiskEvent.run('GOVERNOR_BLOCK', detail, signal?.pair || null, 'BLOCKED_EXECUTION');
     });
   }
 
@@ -654,9 +658,7 @@ async function reconcileTrades() {
   const keys = getApiKeys();
   if (!keys.oanda_key || !keys.oanda_account) return;
 
-  const pending = db.prepare(
-    `SELECT * FROM signals WHERE status='EXECUTED' AND closed_at IS NULL AND trade_id IS NOT NULL`
-  ).all();
+  const pending = _stmtPendingReconcile.all();
   if (!pending.length) return;
 
   try {
@@ -736,12 +738,15 @@ function backupDatabase() {
 }
 
 // ── Trailing stop monitor — protects open profits ────────────────────────────
+let _tslBackoffUntil = 0;
 async function runTrailingStops() {
   const keys = getApiKeys();
   if (!keys.oanda_key || !keys.oanda_account) return;
+  if (Date.now() < _tslBackoffUntil) return; // skip when we know no trades are open
   try {
     const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/openTrades`);
     const trades = r?.trades || [];
+    if (!trades.length) { _tslBackoffUntil = Date.now() + 120000; return; } // 2 min backoff
     for (const trade of trades) {
       const pl   = parseFloat(trade.unrealizedPL || 0);
       const units= parseFloat(trade.currentUnits || 0);
@@ -811,10 +816,8 @@ app.get('/api/storage/:key', (req, res) => {
 app.post('/api/storage/:key', (req, res) => {
   const { value } = req.body;
   if (value === undefined) return res.status(400).json({ error: 'value required' });
-  db.prepare(`
-    INSERT INTO storage (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-  `).run(req.params.key, value);
+  _stmtSetStorage.run(req.params.key, value);
+  if (req.params.key === 'ptp_keys') invalidateKeysCache();
   res.json({ ok: true });
 });
 
@@ -1085,20 +1088,13 @@ function getTodayDate() {
 
 function getDailyPL() {
   const today = getTodayDate();
-  const row = db.prepare('SELECT * FROM daily_pnl WHERE date = ?').get(today);
+  const row = _stmtDailyPL.get(today);
   return row || { date: today, realized_pl: 0, trade_count: 0 };
 }
 
 function recordTradePL(pl) {
   const today = getTodayDate();
-  db.prepare(`
-    INSERT INTO daily_pnl (date, realized_pl, trade_count, updated_at)
-    VALUES (?, ?, 1, CURRENT_TIMESTAMP)
-    ON CONFLICT(date) DO UPDATE SET
-      realized_pl = realized_pl + ?,
-      trade_count = trade_count + 1,
-      updated_at  = CURRENT_TIMESTAMP
-  `).run(today, pl, pl);
+  _stmtRecordPL.run(today, pl, pl);
 }
 
 app.get('/api/trade/daily', async (req, res) => {
@@ -1276,6 +1272,7 @@ app.post('/api/telegram/setup', async (req, res) => {
     const stored = getStorageValue('ptp_keys') || {};
     stored.tg_chat = chatId;
     setStorageValue('ptp_keys', stored);
+    invalidateKeysCache();
     // Send welcome message
     await sendTelegramMsg('✅ PrecisionTraderPro\nTelegram alerts ACTIVE! You will receive trade signals here automatically.');
     res.json({ ok:true, chat_id:chatId });
@@ -1362,6 +1359,50 @@ db.exec(`
     action       TEXT
   );
 `);
+
+// ── Indexes — fast lookups on large signals table ─────────────────────────────
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_signals_status     ON signals(status);
+  CREATE INDEX IF NOT EXISTS idx_signals_created    ON signals(created_at);
+  CREATE INDEX IF NOT EXISTS idx_signals_closed     ON signals(closed_at);
+  CREATE INDEX IF NOT EXISTS idx_signals_trade_id   ON signals(trade_id);
+  CREATE INDEX IF NOT EXISTS idx_risk_events_date   ON risk_events(created_at);
+  CREATE INDEX IF NOT EXISTS idx_daily_pnl_date     ON daily_pnl(date);
+`);
+
+// ── Frequently-used prepared statements (compiled once) ───────────────────────
+const _stmtDailyPL = db.prepare('SELECT * FROM daily_pnl WHERE date = ?');
+const _stmtRecordPL = db.prepare(`
+  INSERT INTO daily_pnl (date, realized_pl, trade_count, updated_at)
+  VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+  ON CONFLICT(date) DO UPDATE SET
+    realized_pl = realized_pl + ?,
+    trade_count = trade_count + 1,
+    updated_at  = CURRENT_TIMESTAMP
+`);
+const _stmtConsecLosses = db.prepare(`
+  SELECT realized_pl FROM signals WHERE status='CLOSED'
+  ORDER BY closed_at DESC LIMIT 10
+`);
+const _stmtTodaySent = db.prepare(`
+  SELECT COUNT(*) as c FROM signals
+  WHERE date(created_at)=date('now') AND status IN ('PENDING','EXECUTED','APPROVED')
+`);
+const _stmtOpenTrades = db.prepare(
+  `SELECT pair, direction FROM signals WHERE status='EXECUTED' AND closed_at IS NULL`
+);
+const _stmtPendingReconcile = db.prepare(
+  `SELECT * FROM signals WHERE status='EXECUTED' AND closed_at IS NULL AND trade_id IS NOT NULL`
+);
+const _stmtOpenTradeCount = db.prepare(
+  `SELECT COUNT(*) as c FROM signals WHERE status='EXECUTED' AND closed_at IS NULL`
+);
+const _stmtInsertRiskEvent = db.prepare(
+  `INSERT INTO risk_events (event_type, detail, blocked_pair, action) VALUES (?,?,?,?)`
+);
+const _stmtTodayLosses = db.prepare(
+  `SELECT COUNT(*) as c FROM signals WHERE status='CLOSED' AND realized_pl < 0 AND date(closed_at)=date('now')`
+);
 
 // ── Parse AI response ────────────────────────────────────────────────────────
 function parseAIResponse(analysis) {
@@ -1595,7 +1636,7 @@ async function runAutoScan() {
   const riskPct   = parseFloat(settings.risk_pct || 1);
   const maxPerDay = parseInt(settings.max_per_day || 3);
 
-  const todaySent = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now') AND status IN ('PENDING','EXECUTED','APPROVED')`).get();
+  const todaySent = _stmtTodaySent.get();
   if (todaySent.c >= maxPerDay) return;
 
   const keys = getApiKeys();
@@ -1612,7 +1653,7 @@ async function runAutoScan() {
 
   for (const instr of scanPairs) {
     try {
-      const fresh = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now') AND status IN ('PENDING','EXECUTED','APPROVED')`).get();
+      const fresh = _stmtTodaySent.get();
       if (fresh.c >= maxPerDay) break;
 
       const existPending = db.prepare(`SELECT id FROM signals WHERE pair=? AND status='PENDING'`).get(instr.replace('_','/'));
@@ -2010,7 +2051,7 @@ app.get('/api/risk/status', async (req, res) => {
   const maxWeekly = balance > 0 ? balance * 0.06 : 0;
 
   // Open position correlation snapshot
-  const openSigs = db.prepare(`SELECT pair, direction FROM signals WHERE status='EXECUTED' AND closed_at IS NULL`).all();
+  const openSigs = _stmtOpenTrades.all();
   const usdLong  = openSigs.filter(s => USD_CORR_GROUP[s.pair]?.[s.direction] === 'USD_LONG').length;
   const usdShort = openSigs.filter(s => USD_CORR_GROUP[s.pair]?.[s.direction] === 'USD_SHORT').length;
 
@@ -2134,8 +2175,7 @@ async function emergencyFlatten(triggeredBy = 'API') {
     console.error('[EMERGENCY] Could not fetch open trades:', e.message);
   }
 
-  db.prepare(`INSERT INTO risk_events (event_type, detail, action) VALUES (?,?,?)`)
-    .run('EMERGENCY_FLATTEN', `Triggered by ${triggeredBy}. Closed ${closed} position(s).`, 'ALL_CLOSED_SAFE_MODE');
+  _stmtInsertRiskEvent.run('EMERGENCY_FLATTEN', `Triggered by ${triggeredBy}. Closed ${closed} position(s).`, null, 'ALL_CLOSED_SAFE_MODE');
 
   const msg =
 `🚨 EMERGENCY FLATTEN EXECUTED

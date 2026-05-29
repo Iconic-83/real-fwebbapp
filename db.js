@@ -14,8 +14,12 @@ if (!fs.existsSync(dataDir)) {
 const dbPath = path.join(dataDir, 'precisiontrader.db');
 const db = new Database(dbPath);
 
-// Enable WAL mode for better performance
-db.pragma('journal_mode = WAL');
+// Performance pragmas
+db.pragma('journal_mode = WAL');      // concurrent reads + writes
+db.pragma('synchronous = NORMAL');    // safe with WAL, much faster than FULL
+db.pragma('cache_size = -16000');     // 16 MB page cache
+db.pragma('temp_store = MEMORY');     // temp tables in RAM
+db.pragma('mmap_size = 268435456');   // 256 MB memory-mapped I/O
 db.pragma('foreign_keys = ON');
 
 // Create tables

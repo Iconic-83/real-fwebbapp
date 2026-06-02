@@ -2818,12 +2818,21 @@ ${rsiDiv !== 'NONE' ? `RSI Signal: ${rsiDiv}` : ''}
 ${compression.compressing ? `Compression: ✓ Squeeze detected (${compression.ratio}x ATR)` : ''}
 ${liquidity.sweep_risk === 'HIGH' ? `⚠️ Liquidity: ${liquidity.note}` : `Liquidity: ${liquidity.note}`}`;
 
-      const r = await tgSendButtons(tgText, [[
-        { text:'✅ APPROVE', callback_data:`approve_${signalId}` },
-        { text:'❌ REJECT',  callback_data:`reject_${signalId}`  },
-      ]]);
-      if (r?.result?.message_id) {
-        db.prepare('UPDATE signals SET tg_message_id=? WHERE id=?').run(r.result.message_id, signalId);
+      // ── AUTO-EXECUTE or send for manual approval ──────────────────────
+      if (settings.auto_execute) {
+        // Fetch the just-inserted signal row and execute immediately
+        const sigRow = db.prepare('SELECT * FROM signals WHERE id=?').get(signalId);
+        console.log(`[SCAN] ⚡ Auto-executing #${signalId}: ${label} ${parsed.direction} ${parsed.confidence}%`);
+        sendTelegramMsg(`⚡ AUTO-EXECUTING SIGNAL #${signalId}\n${tgText}`).catch(() => {});
+        await executeSignal(sigRow);
+      } else {
+        const r = await tgSendButtons(tgText, [[
+          { text:'✅ APPROVE', callback_data:`approve_${signalId}` },
+          { text:'❌ REJECT',  callback_data:`reject_${signalId}`  },
+        ]]);
+        if (r?.result?.message_id) {
+          db.prepare('UPDATE signals SET tg_message_id=? WHERE id=?').run(r.result.message_id, signalId);
+        }
       }
       console.log(`[SCAN] ✅ Signal #${signalId}: ${label} ${parsed.direction} ${parsed.confidence}% score=${scored.score}/${scored.maxScore}`);
 
@@ -2851,24 +2860,26 @@ setInterval(backupDatabase, 24 * 60 * 60 * 1000);
 
 // ── Signal API endpoints ──────────────────────────────────────────────────────
 app.get('/api/autotrade/settings', (req, res) => {
-  const s = getStorageValue('autotrade_settings') || { enabled:false, threshold:85, risk_pct:1, max_per_day:3, min_score:9 };
+  const s = getStorageValue('autotrade_settings') || { enabled:false, auto_execute:false, threshold:85, risk_pct:1, max_per_day:3, min_score:9 };
   res.json(s);
 });
 
 app.post('/api/autotrade/settings', (req, res) => {
-  const { enabled, threshold, risk_pct, max_per_day, min_score } = req.body;
+  const { enabled, auto_execute, threshold, risk_pct, max_per_day, min_score } = req.body;
   const s = {
-    enabled:   !!enabled,
-    threshold: parseInt(threshold  || 85),
-    risk_pct:  parseFloat(risk_pct || 1),
-    max_per_day: parseInt(max_per_day || 3),
-    min_score: parseInt(min_score || 9),
+    enabled:      !!enabled,
+    auto_execute: !!auto_execute,
+    threshold:    parseInt(threshold   || 85),
+    risk_pct:     parseFloat(risk_pct  || 1),
+    max_per_day:  parseInt(max_per_day || 3),
+    min_score:    parseInt(min_score   || 9),
   };
   setStorageValue('autotrade_settings', s);
   writeAudit('SETTINGS_CHANGED', s, 'WEB_UI');
-  const onOff = s.enabled ? 'ON' : 'OFF';
+  const onOff    = s.enabled ? 'ON' : 'OFF';
+  const execMode = s.auto_execute ? '⚡ AUTO-EXECUTE (trades fire automatically)' : '👤 MANUAL APPROVAL (Telegram buttons)';
   sendTelegramMsg(
-    `Signal Scanner: ${onOff}\nScore filter: ${s.min_score}/12 checks required\nAI threshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax/day: ${s.max_per_day}\n\nOnly the highest-confidence setups will be signalled.`
+    `Signal Scanner: ${onOff}\nMode: ${execMode}\nScore filter: ${s.min_score}/12 checks required\nAI threshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax/day: ${s.max_per_day}`
   );
   res.json({ ok:true, settings:s });
 });
@@ -2888,7 +2899,7 @@ app.get('/api/autotrade/status', (req, res) => {
   const pending = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='PENDING'`).get();
   const today   = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now')`).get();
   const total   = db.prepare(`SELECT COUNT(*) as c FROM signals`).get();
-  res.json({ enabled:s.enabled, threshold:s.threshold||80, risk_pct:s.risk_pct||1, max_per_day:s.max_per_day||3,
+  res.json({ enabled:s.enabled, auto_execute:s.auto_execute||false, threshold:s.threshold||80, risk_pct:s.risk_pct||1, max_per_day:s.max_per_day||3,
     pending_signals:pending.c, today_signals:today.c, total_signals:total.c, scanning:autoScanning });
 });
 

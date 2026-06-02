@@ -609,10 +609,8 @@ function analyzeLiquidity(h4Ind, price, direction, atr) {
 // Detects AI/calc engine confidence inflation over time
 // ═══════════════════════════════════════════════════════════════════
 function checkConfidenceDrift() {
-  const recent = db.prepare(`
-    SELECT confidence FROM signals WHERE created_at >= datetime('now','-7 days') ORDER BY created_at DESC LIMIT 20
-  `).all();
-  const allTime = db.prepare(`SELECT AVG(confidence) as avg, COUNT(*) as cnt FROM signals`).get();
+  const recent  = _stmtConfidenceRecent.all();
+  const allTime = _stmtConfidenceAllTime.get();
   if (recent.length < 5 || !allTime?.cnt || allTime.cnt < 10) return { drift:false, recent_avg:null };
 
   const recentAvg = recent.reduce((s, r) => s + r.confidence, 0) / recent.length;
@@ -634,10 +632,7 @@ function checkConfidenceDrift() {
 // ═══════════════════════════════════════════════════════════════════
 function checkSignalFrequencyAnomaly() {
   const today = _stmtTodaySent.get().c;
-  const week  = db.prepare(`
-    SELECT date(created_at) as day, COUNT(*) as c FROM signals
-    WHERE created_at >= date('now','-7 days') GROUP BY date(created_at)
-  `).all();
+  const week  = _stmtSignalFreqWeek.all();
   if (week.length < 3) return { anomaly:false, today, avg_per_day:null };
 
   const avg     = week.reduce((s, r) => s + r.c, 0) / week.length;
@@ -655,10 +650,7 @@ function checkSignalFrequencyAnomaly() {
 // Detects rapidly accelerating drawdown (system degradation signal)
 // ═══════════════════════════════════════════════════════════════════
 function checkDrawdownVelocity() {
-  const recent = db.prepare(`
-    SELECT realized_pl FROM signals WHERE status='CLOSED'
-    AND closed_at >= datetime('now','-72 hours') ORDER BY closed_at ASC
-  `).all();
+  const recent = _stmtDrawdownVelocity.all();
   if (recent.length < 2) return { velocity:'NORMAL', daily_rate:0 };
 
   const totalLoss = recent.filter(t => t.realized_pl < 0).reduce((s, t) => s + t.realized_pl, 0);
@@ -903,11 +895,6 @@ const USD_CORR_GROUP = {
   // Cross pairs and commodities — no USD directional limit applied
 };
 
-const _stmtWeeklyPL = db.prepare(`
-  SELECT COALESCE(SUM(realized_pl), 0) as total, COUNT(*) as cnt
-  FROM signals WHERE status='CLOSED' AND date(closed_at) >= ?
-`);
-
 function getWeeklyPL() {
   const now = new Date();
   const daysFromMonday = now.getUTCDay() === 0 ? 6 : now.getUTCDay() - 1;
@@ -1003,11 +990,19 @@ async function reconcileTrades() {
     // ── Part 1: Close reconciliation (existing logic, enhanced) ─────────────
     const pending = _stmtPendingReconcile.all();
     if (pending.length) {
-      const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=50`);
+      const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=200`);
       const closed = r?.trades || [];
 
       for (const sig of pending) {
-        const oTrade = closed.find(t => t.id === sig.trade_id);
+        let oTrade = closed.find(t => t.id === sig.trade_id);
+
+        // Fallback: direct lookup by trade_id when not in recent batch
+        if (!oTrade && sig.trade_id) {
+          try {
+            const direct = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${sig.trade_id}`);
+            oTrade = direct?.trade;
+          } catch {}
+        }
         if (!oTrade) continue;
 
         const oInstr     = LABEL_TO_OANDA[sig.pair] || sig.pair.replace('/', '_');
@@ -1061,10 +1056,7 @@ Duration: ${dur}`
     if (!brokerOpen.length) return;
 
     // Get all trade IDs we know about locally
-    const localTradeIds = new Set(
-      db.prepare(`SELECT trade_id FROM signals WHERE status='EXECUTED' AND closed_at IS NULL AND trade_id IS NOT NULL`)
-        .all().map(r => r.trade_id)
-    );
+    const localTradeIds = new Set(_stmtOpenTradeIds.all().map(r => r.trade_id));
 
     for (const bt of brokerOpen) {
       if (localTradeIds.has(bt.id)) continue; // known — all good
@@ -1268,7 +1260,10 @@ async function pollPrices() {
       if (r.data && !r.data.code) {
         const m = {};
         PAIRS.forEach(p => { if (r.data[p]?.price) m[p] = r.data[p].price; });
-        if (Object.keys(m).length > 0) { priceCache=m; priceCacheTime=Date.now(); priceSource='TwelveData'; }
+        if (Object.keys(m).length > 0) {
+          priceCache=m; priceCacheTime=Date.now(); priceSource='TwelveData';
+          spreadCache = {}; // Twelve Data has no bid/ask — clear stale OANDA spreads so spread filters don't use wrong data
+        }
       }
     } catch {}
   }
@@ -1775,6 +1770,10 @@ db.exec(`
 `);
 
 // ── Frequently-used prepared statements (compiled once) ───────────────────────
+const _stmtWeeklyPL = db.prepare(`
+  SELECT COALESCE(SUM(realized_pl), 0) as total, COUNT(*) as cnt
+  FROM signals WHERE status='CLOSED' AND date(closed_at) >= ?
+`);
 const _stmtDailyPL = db.prepare('SELECT * FROM daily_pnl WHERE date = ?');
 const _stmtRecordPL = db.prepare(`
   INSERT INTO daily_pnl (date, realized_pl, trade_count, updated_at)
@@ -1806,6 +1805,26 @@ const _stmtInsertRiskEvent = db.prepare(
 );
 const _stmtTodayLosses = db.prepare(
   `SELECT COUNT(*) as c FROM signals WHERE status='CLOSED' AND realized_pl < 0 AND date(closed_at)=date('now')`
+);
+
+// ── Hot-path analytics — prepared once to avoid per-call re-compilation ────────
+const _stmtConfidenceRecent = db.prepare(
+  `SELECT confidence FROM signals WHERE created_at >= datetime('now','-7 days') ORDER BY created_at DESC LIMIT 20`
+);
+const _stmtConfidenceAllTime = db.prepare(
+  `SELECT AVG(confidence) as avg, COUNT(*) as cnt FROM signals`
+);
+const _stmtSignalFreqWeek = db.prepare(
+  `SELECT date(created_at) as day, COUNT(*) as c FROM signals WHERE created_at >= date('now','-7 days') GROUP BY date(created_at)`
+);
+const _stmtDrawdownVelocity = db.prepare(
+  `SELECT realized_pl FROM signals WHERE status='CLOSED' AND closed_at >= datetime('now','-72 hours') ORDER BY closed_at ASC`
+);
+const _stmtOpenHeat = db.prepare(
+  `SELECT pair, direction, risk_pct FROM signals WHERE status='EXECUTED' AND closed_at IS NULL`
+);
+const _stmtOpenTradeIds = db.prepare(
+  `SELECT trade_id FROM signals WHERE status='EXECUTED' AND closed_at IS NULL AND trade_id IS NOT NULL`
 );
 
 // ── Fix 3: Pair breaker prepared statements ───────────────────────────────────
@@ -1929,10 +1948,7 @@ const CORR_WEIGHTS = {
 };
 
 function getPortfolioHeat() {
-  const open = db.prepare(`
-    SELECT pair, direction, risk_pct FROM signals
-    WHERE status='EXECUTED' AND closed_at IS NULL
-  `).all();
+  const open = _stmtOpenHeat.all();
 
   let totalPct = 0, usdLongEff = 0, usdShortEff = 0;
   for (const s of open) {
@@ -2524,8 +2540,9 @@ async function runAutoScan() {
       }
 
       // ── FILTER 3: W1 trend — no counter-trend trades ──────────────────
-      if (w1c.length >= 5) {
-        const w1closes = w1c.map(c => parseFloat(c.mid.c));
+      const w1cc = completedCandles(w1c); // exclude the still-forming weekly candle
+      if (w1cc.length >= 5) {
+        const w1closes = w1cc.map(c => parseFloat(c.mid.c));
         const w1ema21  = calcEMA(w1closes, Math.min(21, w1closes.length));
         const w1trend  = w1closes[w1closes.length - 1] > w1ema21 ? 'BULLISH' : 'BEARISH';
         if ((aiDirection === 'BUY' && w1trend === 'BEARISH') ||

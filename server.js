@@ -11,7 +11,6 @@ const path    = require('path');
 const fs      = require('fs');
 const axios   = require('axios');
 const OpenAI    = require('openai');
-const Anthropic = require('@anthropic-ai/sdk');
 const db        = require('./db');
 
 const app    = express();
@@ -1635,30 +1634,36 @@ app.post('/api/telegram/setup', async (req, res) => {
 // signals table — every signal (pending, approved, rejected, executed, failed)
 db.exec(`
   CREATE TABLE IF NOT EXISTS signals (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
-    actioned_at   DATETIME,
-    pair          TEXT NOT NULL,
-    direction     TEXT NOT NULL,
-    confidence    INTEGER NOT NULL,
-    entry_price   REAL,
-    stop_loss     REAL,
-    take_profit   REAL,
-    sl_pips       REAL,
-    tp_pips       REAL,
-    units         INTEGER,
-    risk_pct      REAL,
-    risk_amount   REAL,
-    lots          TEXT,
-    status        TEXT DEFAULT 'PENDING',
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    actioned_at    DATETIME,
+    pair           TEXT NOT NULL,
+    direction      TEXT NOT NULL,
+    confidence     INTEGER NOT NULL,
+    entry_price    REAL,
+    stop_loss      REAL,
+    take_profit    REAL,
+    sl_pips        REAL,
+    tp_pips        REAL,
+    units          INTEGER,
+    risk_pct       REAL,
+    risk_amount    REAL,
+    lots           TEXT,
+    status         TEXT DEFAULT 'PENDING',
     oanda_order_id TEXT,
-    filled_price  REAL,
-    realized_pl   REAL,
-    analysis      TEXT,
-    ema_align     TEXT,
-    rsi           REAL,
-    h4_trend      TEXT,
-    tg_message_id INTEGER
+    trade_id       TEXT,
+    filled_price   REAL,
+    realized_pl    REAL,
+    exit_price     REAL,
+    exit_reason    TEXT,
+    closed_at      DATETIME,
+    duration_mins  INTEGER,
+    actual_pips    REAL,
+    analysis       TEXT,
+    ema_align      TEXT,
+    rsi            REAL,
+    h4_trend       TEXT,
+    tg_message_id  INTEGER
   );
 `);
 
@@ -1682,14 +1687,14 @@ db.exec(`
   );
 `);
 
-// ── Migrate signals table — add columns if not present ───────────────────────
+// Migrate existing DBs — add columns that were added after initial deploy
 [
-  'trade_id TEXT',         // OANDA trade ID
-  'exit_price REAL',       // actual close price
-  'exit_reason TEXT',      // SL_HIT | TP_HIT | MANUAL
-  'closed_at DATETIME',    // when trade was closed
-  'duration_mins INTEGER', // how long trade was open
-  'actual_pips REAL',      // realized pip move
+  'trade_id TEXT',
+  'exit_price REAL',
+  'exit_reason TEXT',
+  'closed_at DATETIME',
+  'duration_mins INTEGER',
+  'actual_pips REAL',
 ].forEach(col => { try { db.exec(`ALTER TABLE signals ADD COLUMN ${col}`); } catch {} });
 
 // ── Risk events log — every governor block or circuit breaker fire ───────────

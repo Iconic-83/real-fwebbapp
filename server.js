@@ -2695,6 +2695,58 @@ Price source: ${priceSource}`
               continue;
             }
 
+            // RESULTS / RESULTS 48 / RESULTS 7
+            if (txtMsg.startsWith('RESULTS')) {
+              const parts = txtMsg.split(' ');
+              const hours = parseInt(parts[1]) * (parts[1] === '7' ? 24 : 1) || 24;
+              const label = hours <= 24 ? '24h' : hours <= 48 ? '48h' : `${hours/24}d`;
+
+              const trades = db.prepare(`
+                SELECT pair, direction, confidence, realized_pl, actual_pips,
+                       exit_reason, duration_mins, entry_price, exit_price,
+                       stop_loss, take_profit
+                FROM signals
+                WHERE status='CLOSED'
+                  AND closed_at >= datetime('now', '-${hours} hours')
+                ORDER BY closed_at DESC
+              `).all();
+
+              if (!trades.length) {
+                await sendTelegramMsg(`📊 No closed trades in the last ${label}.`);
+                continue;
+              }
+
+              const wins   = trades.filter(t => (t.realized_pl || 0) > 0);
+              const losses = trades.filter(t => (t.realized_pl || 0) < 0);
+              const totalPL= trades.reduce((s, t) => s + (t.realized_pl || 0), 0);
+              const winRate= Math.round(wins.length / trades.length * 100);
+              const avgDur = trades.length
+                ? Math.round(trades.reduce((s,t) => s + (t.duration_mins||0), 0) / trades.length)
+                : 0;
+              const durStr = avgDur < 60 ? `${avgDur}m` : `${(avgDur/60).toFixed(1)}h`;
+
+              const tradeLines = trades.map(t => {
+                const icon = (t.realized_pl||0) > 0 ? '✅' : (t.realized_pl||0) < 0 ? '❌' : '➖';
+                const pl   = t.realized_pl != null ? `${t.realized_pl >= 0 ? '+' : ''}${parseFloat(t.realized_pl).toFixed(2)}` : 'pending';
+                const pips = t.actual_pips != null ? ` (${parseFloat(t.actual_pips) >= 0 ? '+' : ''}${parseFloat(t.actual_pips).toFixed(1)} pips)` : '';
+                const exit = t.exit_reason ? ` — ${t.exit_reason.replace(/_/g,' ')}` : '';
+                const dur  = t.duration_mins ? ` [${t.duration_mins < 60 ? t.duration_mins+'m' : (t.duration_mins/60).toFixed(1)+'h'}]` : '';
+                return `${icon} ${t.pair} ${t.direction} ${t.confidence}%  $${pl}${pips}${exit}${dur}`;
+              }).join('\n');
+
+              await sendTelegramMsg(
+`📊 RESULTS — Last ${label}
+━━━━━━━━━━━━━━━━━━━━
+Trades:   ${trades.length}  (${wins.length}W / ${losses.length}L)
+Win Rate: ${winRate}%
+Total P&L: ${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(2)}
+Avg Duration: ${durStr}
+
+${tradeLines}`
+              );
+              continue;
+            }
+
             const cbq = upd.callback_query;
             if (!cbq?.data) continue;
             const parts    = cbq.data.split('_');

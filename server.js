@@ -92,22 +92,60 @@ function invalidateKeysCache() { _keysCache = null; }
 
 // OANDA instrument map (label → OANDA format)
 const LABEL_TO_OANDA = {
-  'EURUSD':'EUR_USD','GBPUSD':'GBP_USD','USDJPY':'USD_JPY',
-  'XAUUSD':'XAU_USD','AUDUSD':'AUD_USD','USDCAD':'USD_CAD',
+  // Major USD pairs
   'EUR/USD':'EUR_USD','GBP/USD':'GBP_USD','USD/JPY':'USD_JPY',
-  'XAU/USD':'XAU_USD','AUD/USD':'AUD_USD','USD/CAD':'USD_CAD',
+  'USD/CHF':'USD_CHF','USD/CAD':'USD_CAD','AUD/USD':'AUD_USD','NZD/USD':'NZD_USD',
+  // EUR crosses
+  'EUR/GBP':'EUR_GBP','EUR/JPY':'EUR_JPY','EUR/CHF':'EUR_CHF',
+  'EUR/AUD':'EUR_AUD','EUR/CAD':'EUR_CAD','EUR/NZD':'EUR_NZD',
+  // GBP crosses
+  'GBP/JPY':'GBP_JPY','GBP/CHF':'GBP_CHF','GBP/AUD':'GBP_AUD',
+  'GBP/CAD':'GBP_CAD','GBP/NZD':'GBP_NZD',
+  // AUD crosses
+  'AUD/JPY':'AUD_JPY','AUD/CAD':'AUD_CAD','AUD/CHF':'AUD_CHF','AUD/NZD':'AUD_NZD',
+  // Other crosses
+  'CAD/JPY':'CAD_JPY','NZD/JPY':'NZD_JPY','CHF/JPY':'CHF_JPY',
+  'NZD/CAD':'NZD_CAD','NZD/CHF':'NZD_CHF',
+  // Commodities
+  'XAU/USD':'XAU_USD','XAG/USD':'XAG_USD',
+  // Compact aliases
+  'EURUSD':'EUR_USD','GBPUSD':'GBP_USD','USDJPY':'USD_JPY',
+  'USDCHF':'USD_CHF','USDCAD':'USD_CAD','AUDUSD':'AUD_USD','NZDUSD':'NZD_USD',
+  'XAUUSD':'XAU_USD','XAGUSD':'XAG_USD',
 };
 
 // OANDA instrument → display label
 const PAIR_LABELS = {
-  EUR_USD:'EURUSD', GBP_USD:'GBPUSD', USD_JPY:'USDJPY',
-  XAU_USD:'XAUUSD', AUD_USD:'AUDUSD', USD_CAD:'USDCAD',
+  EUR_USD:'EUR/USD', GBP_USD:'GBP/USD', USD_JPY:'USD/JPY',
+  USD_CHF:'USD/CHF', USD_CAD:'USD/CAD', AUD_USD:'AUD/USD', NZD_USD:'NZD/USD',
+  EUR_GBP:'EUR/GBP', EUR_JPY:'EUR/JPY', EUR_CHF:'EUR/CHF',
+  EUR_AUD:'EUR/AUD', EUR_CAD:'EUR/CAD', EUR_NZD:'EUR/NZD',
+  GBP_JPY:'GBP/JPY', GBP_CHF:'GBP/CHF', GBP_AUD:'GBP/AUD',
+  GBP_CAD:'GBP/CAD', GBP_NZD:'GBP/NZD',
+  AUD_JPY:'AUD/JPY', AUD_CAD:'AUD/CAD', AUD_CHF:'AUD/CHF', AUD_NZD:'AUD/NZD',
+  CAD_JPY:'CAD/JPY', NZD_JPY:'NZD/JPY', CHF_JPY:'CHF/JPY',
+  NZD_CAD:'NZD/CAD', NZD_CHF:'NZD/CHF',
+  XAU_USD:'XAU/USD', XAG_USD:'XAG/USD',
 };
 
 // Pip sizes
 const PIP = {
+  // Major USD
   EUR_USD:0.0001, GBP_USD:0.0001, USD_JPY:0.01,
-  XAU_USD:0.1,   AUD_USD:0.0001, USD_CAD:0.0001,
+  USD_CHF:0.0001, USD_CAD:0.0001, AUD_USD:0.0001, NZD_USD:0.0001,
+  // EUR crosses
+  EUR_GBP:0.0001, EUR_JPY:0.01, EUR_CHF:0.0001,
+  EUR_AUD:0.0001, EUR_CAD:0.0001, EUR_NZD:0.0001,
+  // GBP crosses
+  GBP_JPY:0.01, GBP_CHF:0.0001, GBP_AUD:0.0001,
+  GBP_CAD:0.0001, GBP_NZD:0.0001,
+  // AUD crosses
+  AUD_JPY:0.01, AUD_CAD:0.0001, AUD_CHF:0.0001, AUD_NZD:0.0001,
+  // Other crosses
+  CAD_JPY:0.01, NZD_JPY:0.01, CHF_JPY:0.01,
+  NZD_CAD:0.0001, NZD_CHF:0.0001,
+  // Commodities
+  XAU_USD:0.1, XAG_USD:0.01,
 };
 
 // FIX 4 — OANDA latency telemetry
@@ -853,12 +891,16 @@ function getSession() {
 
 // USD directional correlation groups (who profits when USD moves which way)
 const USD_CORR_GROUP = {
-  'USD/JPY': { BUY:'USD_LONG',  SELL:'USD_SHORT' },
-  'USD/CAD': { BUY:'USD_LONG',  SELL:'USD_SHORT' },
+  // USD quote (long = short USD)
   'EUR/USD': { BUY:'USD_SHORT', SELL:'USD_LONG'  },
   'GBP/USD': { BUY:'USD_SHORT', SELL:'USD_LONG'  },
   'AUD/USD': { BUY:'USD_SHORT', SELL:'USD_LONG'  },
-  // XAU/USD omitted — standalone asset, no USD correlation limit
+  'NZD/USD': { BUY:'USD_SHORT', SELL:'USD_LONG'  },
+  // USD base (long = long USD)
+  'USD/JPY': { BUY:'USD_LONG',  SELL:'USD_SHORT' },
+  'USD/CAD': { BUY:'USD_LONG',  SELL:'USD_SHORT' },
+  'USD/CHF': { BUY:'USD_LONG',  SELL:'USD_SHORT' },
+  // Cross pairs and commodities — no USD directional limit applied
 };
 
 const _stmtWeeklyPL = db.prepare(`
@@ -970,7 +1012,7 @@ async function reconcileTrades() {
 
         const oInstr     = LABEL_TO_OANDA[sig.pair] || sig.pair.replace('/', '_');
         const pipSize    = PIP[oInstr] || 0.0001;
-        const dp         = oInstr === 'XAU_USD' ? 2 : 5;
+        const dp         = ['XAU_USD','XAG_USD'].includes(oInstr) ? 2 : oInstr.includes('JPY') ? 3 : 5;
         const entry      = parseFloat(sig.entry_price);
         const exitPx     = parseFloat(oTrade.averageClosePrice || oTrade.price);
         const realizedPL = parseFloat(oTrade.realizedPL || 0);
@@ -1097,7 +1139,7 @@ async function runTrailingStops() {
       const instr= trade.instrument;
       const isBuy= units > 0;
       const pipSize = PIP[instr] || 0.0001;
-      const dp    = instr==='XAU_USD' ? 2 : 5;
+      const dp    = ['XAU_USD','XAG_USD'].includes(instr) ? 2 : instr.includes('JPY') ? 3 : 5;
 
       // Current SL
       const currentSL = parseFloat(trade.stopLossOrder?.price || 0);
@@ -1168,8 +1210,21 @@ app.post('/api/storage/:key', (req, res) => {
 // PRICES — Primary: OANDA (free, unlimited) | Fallback: Twelve Data
 // Server-side cache → frontend gets instant response, no rate limits ever
 // ═════════════════════════════════════════════════════════════════════════════
-const PAIRS       = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD','AUD/USD','USD/CAD'];
-const OANDA_INSTR = 'EUR_USD,GBP_USD,USD_JPY,XAU_USD,AUD_USD,USD_CAD';
+const PAIRS = [
+  // Major USD pairs
+  'EUR/USD','GBP/USD','USD/JPY','USD/CHF','USD/CAD','AUD/USD','NZD/USD',
+  // EUR crosses
+  'EUR/GBP','EUR/JPY','EUR/CHF','EUR/AUD','EUR/CAD','EUR/NZD',
+  // GBP crosses
+  'GBP/JPY','GBP/CHF','GBP/AUD','GBP/CAD','GBP/NZD',
+  // AUD crosses
+  'AUD/JPY','AUD/CAD','AUD/CHF','AUD/NZD',
+  // Other crosses
+  'CAD/JPY','NZD/JPY','CHF/JPY','NZD/CAD','NZD/CHF',
+  // Commodities
+  'XAU/USD','XAG/USD',
+];
+const OANDA_INSTR = 'EUR_USD,GBP_USD,USD_JPY,USD_CHF,USD_CAD,AUD_USD,NZD_USD,EUR_GBP,EUR_JPY,EUR_CHF,EUR_AUD,EUR_CAD,EUR_NZD,GBP_JPY,GBP_CHF,GBP_AUD,GBP_CAD,GBP_NZD,AUD_JPY,AUD_CAD,AUD_CHF,AUD_NZD,CAD_JPY,NZD_JPY,CHF_JPY,NZD_CAD,NZD_CHF,XAU_USD,XAG_USD';
 
 let priceCache = {}, priceCacheTime = 0, priceSource = 'none';
 let spreadCache = {}; // pair → live spread (ask - bid)
@@ -1285,7 +1340,7 @@ app.post('/api/ai/analyze', async (req, res) => {
 
       if (h1.length >= 10) {
         indicators = buildIndicators(h1, h4);
-        const dp = oandaInstr === 'XAU_USD' ? 2 : 5;
+        const dp = ['XAU_USD','XAG_USD'].includes(oandaInstr) ? 2 : oandaInstr.includes('JPY') ? 3 : 5;
         const last5Str = indicators.last5.map((c,i) =>
           `  C${i+1}: O=${c.open} H=${c.high} L=${c.low} C=${c.close} [${c.bull?'▲':'▼'}]`
         ).join('\n');
@@ -1863,12 +1918,14 @@ function checkAndSetPairBreaker(pair) {
 // ── Fix 4: Correlation weights matrix ────────────────────────────────────────
 // Empirical forex correlation for USD direction exposure
 const CORR_WEIGHTS = {
-  'EUR/USD': { USD_SHORT: 1.0 },
+  'EUR/USD': { USD_SHORT: 1.00 },
   'GBP/USD': { USD_SHORT: 0.85 },
   'AUD/USD': { USD_SHORT: 0.75 },
-  'USD/JPY': { USD_LONG:  1.0  },
+  'NZD/USD': { USD_SHORT: 0.65 },
+  'USD/JPY': { USD_LONG:  1.00 },
   'USD/CAD': { USD_LONG:  0.80 },
-  'XAU/USD': { USD_SHORT: 0.70 }, // gold rises with USD weakness — now included
+  'USD/CHF': { USD_LONG:  0.85 },
+  'XAU/USD': { USD_SHORT: 0.70 },
 };
 
 function getPortfolioHeat() {
@@ -1969,7 +2026,7 @@ const tgSendButtons = (text, buttons) => {
 // Fetches fresh quote, checks price drift, recalculates SL/TP/lots with current data
 async function recalcAtExecution(signal, keys) {
   const oandaInstr = LABEL_TO_OANDA[signal.pair] || signal.pair.replace('/','_');
-  const dp         = oandaInstr === 'XAU_USD' ? 2 : 5;
+  const dp         = ['XAU_USD','XAG_USD'].includes(oandaInstr) ? 2 : oandaInstr.includes('JPY') ? 3 : 5;
   const pipSize    = PIP[oandaInstr] || 0.0001;
   const isBuy      = signal.direction === 'BUY';
 
@@ -2331,7 +2388,20 @@ async function runAutoScan() {
   // Pre-fetch news for blackout check
   const currentNews = newsCache || [];
 
-  const scanPairs = ['EUR_USD','GBP_USD','USD_JPY','XAU_USD','AUD_USD','USD_CAD'];
+  const scanPairs = [
+    // Major USD
+    'EUR_USD','GBP_USD','USD_JPY','USD_CHF','USD_CAD','AUD_USD','NZD_USD',
+    // EUR crosses
+    'EUR_GBP','EUR_JPY','EUR_CHF','EUR_AUD','EUR_CAD','EUR_NZD',
+    // GBP crosses
+    'GBP_JPY','GBP_CHF','GBP_AUD','GBP_CAD','GBP_NZD',
+    // AUD crosses
+    'AUD_JPY','AUD_CAD','AUD_CHF','AUD_NZD',
+    // Other crosses
+    'CAD_JPY','NZD_JPY','CHF_JPY','NZD_CAD','NZD_CHF',
+    // Commodities
+    'XAU_USD','XAG_USD',
+  ];
 
   for (const instr of scanPairs) {
     try {
@@ -2496,7 +2566,7 @@ async function runAutoScan() {
       }
 
       // ── STEP 1: Calc engine — instant rule-based scoring ─────────────
-      const dp = instr==='XAU_USD' ? 2 : 5;
+      const dp = ['XAU_USD','XAG_USD'].includes(instr) ? 2 : instr.includes('JPY') ? 3 : 5;
       const setup = calcTradeSetup({
         direction: aiDirection, price,
         h4: indH4, h2: indH2, m30: indM30, m5: indM5,
@@ -3063,7 +3133,7 @@ app.post('/api/backtest', async (req, res) => {
   const { pair = 'EUR_USD', from, to, minScore = 9, direction = 'BOTH', minConf = 70 } = req.body;
   const oInstr = pair.replace('/', '_');
   const pip    = PIP[oInstr] || 0.0001;
-  const dp     = oInstr === 'XAU_USD' ? 2 : 5;
+  const dp     = ['XAU_USD','XAG_USD'].includes(oInstr) ? 2 : oInstr.includes('JPY') ? 3 : 5;
 
   try {
     const fromDt = new Date(from);

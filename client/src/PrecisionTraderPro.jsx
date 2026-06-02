@@ -1,8 +1,26 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
-const PAIRS = ["EUR_USD","GBP_USD","USD_JPY","XAU_USD","AUD_USD","USD_CAD"];
-const PAIR_LABELS = { EUR_USD:"EURUSD", GBP_USD:"GBPUSD", USD_JPY:"USDJPY", XAU_USD:"XAUUSD", AUD_USD:"AUDUSD", USD_CAD:"USDCAD" };
+const PAIRS = [
+  "EUR_USD","GBP_USD","USD_JPY","USD_CHF","USD_CAD","AUD_USD","NZD_USD",
+  "EUR_GBP","EUR_JPY","EUR_CHF","EUR_AUD","EUR_CAD","EUR_NZD",
+  "GBP_JPY","GBP_CHF","GBP_AUD","GBP_CAD","GBP_NZD",
+  "AUD_JPY","AUD_CAD","AUD_CHF","AUD_NZD",
+  "CAD_JPY","NZD_JPY","CHF_JPY","NZD_CAD","NZD_CHF",
+  "XAU_USD","XAG_USD",
+];
+const PAIR_LABELS = {
+  EUR_USD:"EUR/USD", GBP_USD:"GBP/USD", USD_JPY:"USD/JPY",
+  USD_CHF:"USD/CHF", USD_CAD:"USD/CAD", AUD_USD:"AUD/USD", NZD_USD:"NZD/USD",
+  EUR_GBP:"EUR/GBP", EUR_JPY:"EUR/JPY", EUR_CHF:"EUR/CHF",
+  EUR_AUD:"EUR/AUD", EUR_CAD:"EUR/CAD", EUR_NZD:"EUR/NZD",
+  GBP_JPY:"GBP/JPY", GBP_CHF:"GBP/CHF", GBP_AUD:"GBP/AUD",
+  GBP_CAD:"GBP/CAD", GBP_NZD:"GBP/NZD",
+  AUD_JPY:"AUD/JPY", AUD_CAD:"AUD/CAD", AUD_CHF:"AUD/CHF", AUD_NZD:"AUD/NZD",
+  CAD_JPY:"CAD/JPY", NZD_JPY:"NZD/JPY", CHF_JPY:"CHF/JPY",
+  NZD_CAD:"NZD/CAD", NZD_CHF:"NZD/CHF",
+  XAU_USD:"XAU/USD", XAG_USD:"XAG/USD",
+};
 const NAV = [
   { id:"dashboard",     label:"Dashboard",      icon:"⬡" },
   { id:"opportunities", label:"Opportunities",  icon:"◈" },
@@ -212,7 +230,7 @@ function PriceRow({ pair, prices, prevPrices = {}, alertPrices = [], onSetAlert 
   const p = prices[pair];
   useEffect(() => { if (p) setHist(h => [...h.slice(-18), p]); }, [p]);
   const up = hist.length > 1 ? hist[hist.length - 1] >= hist[hist.length - 2] : true;
-  const dp = pair === "XAU_USD" ? 2 : 5;
+  const dp = ["XAU_USD","XAG_USD"].includes(pair) ? 2 : pair.includes("JPY") ? 3 : 5;
   const hasAlert = alertPrices.some(a => a.pair === pair && a.active);
   return (
     <div style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 0", borderBottom:"1px solid #0d0d1e" }}>
@@ -770,7 +788,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
   };
 
   const livePrice = prices[pair];
-  const dp = pair === "XAU_USD" ? 2 : 5;
+  const dp = ["XAU_USD","XAG_USD"].includes(pair) ? 2 : pair.includes("JPY") ? 3 : 5;
   const pipValue = pair === "XAU_USD" ? 0.5 : 0.0010;
 
   const autofill = () => {
@@ -2455,7 +2473,7 @@ export default function App() {
 
   const handleSetAlert = (pair, price) => {
     if (!price) return;
-    const dp = pair === "XAU_USD" ? 2 : 5;
+    const dp = ["XAU_USD","XAG_USD"].includes(pair) ? 2 : pair.includes("JPY") ? 3 : 5;
     const targetPrice = parseFloat(prompt(`Set alert for ${PAIR_LABELS[pair]} at ${price?.toFixed(dp)}. Enter target price:`) || "0");
     if (!targetPrice) return;
     const dir = targetPrice > price ? "ABOVE" : "BELOW";

@@ -151,7 +151,7 @@ function useTwelve(keys) {
   const prevPrices = useRef({});
 
   const load = useCallback(async () => {
-    if (!keys.twelve_key) return;
+    if (!keys.oanda_key && !keys.twelve_key) return;
     try {
       const d = await fetchPrices();
       const m = {};
@@ -165,7 +165,7 @@ function useTwelve(keys) {
         setConnected(true);
       }
     } catch { setConnected(false); }
-  }, [keys.twelve_key]);
+  }, [keys.oanda_key, keys.twelve_key]);
 
   useEffect(() => {
     load();
@@ -286,7 +286,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
     <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
       <div style={{ ...S.card, display:"flex", gap:12, padding:"10px 15px", flexWrap:"wrap", alignItems:"center" }}>
         <Pill ok={oConn}   label="OANDA" />
-        <Pill ok={tConn}   label="TWELVE DATA" />
+        <Pill ok={tConn}   label="LIVE PRICES" />
         <Pill ok={aiReady} label="GPT-4o AI" />
         {account && <span style={{ marginLeft:"auto", fontSize:11, color:"#2a2a4a", fontFamily:"monospace" }}>ID: {account.id?.slice(-8)}</span>}
       </div>
@@ -412,7 +412,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
         <div style={S.card}>
           <div style={S.title}>Live Prices</div>
           {PAIRS.map(p => <PriceRow key={p} pair={p} prices={prices} prevPrices={prevPrices} priceAlerts={priceAlerts} onSetAlert={onSetAlert} />)}
-          {!tConn && <div style={{ color:"#2a2a4a", fontSize:12, marginTop:12, textAlign:"center" }}>Add Twelve Data key in Settings</div>}
+          {!tConn && <div style={{ color:"#2a2a4a", fontSize:12, marginTop:12, textAlign:"center" }}>Add OANDA or Twelve Data key in Settings</div>}
         </div>
         <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
           {plHistory.length > 1 && (
@@ -1480,7 +1480,7 @@ function Alerts({ alerts, keys, priceAlerts, setPriceAlerts }) {
               <div key={a.id} style={{ display:"flex", alignItems:"center", gap:10, padding:"7px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
                 <span style={{ color:"#ffcc00", minWidth:60 }}>{PAIR_LABELS[a.pair]}</span>
                 <span style={{ color:"#555" }}>{a.dir}</span>
-                <span style={{ color:"#ccc", fontFamily:"monospace" }}>{a.price.toFixed(5)}</span>
+                <span style={{ color:"#ccc", fontFamily:"monospace" }}>{a.price.toFixed(a.pair === "XAU_USD" ? 2 : 5)}</span>
                 <span style={{ color:"#2a2a4a", fontSize:10, flex:1 }}>set {a.created}</span>
                 <button onClick={() => removeAlert(a.id)} style={{ ...S.btn, padding:"3px 9px", color:"#ff4466", border:"1px solid #ff446633", background:"transparent", fontSize:10 }}>Remove</button>
               </div>
@@ -2444,8 +2444,9 @@ export default function App() {
       if (!cur) return;
       const triggered = (a.dir === "ABOVE" && cur >= a.price) || (a.dir === "BELOW" && cur <= a.price);
       if (triggered) {
-        addAlert({ type:"PRICE", icon:"◬", title:`${PAIR_LABELS[a.pair]} Alert Triggered`, detail:`Price ${a.dir==="ABOVE"?"reached above":"fell below"} ${a.price.toFixed(5)} — Current: ${cur.toFixed(5)}`, color:"#ffcc00" });
-        sendTelegramViaBackend(`PRICE ALERT: ${PAIR_LABELS[a.pair]} ${a.dir} ${a.price.toFixed(5)} — Current: ${cur.toFixed(5)}`);
+        const adp = a.pair === "XAU_USD" ? 2 : 5;
+        addAlert({ type:"PRICE", icon:"◬", title:`${PAIR_LABELS[a.pair]} Alert Triggered`, detail:`Price ${a.dir==="ABOVE"?"reached above":"fell below"} ${a.price.toFixed(adp)} — Current: ${cur.toFixed(adp)}`, color:"#ffcc00" });
+        sendTelegramViaBackend(`PRICE ALERT: ${PAIR_LABELS[a.pair]} ${a.dir} ${a.price.toFixed(adp)} — Current: ${cur.toFixed(adp)}`);
         const updated = priceAlerts.map(x => x.id === a.id ? { ...x, active:false } : x);
         setPriceAlerts(updated); savePriceAlerts(updated);
       }

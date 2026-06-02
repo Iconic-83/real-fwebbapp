@@ -105,6 +105,19 @@ db.exec(`
     notes        TEXT
   );
 
+  -- Pattern analysis snapshots — stored each time runPatternAnalysis fires
+  CREATE TABLE IF NOT EXISTS pattern_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    trade_count  INTEGER,
+    win_rate     REAL,
+    profit_factor REAL,
+    total_pl     REAL,
+    top_avoid    TEXT,
+    top_reinforce TEXT,
+    summary      TEXT
+  );
+
   -- Post-trade attribution: rich entry context stored at signal time,
   -- joined with outcome after close for "what actually works" analysis
   CREATE TABLE IF NOT EXISTS trade_attribution (

@@ -920,25 +920,34 @@ function checkDrawdownVelocity() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// ADAPTIVE LEARNING ENGINE
-// Learns from every closed trade — win or loss
-// Adjusts future confidence based on accumulated evidence
+// QUANTITATIVE LEARNING ENGINE
+//
+// Design principle: learn statistically, not emotionally.
+// A single losing trade proves nothing. 30+ trades on a condition
+// begins to reveal real edge (or lack of it).
+//
+// Thresholds (conservative — avoids false conclusions):
+//   MIN_LEARN  = 20  — minimum trades before applying score adjustment
+//   MIN_LESSON = 10  — minimum trades before flagging a pattern
+//   ANALYSIS   = 25  — run full pattern analysis every N closed trades
 // ═══════════════════════════════════════════════════════════════════
+
+const LEARN_MIN_ADJUST  = 20;  // trades needed before changing future scoring
+const LEARN_MIN_LESSON  = 10;  // trades needed before generating a lesson
+const LEARN_ANALYSIS_N  = 25;  // run full analysis every N closed trades
 
 function _upsertConditionStat(condition, isWin, pl) {
   try {
     const existing = db.prepare('SELECT * FROM condition_stats WHERE condition=?').get(condition);
     if (existing) {
-      const newTrades  = existing.trades + 1;
-      const newWins    = existing.wins + (isWin ? 1 : 0);
-      const newLosses  = existing.losses + (isWin ? 0 : 1);
-      const newWinRate = parseFloat((newWins / newTrades * 100).toFixed(1));
-      const newPL      = parseFloat((existing.total_pl + (pl || 0)).toFixed(2));
+      const t = existing.trades + 1;
+      const w = existing.wins    + (isWin ? 1 : 0);
+      const l = existing.losses  + (isWin ? 0 : 1);
       db.prepare(`UPDATE condition_stats SET trades=?,wins=?,losses=?,win_rate=?,total_pl=?,updated_at=CURRENT_TIMESTAMP WHERE condition=?`)
-        .run(newTrades, newWins, newLosses, newWinRate, newPL, condition);
+        .run(t, w, l, parseFloat((w/t*100).toFixed(1)), parseFloat((existing.total_pl+(pl||0)).toFixed(2)), condition);
     } else {
       db.prepare(`INSERT INTO condition_stats (condition,trades,wins,losses,win_rate,total_pl) VALUES (?,1,?,?,?,?)`)
-        .run(condition, isWin ? 1 : 0, isWin ? 0 : 1, isWin ? 100 : 0, pl || 0);
+        .run(condition, isWin?1:0, isWin?0:1, isWin?100:0, pl||0);
     }
   } catch(e) { console.error('[LEARN]', e.message); }
 }
@@ -948,172 +957,281 @@ function _getConditionStat(condition) {
          { condition, trades:0, wins:0, losses:0, win_rate:50, total_pl:0 };
 }
 
-// Called after every closed trade — the core learning step
+// ── LOSS ATTRIBUTION ─────────────────────────────────────────────────
+// Classify WHY a trade likely lost based on its entry conditions.
+// This is not blame — it is categorisation for pattern detection.
+// Each reason is a hypothesis. It becomes a fact only after 20+ samples.
+function classifyLossReasons(attr, realizedPL, exitReason) {
+  const reasons = [];
+  if (!attr) return reasons;
+
+  // Execution / timing reasons
+  if (exitReason === 'SL_HIT') {
+    if (attr.spread_pips > 2.0)  reasons.push({ code:'SPREAD_HIGH',    note:`Spread was ${attr.spread_pips} pips — high spread eats into edge before trade moves` });
+    if (attr.atr_pips && attr.spread_pips / attr.atr_pips > 0.15)
+                                  reasons.push({ code:'SPREAD_VS_ATR',  note:`Spread was ${(attr.spread_pips/attr.atr_pips*100).toFixed(0)}% of ATR — cost too large relative to volatility` });
+  }
+
+  // Market condition reasons
+  if (attr.adx < 20)            reasons.push({ code:'ADX_WEAK',       note:`ADX was ${attr.adx} at entry — market was not strongly trending (< 20)` });
+  if (attr.regime === 'TRENDING' && attr.adx < 22)
+                                  reasons.push({ code:'WEAK_TREND',     note:`Regime TRENDING but ADX marginal (${attr.adx}) — borderline trending conditions` });
+  if (attr.rsi_m30 > 70)        reasons.push({ code:'RSI_OVERBOUGHT', note:`RSI M30 was ${attr.rsi_m30} at BUY entry — overbought zone, mean reversion risk` });
+  if (attr.rsi_m30 < 30)        reasons.push({ code:'RSI_OVERSOLD',   note:`RSI M30 was ${attr.rsi_m30} at SELL entry — oversold zone, bounce risk` });
+
+  // Structure reasons
+  if (attr.sweep_risk === 'HIGH') reasons.push({ code:'SWEEP_RISK',    note:`Entry was near liquidity zone — price likely swept stops before reversing` });
+  if (attr.bos === 'NONE')       reasons.push({ code:'NO_BOS',        note:`No Break of Structure confirmed — entry lacked structural confirmation` });
+  if (attr.structure_bias !== 'NEUTRAL' &&
+      attr.structure_bias !== (attr.direction === 'BUY' ? 'BULLISH' : 'BEARISH'))
+                                  reasons.push({ code:'STRUCTURE_BIAS', note:`Market structure bias was ${attr.structure_bias} — against trade direction` });
+
+  // Timing / session reasons
+  if (attr.session === 'OFF_HOURS') reasons.push({ code:'OFF_HOURS',   note:`Trade entered during off-hours — lower liquidity, wider spreads, weaker moves` });
+  if (attr.session === 'ASIAN')   reasons.push({ code:'ASIAN_SESSION', note:`Asian session entry — historically lower directional follow-through` });
+
+  // Confidence / score reasons
+  if (attr.score === 9)          reasons.push({ code:'MIN_SCORE',     note:`Score was exactly 9/12 — minimum threshold, lowest-confidence entry band` });
+  if (attr.confidence < 80)      reasons.push({ code:'LOW_CONF',      note:`Confidence was ${attr.confidence}% — below 80% threshold, weaker setup` });
+
+  // W1 alignment
+  if (attr.w1_trend && attr.w1_trend !== 'UNKNOWN' &&
+      attr.w1_trend !== (attr.direction === 'BUY' ? 'BULLISH' : 'BEARISH'))
+                                  reasons.push({ code:'HTF_MISALIGNED', note:`W1 trend was ${attr.w1_trend} — trade was partially against higher timeframe` });
+
+  return reasons;
+}
+
+// ── POST-TRADE MESSAGE ───────────────────────────────────────────────
+// Called after every closed trade. Records conditions, generates attribution.
+// Only draws pattern conclusions from statistically sufficient samples.
 async function generateTradeLessons(sig, outcome, realizedPL, exitReason) {
   try {
     const isWin = outcome === 'WIN';
     const attr  = db.prepare('SELECT * FROM trade_attribution WHERE signal_id=?').get(sig.id);
-    if (!attr) return;
 
-    // ── Update condition stats (every trade, win or loss) ─────────────
+    // Update condition stats regardless of whether attr exists (use signal data)
+    const attrForStats = attr || {
+      session: 'UNKNOWN', regime: 'UNKNOWN', pair: sig.pair,
+      direction: sig.direction, score: 0, bos: 'NONE',
+      sweep_risk: 'LOW', w1_trend: 'UNKNOWN', structure_bias: 'NEUTRAL',
+    };
     const conditions = [
-      `session:${attr.session}:${attr.direction}`,
-      `regime:${attr.regime}`,
-      `pair:${attr.pair}:${attr.direction}`,
-      `score:${attr.score}`,
-      `bos:${attr.bos}`,
-      `sweep_risk:${attr.sweep_risk}`,
-      `w1_trend:${attr.w1_trend}:${attr.direction}`,
-      `structure:${attr.structure_bias}:${attr.direction}`,
+      `session:${attrForStats.session}:${attrForStats.direction}`,
+      `regime:${attrForStats.regime}`,
+      `pair:${attrForStats.pair}:${attrForStats.direction}`,
+      `score:${attrForStats.score}`,
+      `bos:${attrForStats.bos}`,
+      `sweep_risk:${attrForStats.sweep_risk}`,
+      `w1_trend:${attrForStats.w1_trend}:${attrForStats.direction}`,
+      `structure:${attrForStats.structure_bias}:${attrForStats.direction}`,
     ];
-    if (attr.rsi_divergence && attr.rsi_divergence !== 'NONE') {
+    if (attr?.rsi_divergence && attr.rsi_divergence !== 'NONE') {
       conditions.push(`rsi_div:${attr.rsi_divergence}`);
+    }
+    // ADX band — this is the most important single predictor
+    if (attr?.adx != null) {
+      const adxBand = attr.adx < 18 ? 'adx:<18' : attr.adx < 22 ? 'adx:18-22' :
+                      attr.adx < 26 ? 'adx:22-26' : attr.adx < 30 ? 'adx:26-30' : 'adx:30+';
+      conditions.push(adxBand);
+    }
+    // Spread band
+    if (attr?.spread_pips != null) {
+      const spBand = attr.spread_pips < 1 ? 'spread:<1' : attr.spread_pips < 2 ? 'spread:1-2' : 'spread:2+';
+      conditions.push(spBand);
+    }
+    // Confidence band
+    if (attr?.confidence != null) {
+      const confBand = attr.confidence < 80 ? 'conf:<80' : attr.confidence < 88 ? 'conf:80-88' : 'conf:88+';
+      conditions.push(confBand);
     }
     conditions.forEach(c => _upsertConditionStat(c, isWin, realizedPL));
 
-    // ── Generate lessons ───────────────────────────────────────────────
+    // ── Loss attribution (categorise, don't blame) ────────────────────
+    const lossReasons = (!isWin && attr) ? classifyLossReasons(attr, realizedPL, exitReason) : [];
+
+    // ── Statistically-grounded lessons (LEARN_MIN_LESSON+ samples only) ─
     const lessons = [];
-
-    // Need at least 3 data points for a condition to draw a lesson from it
-    const MIN_SAMPLE = 3;
-
-    // 1. Session lesson
-    const sessionStat = _getConditionStat(`session:${attr.session}:${attr.direction}`);
-    if (sessionStat.trades >= MIN_SAMPLE) {
-      if (!isWin && sessionStat.win_rate < 40) {
-        lessons.push({ impact:'HIGH', delta:-5,
-          condition: `session:${attr.session}:${attr.direction}`,
-          lesson: `${attr.direction} in ${attr.session} session: only ${sessionStat.win_rate}% win rate (${sessionStat.wins}W/${sessionStat.losses}L) — this session-direction combo underperforms` });
-      } else if (isWin && sessionStat.win_rate > 70) {
-        lessons.push({ impact:'POSITIVE', delta:+3,
-          condition: `session:${attr.session}:${attr.direction}`,
-          lesson: `${attr.direction} in ${attr.session} session: ${sessionStat.win_rate}% win rate (${sessionStat.wins}W/${sessionStat.losses}L) — reliable combination, keep it` });
+    for (const c of conditions) {
+      const stat = _getConditionStat(c);
+      if (stat.trades < LEARN_MIN_LESSON) continue;
+      if (stat.win_rate < 38) {
+        lessons.push({ type:'AVOID', condition: c,
+          lesson: `${c}: ${stat.win_rate}% win rate over ${stat.trades} trades (${stat.wins}W/${stat.losses}L)`,
+          impact: stat.win_rate < 30 ? 'HIGH' : 'MEDIUM' });
+      } else if (stat.win_rate > 68) {
+        lessons.push({ type:'REINFORCE', condition: c,
+          lesson: `${c}: ${stat.win_rate}% win rate over ${stat.trades} trades (${stat.wins}W/${stat.losses}L)`,
+          impact: 'POSITIVE' });
       }
     }
-
-    // 2. Pair lesson
-    const pairStat = _getConditionStat(`pair:${attr.pair}:${attr.direction}`);
-    if (pairStat.trades >= MIN_SAMPLE) {
-      if (!isWin && pairStat.win_rate < 35) {
-        lessons.push({ impact:'HIGH', delta:-8,
-          condition: `pair:${attr.pair}:${attr.direction}`,
-          lesson: `${attr.pair} ${attr.direction}: only ${pairStat.win_rate}% win rate over ${pairStat.trades} trades — this pair-direction is consistently poor` });
-      } else if (isWin && pairStat.win_rate > 75) {
-        lessons.push({ impact:'POSITIVE', delta:+5,
-          condition: `pair:${attr.pair}:${attr.direction}`,
-          lesson: `${attr.pair} ${attr.direction}: ${pairStat.win_rate}% win rate over ${pairStat.trades} trades — high-confidence pair-direction` });
-      }
-    }
-
-    // 3. Score band lesson
-    const scoreStat = _getConditionStat(`score:${attr.score}`);
-    if (!isWin && scoreStat.trades >= MIN_SAMPLE && scoreStat.win_rate < 40 && attr.score <= 9) {
-      lessons.push({ impact:'MEDIUM', delta:-3,
-        condition: `score:${attr.score}`,
-        lesson: `Score ${attr.score}/12 signals: only ${scoreStat.win_rate}% win rate — borderline signals (9/12) lose more often, consider raising min_score to 10` });
-    }
-
-    // 4. Market structure lesson
-    if (!isWin && attr.sweep_risk === 'HIGH') {
-      const sweepStat = _getConditionStat('sweep_risk:HIGH');
-      if (sweepStat.trades >= MIN_SAMPLE && sweepStat.win_rate < 45) {
-        lessons.push({ impact:'HIGH', delta:-6,
-          condition: 'sweep_risk:HIGH',
-          lesson: `HIGH sweep risk entries: ${sweepStat.win_rate}% win rate — entering near liquidity zones leads to stop sweeps before the move` });
-      }
-    }
-
-    // 5. BOS lesson
-    const bosStat = _getConditionStat(`bos:${attr.bos}`);
-    if (attr.bos !== 'NONE' && bosStat.trades >= MIN_SAMPLE) {
-      if (isWin && bosStat.win_rate > 70) {
-        lessons.push({ impact:'POSITIVE', delta:+4,
-          condition: `bos:${attr.bos}`,
-          lesson: `BOS ${attr.bos} confirmed entries: ${bosStat.win_rate}% win rate — structure confirmation is working` });
-      }
-    }
-
-    // 6. Regime lesson
-    const regimeStat = _getConditionStat(`regime:${attr.regime}`);
-    if (!isWin && regimeStat.trades >= MIN_SAMPLE && regimeStat.win_rate < 40) {
-      lessons.push({ impact:'MEDIUM', delta:-4,
-        condition: `regime:${attr.regime}`,
-        lesson: `${attr.regime} regime: only ${regimeStat.win_rate}% win rate over ${regimeStat.trades} trades — this market state produces unreliable signals` });
-    }
-
-    // 7. Consecutive loss pattern
-    const recentLosses = db.prepare(`SELECT realized_pl FROM signals WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 5`).all();
-    const streak = recentLosses.filter(t => (t.realized_pl || 0) < 0).length;
-    // Find leading consecutive losses
-    let consecCount = 0;
-    for (const t of recentLosses) { if ((t.realized_pl||0) < 0) consecCount++; else break; }
-    if (!isWin && consecCount >= 3) {
-      lessons.push({ impact:'HIGH', delta:0,
-        condition: `consec_loss:${consecCount}`,
-        lesson: `${consecCount} consecutive losses — system may be in an unfavorable market phase. Consider pausing and reviewing conditions.` });
-    }
-
-    // ── Save lessons to DB ─────────────────────────────────────────────
     for (const l of lessons) {
       try {
-        db.prepare(`INSERT INTO trade_lessons (signal_id,pair,direction,outcome,lesson_type,condition,lesson,impact,delta) VALUES (?,?,?,?,?,?,?,?,?)`)
-          .run(sig.id, sig.pair, sig.direction, outcome,
-               l.impact === 'POSITIVE' ? 'REINFORCE' : 'AVOID',
-               l.condition, l.lesson, l.impact, l.delta || 0);
+        db.prepare(`INSERT INTO trade_lessons (signal_id,pair,direction,outcome,lesson_type,condition,lesson,impact,delta) VALUES (?,?,?,?,?,?,?,?,0)`)
+          .run(sig.id, sig.pair, sig.direction, outcome, l.type, l.condition, l.lesson, l.impact);
       } catch(e) {}
     }
 
-    // ── Build and send Telegram lesson message ─────────────────────────
+    // ── Telegram close message ────────────────────────────────────────
     const plStr  = `${realizedPL >= 0 ? '+' : ''}$${realizedPL.toFixed(2)}`;
     const durStr = sig.duration_mins
-      ? (sig.duration_mins < 60 ? `${sig.duration_mins}m` : `${(sig.duration_mins/60).toFixed(1)}h`)
-      : '';
+      ? (sig.duration_mins < 60 ? `${sig.duration_mins}m` : `${(sig.duration_mins/60).toFixed(1)}h`) : '';
     const exitStr = (exitReason || '').replace(/_/g, ' ');
     const icon   = isWin ? '✅' : '❌';
 
-    let tgLesson =
+    // Get MFE/MAE if tracked
+    const mfe = _tradeMfeCache[sig.trade_id];
+    const mae = _tradeMaeCache[sig.trade_id];
+
+    const totalClosed = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
+
+    let msg =
 `${icon} TRADE CLOSED — #${sig.id} ${sig.pair} ${sig.direction}
-P&L: ${plStr}  |  Exit: ${exitStr}  |  Duration: ${durStr}
+P&L: ${plStr}  |  Exit: ${exitStr}  |  Duration: ${durStr}`;
 
-📚 LESSON:`;
+    if (mfe != null || mae != null) {
+      msg += `\nMFE: ${mfe != null ? '+'+mfe.toFixed(1) : '?'} pips  |  MAE: ${mae != null ? mae.toFixed(1) : '?'} pips`;
+      if (!isWin && mfe != null && mfe > 10) {
+        msg += `\n⚠️ Trade reached +${mfe.toFixed(1)} pips before reversing — TP may be too conservative`;
+      }
+    }
 
-    if (lessons.length === 0) {
-      // No strong pattern yet — give a data-driven observation instead
-      const allClosed = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
-      tgLesson += isWin
-        ? `\n✅ Win recorded. ${allClosed} closed trade(s) total — keep building data.`
-        : `\n📊 Loss recorded. Conditions logged. Pattern analysis needs ${Math.max(0, 5 - allClosed)} more trade(s) before lessons emerge.`;
+    msg += `\n\n📊 ENTRY CONDITIONS RECORDED:`;
+    if (attr) {
+      msg += `\nSession: ${attr.session} | Regime: ${attr.regime} | ADX: ${attr.adx}`;
+      msg += `\nScore: ${attr.score}/12 | Confidence: ${attr.confidence}% | Spread: ${attr.spread_pips} pips`;
+      msg += `\nBOS: ${attr.bos} | W1: ${attr.w1_trend} | Structure: ${attr.structure_bias}`;
+    }
 
-      // Still show raw conditions for transparency
-      tgLesson += `\n\nEntry context:\n• Session: ${attr.session}\n• Regime: ${attr.regime}\n• Structure: ${attr.structure_bias} | BOS: ${attr.bos}\n• Score: ${attr.score}/12 | Spread: ${attr.spread_pips} pips`;
-    } else {
+    if (!isWin && lossReasons.length > 0) {
+      msg += `\n\n🔍 POSSIBLE LOSS REASONS (${lossReasons.length} factor${lossReasons.length>1?'s':''}):`;
+      for (const r of lossReasons.slice(0, 3)) {
+        msg += `\n• ${r.note}`;
+      }
+      msg += `\n\n⚠️ Note: A single loss does not confirm these are problems.`;
+      msg += `\nPatterns only become real after ${LEARN_MIN_LESSON}+ similar trades.`;
+    }
+
+    if (lessons.length > 0) {
+      msg += `\n\n📚 STATISTICALLY CONFIRMED PATTERNS:`;
       for (const l of lessons) {
         const bullet = l.impact === 'POSITIVE' ? '✅' : l.impact === 'HIGH' ? '🔴' : '🟡';
-        tgLesson += `\n${bullet} ${l.lesson}`;
-        if (l.delta && l.delta !== 0) {
-          tgLesson += `\n   → Adjustment: ${l.delta > 0 ? '+' : ''}${l.delta} confidence on future similar setups`;
+        msg += `\n${bullet} ${l.lesson}`;
+      }
+    }
+
+    // Milestones
+    const milestoneMsg = {
+      10: `\n\n🎯 10 trades closed — early data forming. Type REPORT for analysis.`,
+      25: `\n\n🎯 25 trades closed — running full pattern analysis now...`,
+      50: `\n\n🎯 50 trades closed — system has meaningful statistical data. Type REPORT.`,
+      100:`\n\n🎯 100 trades — system now has institutional-level self-knowledge. Type REPORT.`,
+    }[totalClosed] || '';
+    msg += milestoneMsg;
+
+    await sendTelegramMsg(msg).catch(() => {});
+    console.log(`[LEARN] #${sig.id} ${outcome}: ${lossReasons.length} reasons, ${lessons.length} lessons`);
+
+    // Clean up MFE/MAE cache for closed trade
+    if (sig.trade_id) {
+      delete _tradeMfeCache[sig.trade_id];
+      delete _tradeMaeCache[sig.trade_id];
+    }
+
+    // Trigger pattern analysis every LEARN_ANALYSIS_N trades
+    if (totalClosed > 0 && totalClosed % LEARN_ANALYSIS_N === 0) {
+      setTimeout(() => runPatternAnalysis(totalClosed).catch(() => {}), 5000);
+    }
+
+  } catch(e) { console.error('[LEARN]', e.message); }
+}
+
+// ── MFE / MAE IN-MEMORY CACHE ────────────────────────────────────────
+// runTrailingStops() updates these every 30s while the trade is open
+const _tradeMfeCache = {};  // trade_id → max pips reached (positive)
+const _tradeMaeCache = {};  // trade_id → max adverse pips (negative)
+
+// ── PATTERN ANALYSIS — runs every 25 trades and on REPORT command ────
+async function runPatternAnalysis(totalClosed) {
+  try {
+    const attrs = db.prepare(`SELECT * FROM trade_attribution WHERE outcome IS NOT NULL ORDER BY created_at DESC`).all();
+    if (attrs.length < 10) return;
+
+    const wins   = attrs.filter(a => a.outcome === 'WIN');
+    const losses = attrs.filter(a => a.outcome === 'LOSS');
+    const winRate = Math.round(wins.length / attrs.length * 100);
+    const totalPL = attrs.reduce((s, a) => s + (a.realized_pl || 0), 0);
+    const avgWin  = wins.length   ? wins.reduce((s,a)   => s+(a.realized_pl||0), 0)/wins.length   : 0;
+    const avgLoss = losses.length ? losses.reduce((s,a) => s+(a.realized_pl||0), 0)/losses.length : 0;
+    const pf      = avgLoss < 0 ? Math.abs(avgWin / avgLoss) : null;
+
+    // Find all conditions with MIN_LEARN+ samples, sorted by deviation from 50%
+    const stats = db.prepare(`
+      SELECT condition, trades, wins, losses, win_rate, total_pl
+      FROM condition_stats WHERE trades >= ${LEARN_MIN_ADJUST}
+      ORDER BY ABS(win_rate - 50) DESC
+    `).all();
+
+    const avoid    = stats.filter(s => s.win_rate < 40).slice(0, 5);
+    const reinforce= stats.filter(s => s.win_rate > 65).slice(0, 5);
+
+    // ADX analysis (most important single factor)
+    const adxStats = db.prepare(`
+      SELECT condition, trades, wins, win_rate FROM condition_stats
+      WHERE condition LIKE 'adx:%' ORDER BY condition
+    `).all();
+
+    // Build the report
+    let report =
+`📊 PATTERN ANALYSIS REPORT
+${totalClosed} closed trades analysed
+━━━━━━━━━━━━━━━━━━━━━━━
+Overall: ${winRate}% WR | P&L: ${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(0)}
+Avg Win: +$${avgWin.toFixed(0)} | Avg Loss: $${avgLoss.toFixed(0)}
+${pf ? `Profit Factor: ${pf.toFixed(2)}` : ''}`;
+
+    if (adxStats.length > 0) {
+      report += `\n\n📈 ADX IMPACT (${LEARN_MIN_ADJUST}+ samples):`;
+      for (const s of adxStats) {
+        if (s.trades >= LEARN_MIN_ADJUST) {
+          const bar = s.win_rate >= 60 ? '✅' : s.win_rate <= 40 ? '🔴' : '➖';
+          report += `\n${bar} ${s.condition.replace('adx:','ADX ')}: ${s.win_rate}%WR (${s.wins}W/${s.losses}L)`;
         }
       }
     }
 
-    // Milestone messages
-    const totalClosed = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
-    if ([10, 25, 50, 100].includes(totalClosed)) {
-      tgLesson += `\n\n🎯 Milestone: ${totalClosed} closed trades! Type LESSONS to see full pattern analysis.`;
+    if (avoid.length > 0) {
+      report += `\n\n🔴 AVOID (statistically weak, ${LEARN_MIN_ADJUST}+ trades):`;
+      for (const s of avoid) {
+        report += `\n• ${s.condition}: ${s.win_rate}%WR (${s.trades} trades, $${s.total_pl.toFixed(0)} P&L)`;
+      }
     }
 
-    await sendTelegramMsg(tgLesson).catch(() => {});
-    console.log(`[LEARN] Trade #${sig.id} ${outcome}: ${lessons.length} lesson(s) generated`);
+    if (reinforce.length > 0) {
+      report += `\n\n✅ REINFORCE (statistically strong):`;
+      for (const s of reinforce) {
+        report += `\n• ${s.condition}: ${s.win_rate}%WR (${s.trades} trades, $${s.total_pl.toFixed(0)} P&L)`;
+      }
+    }
 
-  } catch(e) {
-    console.error('[LEARN]', e.message);
-  }
+    if (stats.length === 0) {
+      report += `\n\nInsufficient data for condition analysis (need ${LEARN_MIN_ADJUST}+ per condition).`;
+      report += `\nAll entry conditions logged — patterns will emerge after more trades.`;
+    }
+
+    report += `\n\nNext analysis at ${totalClosed + LEARN_ANALYSIS_N} trades.`;
+
+    await sendTelegramMsg(report).catch(() => {});
+    console.log(`[LEARN] Pattern analysis sent (${totalClosed} trades)`);
+
+  } catch(e) { console.error('[LEARN] Analysis failed:', e.message); }
 }
 
-// Called during scan to apply accumulated learning as a confidence delta
-// Only activates when condition has 5+ data points (statistically meaningful)
+// ── DYNAMIC CONFIDENCE DELTA ─────────────────────────────────────────
+// Applied during scan AFTER calcTradeSetup.
+// Only adjusts when a condition has LEARN_MIN_ADJUST+ data points.
+// Key insight: 45% win rate on 8 trades = noise. 45% on 30 trades = signal.
 function getLearningDelta(attrs) {
-  const MIN_SAMPLE = 5;
   let delta = 0;
   const applied = [];
 
@@ -1125,27 +1243,33 @@ function getLearningDelta(attrs) {
     `sweep_risk:${attrs.sweep_risk}`,
     `w1_trend:${attrs.w1Trend}:${attrs.direction}`,
   ];
+  if (attrs.adx != null) {
+    const adxBand = attrs.adx < 18 ? 'adx:<18' : attrs.adx < 22 ? 'adx:18-22' :
+                    attrs.adx < 26 ? 'adx:22-26' : attrs.adx < 30 ? 'adx:26-30' : 'adx:30+';
+    conditions.push(adxBand);
+  }
 
   for (const cond of conditions) {
     const stat = _getConditionStat(cond);
-    if (stat.trades < MIN_SAMPLE) continue;
+    if (stat.trades < LEARN_MIN_ADJUST) continue; // not enough data — no adjustment
 
-    // Win rate significantly above 50% → bonus
-    if (stat.win_rate > 72) {
-      const bonus = Math.min(6, Math.round((stat.win_rate - 60) / 4));
+    // Statistically meaningful deviation from expected ~50%
+    if (stat.win_rate > 68) {
+      // Strong historical edge for this condition
+      const bonus = Math.min(8, Math.round((stat.win_rate - 58) / 4));
       delta += bonus;
-      applied.push(`+${bonus} (${cond} ${stat.win_rate}%WR)`);
-    }
-    // Win rate significantly below 50% → penalty
-    else if (stat.win_rate < 38) {
-      const penalty = -Math.min(10, Math.round((50 - stat.win_rate) / 3));
+      applied.push(`+${bonus} (${cond}: ${stat.win_rate}%WR n=${stat.trades})`);
+    } else if (stat.win_rate < 38) {
+      // This condition historically underperforms
+      const penalty = -Math.min(12, Math.round((48 - stat.win_rate) / 3));
       delta += penalty;
-      applied.push(`${penalty} (${cond} ${stat.win_rate}%WR)`);
+      applied.push(`${penalty} (${cond}: ${stat.win_rate}%WR n=${stat.trades})`);
     }
+    // 38-68% win rate = normal variance, no adjustment (avoids false learning)
   }
 
   if (applied.length > 0) {
-    console.log(`[LEARN] Dynamic delta ${delta > 0 ? '+' : ''}${delta}: ${applied.join(', ')}`);
+    console.log(`[LEARN] Delta ${delta>0?'+':''}${delta}: ${applied.join(', ')}`);
   }
   return delta;
 }
@@ -1686,6 +1810,14 @@ async function runTrailingStops() {
           });
           console.log(`[TSL] Trailing SL moved: ${instr} → ${trailSL}`);
         }
+      }
+
+      // ── MFE / MAE TRACKING ───────────────────────────────────────────
+      // Track max favorable and max adverse excursion for post-trade analysis
+      if (plPips > 0) {
+        _tradeMfeCache[trade.id] = Math.max(_tradeMfeCache[trade.id] || 0, plPips);
+      } else if (plPips < 0) {
+        _tradeMaeCache[trade.id] = Math.min(_tradeMaeCache[trade.id] || 0, plPips);
       }
 
       // ── STAGNATION EXIT — trade going nowhere ────────────────────────
@@ -2974,44 +3106,46 @@ ${tradeLines}`
 
             // LESSONS — show what the system has learned so far
             if (txtMsg === 'LESSONS') {
-              const totalClosed  = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
-              const topConditions= db.prepare(`
-                SELECT condition, trades, wins, losses, win_rate, total_pl
-                FROM condition_stats WHERE trades >= 3
-                ORDER BY ABS(win_rate - 50) DESC LIMIT 8
-              `).all();
-              const recentLessons= db.prepare(`
-                SELECT lesson, impact, outcome, created_at
-                FROM trade_lessons ORDER BY created_at DESC LIMIT 5
-              `).all();
-
+              const totalClosed = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
               if (totalClosed === 0) {
-                await sendTelegramMsg('📚 No closed trades yet — lessons will appear after your first trade closes.');
+                await sendTelegramMsg('📚 No closed trades yet.\n\nEvery time a trade closes the system records all entry conditions and updates its statistical model.\n\nPatterns emerge after:\n• 10+ trades: early observations\n• 20+ trades per condition: confirmed adjustments\n• 50+ trades: reliable analysis\n\nType REPORT anytime to see current state.');
                 continue;
               }
+              // Show conditions with meaningful data (LEARN_MIN_LESSON+)
+              const meaningful = db.prepare(`
+                SELECT condition, trades, wins, losses, win_rate, total_pl
+                FROM condition_stats WHERE trades >= ${LEARN_MIN_LESSON}
+                ORDER BY ABS(win_rate - 50) DESC LIMIT 12
+              `).all();
+              const allCount = db.prepare(`SELECT COUNT(*) as c FROM condition_stats`).get().c;
 
-              let msg = `📚 SYSTEM LESSONS\n━━━━━━━━━━━━━━━━━━━━\n${totalClosed} closed trade(s) analysed\n`;
+              let msg = `📚 LEARNING ENGINE STATUS\n━━━━━━━━━━━━━━━━━━━━\n`;
+              msg += `Closed trades: ${totalClosed}\n`;
+              msg += `Conditions tracked: ${allCount}\n`;
+              msg += `Conditions with ${LEARN_MIN_LESSON}+ data: ${meaningful.length}\n`;
+              msg += `Adjustment threshold: ${LEARN_MIN_ADJUST} trades\n`;
 
-              if (topConditions.length > 0) {
-                msg += `\n🔬 WHAT THE DATA SHOWS:\n`;
-                for (const c of topConditions) {
-                  const icon = c.win_rate >= 60 ? '✅' : c.win_rate <= 40 ? '🔴' : '➖';
-                  const plStr = c.total_pl >= 0 ? `+$${c.total_pl.toFixed(0)}` : `-$${Math.abs(c.total_pl).toFixed(0)}`;
-                  msg += `${icon} ${c.condition}: ${c.win_rate}%WR (${c.wins}W/${c.losses}L) ${plStr}\n`;
+              if (meaningful.length > 0) {
+                msg += `\n🔬 PATTERNS EMERGING (${LEARN_MIN_LESSON}+ trades):\n`;
+                for (const c of meaningful) {
+                  const icon = c.win_rate >= 65 ? '✅' : c.win_rate <= 40 ? '🔴' : '➖';
+                  const adj  = c.trades >= LEARN_MIN_ADJUST
+                    ? (c.win_rate > 68 ? ' → +bonus' : c.win_rate < 38 ? ' → -penalty' : ' → no adj')
+                    : ` → (${LEARN_MIN_ADJUST - c.trades} more needed)`;
+                  msg += `${icon} ${c.condition}: ${c.win_rate}%WR (${c.trades} trades)${adj}\n`;
                 }
               } else {
-                msg += `\nNeed 3+ trades per condition before patterns emerge.\n`;
+                msg += `\nNo condition has ${LEARN_MIN_LESSON}+ trades yet.\nAll conditions are being tracked — keep trading.\n`;
               }
-
-              if (recentLessons.length > 0) {
-                msg += `\n📌 RECENT LESSONS:\n`;
-                for (const l of recentLessons) {
-                  const icon = l.impact === 'POSITIVE' ? '✅' : l.impact === 'HIGH' ? '🔴' : '🟡';
-                  msg += `${icon} ${l.lesson}\n`;
-                }
-              }
-
+              msg += `\nType REPORT for full statistical analysis.`;
               await sendTelegramMsg(msg);
+              continue;
+            }
+
+            if (txtMsg === 'REPORT') {
+              const totalClosed = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
+              await sendTelegramMsg(`📊 Running pattern analysis on ${totalClosed} trades...`);
+              await runPatternAnalysis(totalClosed);
               continue;
             }
 

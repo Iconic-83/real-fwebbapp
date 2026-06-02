@@ -161,8 +161,7 @@ function useTwelve(keys) {
         if (v) m[p] = parseFloat(v);
       });
       if (Object.keys(m).length > 0) {
-        prevPrices.current = { ...prices };
-        setPrices(m);
+        setPrices(prev => { prevPrices.current = { ...prev }; return m; });
         setConnected(true);
       }
     } catch { setConnected(false); }
@@ -2451,7 +2450,7 @@ export default function App() {
         setPriceAlerts(updated); savePriceAlerts(updated);
       }
     });
-  }, [prices]);
+  }, [prices, priceAlerts, setPriceAlerts]);
 
   const handleSetAlert = (pair, price) => {
     if (!price) return;

@@ -148,6 +148,33 @@ db.exec(`
     stated_conf_avg REAL,
     calibration_gap REAL
   );
+
+  -- Per-condition win/loss counters — the memory of what works
+  -- condition key examples: "session:LONDON:BUY", "regime:TRENDING_STRONG", "pair:EUR/USD:SELL"
+  CREATE TABLE IF NOT EXISTS condition_stats (
+    condition   TEXT PRIMARY KEY,
+    trades      INTEGER DEFAULT 0,
+    wins        INTEGER DEFAULT 0,
+    losses      INTEGER DEFAULT 0,
+    win_rate    REAL DEFAULT 0,
+    total_pl    REAL DEFAULT 0,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- Lessons generated after every closed trade — what the system learned
+  CREATE TABLE IF NOT EXISTS trade_lessons (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    signal_id    INTEGER,
+    pair         TEXT,
+    direction    TEXT,
+    outcome      TEXT,
+    lesson_type  TEXT,
+    condition    TEXT,
+    lesson       TEXT,
+    impact       TEXT,
+    delta        REAL DEFAULT 0
+  );
 `);
 
 console.log(`[DB] SQLite ready at: ${dbPath}`);

@@ -104,6 +104,50 @@ db.exec(`
     resolved_at  DATETIME,
     notes        TEXT
   );
+
+  -- Post-trade attribution: rich entry context stored at signal time,
+  -- joined with outcome after close for "what actually works" analysis
+  CREATE TABLE IF NOT EXISTS trade_attribution (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id       INTEGER UNIQUE,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    pair            TEXT,
+    direction       TEXT,
+    session         TEXT,
+    regime          TEXT,
+    atr_ratio       REAL,
+    score           INTEGER,
+    confidence      INTEGER,
+    spread_pips     REAL,
+    atr_pips        REAL,
+    adx             REAL,
+    rsi_m30         REAL,
+    w1_trend        TEXT,
+    structure_bias  TEXT,
+    bos             TEXT,
+    choch           TEXT,
+    rsi_divergence  TEXT,
+    compressing     INTEGER,
+    sweep_risk      TEXT,
+    size_factor     REAL,
+    realized_pl     REAL,
+    actual_pips     REAL,
+    exit_reason     TEXT,
+    duration_mins   INTEGER,
+    outcome         TEXT
+  );
+
+  -- Confidence calibration: after N trades, compare stated confidence vs actual win rate
+  CREATE TABLE IF NOT EXISTS confidence_calibration (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    computed_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    confidence_band TEXT,
+    trade_count     INTEGER,
+    win_count       INTEGER,
+    actual_win_pct  REAL,
+    stated_conf_avg REAL,
+    calibration_gap REAL
+  );
 `);
 
 console.log(`[DB] SQLite ready at: ${dbPath}`);

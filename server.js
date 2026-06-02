@@ -439,33 +439,71 @@ function buildIndicators(candles, refCandles = []) {
 // STAGE 1 — MARKET REGIME CLASSIFIER
 // Returns regime type + tradeability flag based on ADX, EMA slope, ATR
 // ═══════════════════════════════════════════════════════════════════
-function classifyRegime(h4Ind, m30Ind) {
+function classifyRegime(h4Ind, m30Ind, h4Candles = []) {
   const adx      = h4Ind.adx;
   const emaSlope = Math.abs(h4Ind.emaSlope || 0);
   const macdSlope= h4Ind.macdSlope || 0;
   const rsi      = m30Ind.rsi14;
 
-  // Strong trend — ideal for trend-following entries
+  // ATR expansion ratio: is volatility currently expanding vs recent history?
+  let atrRatio = 1;
+  if (h4Candles.length >= 35) {
+    const recentATR  = calcATR(h4Candles.slice(-14), 14);
+    const historicATR= calcATR(h4Candles.slice(-35, -14), 14);
+    if (historicATR > 0) atrRatio = recentATR / historicATR;
+  }
+
+  // VOLATILE_EXHAUSTION: RSI extreme + high ADX + momentum fading
+  if (adx >= 25 && (rsi > 75 || rsi < 25) && macdSlope !== 0) {
+    return { regime:'VOLATILE_EXHAUSTION', tradeable:false, atrRatio,
+      note:'RSI exhaustion + elevated ADX — momentum reversal risk, avoid entry' };
+  }
+
+  // EXPANSION: ATR exploding > 2× historical average — news or breakout chaos
+  if (atrRatio > 2.0) {
+    return { regime:'EXPANSION', tradeable:false, atrRatio,
+      note:`ATR ${atrRatio.toFixed(1)}× historical — volatility explosion, wait for settle` };
+  }
+
+  // DISTRIBUTION: price at highs, compression forming, momentum dying
+  // Hallmarks: ADX > 20, EMA slope flattening, RSI diverging downward from overbought
+  if (adx >= 20 && emaSlope < 0.8 && rsi > 65 && h4Ind.trend === 'BULLISH') {
+    return { regime:'DISTRIBUTION', tradeable:false, atrRatio,
+      note:'Price extended + EMA flattening at highs — distribution phase, BUY entries dangerous' };
+  }
+
+  // ACCUMULATION: price at lows, compression, RSI recovering from oversold
+  if (adx >= 15 && emaSlope < 0.8 && rsi < 35 && h4Ind.trend === 'BEARISH') {
+    return { regime:'ACCUMULATION', tradeable:false, atrRatio,
+      note:'Price compressed at lows — accumulation phase, SELL entries dangerous' };
+  }
+
+  // TRENDING_STRONG — ideal for trend-following entries
   if (adx >= 28 && emaSlope >= 2.0) {
-    return { regime:'TRENDING_STRONG', tradeable:true, note:'Strong directional momentum — ideal entry conditions' };
+    return { regime:'TRENDING_STRONG', tradeable:true, atrRatio,
+      note:'Strong directional momentum — ideal entry conditions' };
   }
-  // Moderate trend — acceptable with confirmation
+
+  // TRENDING — acceptable with confirmation
   if (adx >= 20 && emaSlope >= 1.0) {
-    return { regime:'TRENDING', tradeable:true, note:'Moderate trend — entry acceptable with full confirmation' };
+    return { regime:'TRENDING', tradeable:true, atrRatio,
+      note:'Moderate trend — entry acceptable with full confirmation' };
   }
-  // Choppy — ADX low AND flat EMA
-  if (adx < 20 && emaSlope < 1.0) {
-    return { regime:'CHOPPY', tradeable:false, note:'Flat EMA + weak ADX — trend-following systems fail here' };
-  }
-  // Ranging — very low ADX
+
+  // RANGING — very low ADX
   if (adx < 15) {
-    return { regime:'RANGING', tradeable:false, note:'Price ranging without direction — false signals likely' };
+    return { regime:'RANGING', tradeable:false, atrRatio,
+      note:'Price ranging without direction — false signals likely' };
   }
-  // High volatility — ADX high but momentum reversing
-  if (adx >= 25 && Math.abs(macdSlope) > 0 && rsi > 75) {
-    return { regime:'VOLATILE_EXHAUSTION', tradeable:false, note:'High volatility + RSI exhaustion — momentum reversal risk' };
+
+  // CHOPPY — ADX low + flat EMA
+  if (adx < 20 && emaSlope < 1.0) {
+    return { regime:'CHOPPY', tradeable:false, atrRatio,
+      note:'Flat EMA + weak ADX — trend-following systems fail here' };
   }
-  return { regime:'MIXED', tradeable:true, note:'Mixed conditions — proceed with extra caution' };
+
+  return { regime:'MIXED', tradeable:true, atrRatio,
+    note:'Mixed conditions — proceed with extra caution' };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -630,6 +668,132 @@ function analyzeLiquidity(h4Ind, price, direction, atr) {
     note,
     favorable:     sweepRisk === 'LOW',
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE ENGINE
+// Swing Highs/Lows → BOS → CHOCH → Liquidity Zones
+// ═══════════════════════════════════════════════════════════════════
+
+// Find significant swing highs and lows in candle data
+function detectSwings(candles, lookback = 3) {
+  const highs = [], lows = [];
+  const len = candles.length;
+  if (len < lookback * 2 + 1) return { highs, lows };
+
+  for (let i = lookback; i < len - lookback; i++) {
+    const currH = parseFloat(candles[i].mid.h);
+    const currL = parseFloat(candles[i].mid.l);
+
+    let isHigh = true, isLow = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue;
+      if (parseFloat(candles[j].mid.h) >= currH) isHigh = false;
+      if (parseFloat(candles[j].mid.l) <= currL)  isLow  = false;
+    }
+    if (isHigh) highs.push({ idx: i, price: currH });
+    if (isLow)  lows.push({ idx: i, price: currL });
+  }
+  return { highs, lows };
+}
+
+// BOS = Break of Structure (continuation signal)
+// CHOCH = Change of Character (reversal warning)
+function detectMarketStructure(candles, direction) {
+  if (candles.length < 30) return { bos:'NONE', choch:'NONE', structureBias:'NEUTRAL', swingHigh:null, swingLow:null };
+
+  const slice = candles.slice(-60);
+  const { highs, lows } = detectSwings(slice, 3);
+  const price = parseFloat(candles[candles.length - 1].mid.c);
+
+  const lastHigh = highs[highs.length - 1] || null;
+  const prevHigh = highs[highs.length - 2] || null;
+  const lastLow  = lows[lows.length  - 1] || null;
+  const prevLow  = lows[lows.length  - 2] || null;
+
+  let bos = 'NONE', choch = 'NONE';
+
+  // Structure bias: higher highs + higher lows = bullish structure
+  const higherHighs = lastHigh && prevHigh && lastHigh.price > prevHigh.price;
+  const higherLows  = lastLow  && prevLow  && lastLow.price  > prevLow.price;
+  const lowerHighs  = lastHigh && prevHigh && lastHigh.price < prevHigh.price;
+  const lowerLows   = lastLow  && prevLow  && lastLow.price  < prevLow.price;
+  const structureBias =
+    (higherHighs && higherLows) ? 'BULLISH' :
+    (lowerHighs  && lowerLows)  ? 'BEARISH' : 'NEUTRAL';
+
+  if (direction === 'BUY') {
+    // BOS bullish: price breaks above the last swing high (structure continuation)
+    if (lastHigh && price > lastHigh.price) bos = 'BULLISH';
+    // CHOCH: market was bullish but last low broke below previous low (structure flip)
+    if (lastLow && prevLow && lastLow.price < prevLow.price) choch = 'BEARISH';
+  } else {
+    // BOS bearish: price breaks below the last swing low
+    if (lastLow && price < lastLow.price) bos = 'BEARISH';
+    // CHOCH: market was bearish but last high broke above previous high
+    if (lastHigh && prevHigh && lastHigh.price > prevHigh.price) choch = 'BULLISH';
+  }
+
+  return {
+    bos,
+    choch,
+    structureBias,
+    swingHigh: lastHigh?.price || null,
+    swingLow:  lastLow?.price  || null,
+    prevSwingHigh: prevHigh?.price || null,
+    prevSwingLow:  prevLow?.price  || null,
+    higherHighs, higherLows, lowerHighs, lowerLows,
+  };
+}
+
+// Liquidity zones: stop clusters above swing highs (buy-side) and below swing lows (sell-side)
+// These are where institutional orders hunt before reversing
+function detectLiquidityZones(candles, atr) {
+  if (candles.length < 20 || !atr) return { buySide:[], sellSide:[], nearBuySide:false, nearSellSide:false };
+
+  const slice = candles.slice(-100);
+  const { highs, lows } = detectSwings(slice, 3);
+  const price     = parseFloat(candles[candles.length - 1].mid.c);
+  const threshold = atr * 0.8; // "near" = within 0.8 ATR
+
+  const buySide  = highs.filter(h => h.price > price).map(h => h.price).sort((a,b) => a - b).slice(0, 3);
+  const sellSide = lows.filter(l => l.price < price).map(l => l.price).sort((a,b) => b - a).slice(0, 3);
+
+  return {
+    buySide,
+    sellSide,
+    nearestBuySide:  buySide[0]  || null,
+    nearestSellSide: sellSide[0] || null,
+    nearBuySide:  buySide[0]  != null && (buySide[0]  - price) < threshold,
+    nearSellSide: sellSide[0] != null && (price - sellSide[0]) < threshold,
+  };
+}
+
+// Structure confidence adjustment — called after calcTradeSetup
+// Returns a delta to add/subtract from confidence
+function scoreMarketStructure(structure, direction, liquidity) {
+  let delta = 0;
+  const isBuy = direction === 'BUY';
+
+  // BOS confirmed in trade direction = strong continuation signal
+  if (structure.bos === (isBuy ? 'BULLISH' : 'BEARISH')) delta += 8;
+
+  // CHOCH against trade direction = structure is flipping — dangerous
+  if (structure.choch !== 'NONE' && structure.choch !== (isBuy ? 'BULLISH' : 'BEARISH')) delta -= 15;
+
+  // Structure bias agrees with trade = extra confidence
+  if (structure.structureBias === (isBuy ? 'BULLISH' : 'BEARISH')) delta += 5;
+
+  // Opposing structure bias = penalty
+  if (structure.structureBias !== 'NEUTRAL' &&
+      structure.structureBias !== (isBuy ? 'BULLISH' : 'BEARISH')) delta -= 8;
+
+  // Near buy-side liquidity on a BUY = smart money may sweep before reversal
+  if (isBuy  && liquidity.nearBuySide)  delta -= 6;
+  // Near sell-side liquidity on a SELL = sweep risk
+  if (!isBuy && liquidity.nearSellSide) delta -= 6;
+
+  return delta;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1068,8 +1232,17 @@ async function reconcileTrades() {
 
         recordTradePL(realizedPL);
         writeAudit('TRADE_CLOSED', { signal_id: sig.id, pair: sig.pair, pl: realizedPL, exitReason });
-        // Check if this pair now has a losing streak → set pair breaker
         checkAndSetPairBreaker(sig.pair);
+
+        // Fill in attribution outcome for post-trade analysis
+        try {
+          db.prepare(`
+            UPDATE trade_attribution SET
+              realized_pl=?, actual_pips=?, exit_reason=?, duration_mins=?,
+              outcome=CASE WHEN ? > 0 THEN 'WIN' WHEN ? < 0 THEN 'LOSS' ELSE 'BE' END
+            WHERE signal_id=?
+          `).run(realizedPL, actualPips, exitReason, durMins, realizedPL, realizedPL, sig.id);
+        } catch(e) { console.error('[ATTR]', e.message); }
 
         console.log(`[RECONCILE] #${sig.id} ${sig.pair} ${sig.direction} → ${exitReason} | P&L: ${realizedPL >= 0 ? '+' : ''}${realizedPL.toFixed(2)} | ${actualPips} pips | ${durMins}m`);
 
@@ -2575,13 +2748,13 @@ async function runAutoScan() {
         continue;
       }
 
-      // ── STAGE 1: Market Regime — reject RANGING / CHOPPY ─────────────
-      const regime = classifyRegime(indH4, indM30);
+      // ── STAGE 1: Market Regime — reject untradeable states ───────────
+      const regime = classifyRegime(indH4, indM30, h4cc);
       if (!regime.tradeable) {
         console.log(`[SCAN] ${label}: Regime ${regime.regime} — ${regime.note}`);
         continue;
       }
-      console.log(`[SCAN] ${label}: Regime ${regime.regime} ✓`);
+      console.log(`[SCAN] ${label}: Regime ${regime.regime} (ATR ratio ${regime.atrRatio?.toFixed(2)}) ✓`);
 
       // ── STAGE 1: Candle Quality — reject spike/doji/exhaustion ───────
       const candleQuality = inspectCandleQuality(h4cc, indH4.atr14);
@@ -2621,12 +2794,28 @@ async function runAutoScan() {
       }
 
       // ── STAGE 2: Supplementary intelligence (logged, not blocking) ───
-      const rsiDiv     = detectRSIDivergence(m30cc, aiDirection);
-      const compression= detectCompression(h4cc);
-      const liquidity  = analyzeLiquidity(indH4, price, aiDirection, indH4.atr14);
+      const rsiDiv      = detectRSIDivergence(m30cc, aiDirection);
+      const compression = detectCompression(h4cc);
+      const liquidity   = analyzeLiquidity(indH4, price, aiDirection, indH4.atr14);
+
+      // ── MARKET STRUCTURE ENGINE ───────────────────────────────────────
+      const structure     = detectMarketStructure(h4cc, aiDirection);
+      const liqZones      = detectLiquidityZones(h4cc, indH4.atr14);
+      const structureDelta= scoreMarketStructure(structure, aiDirection, liqZones);
+
+      console.log(`[SCAN] ${label}: Structure ${structure.structureBias} | BOS ${structure.bos} | CHOCH ${structure.choch} | delta ${structureDelta > 0 ? '+' : ''}${structureDelta}`);
+
+      // CHOCH against trade direction is a hard block — structure is flipping
+      if (structure.choch !== 'NONE' && structure.choch !== (aiDirection === 'BUY' ? 'BULLISH' : 'BEARISH')) {
+        console.log(`[SCAN] ${label}: CHOCH ${structure.choch} against ${aiDirection} — structure change, rejected`);
+        continue;
+      }
 
       if (liquidity.sweep_risk === 'HIGH') {
         console.log(`[SCAN] ${label}: Liquidity warning — ${liquidity.note}`);
+      }
+      if (liqZones.nearBuySide || liqZones.nearSellSide) {
+        console.log(`[SCAN] ${label}: Near liquidity zone — sweep risk`);
       }
       if (compression.compressing) {
         console.log(`[SCAN] ${label}: Compression detected (ATR ratio ${compression.ratio}) — breakout potential ✓`);
@@ -2662,10 +2851,13 @@ async function runAutoScan() {
       let analysis  = setup.analysis;
       let parsed    = {
         direction:  setup.direction,
-        confidence: setup.confidence,
+        confidence: Math.min(95, Math.max(10, setup.confidence + structureDelta)),
         stopLoss:   setup.stopLoss,
         takeProfit: setup.takeProfit,
       };
+      if (structureDelta !== 0) {
+        console.log(`[SCAN] ${label}: Structure delta ${structureDelta > 0 ? '+' : ''}${structureDelta} → confidence ${setup.confidence}% → ${parsed.confidence}%`);
+      }
 
       // ── FIX 10: Regime persistence — bonus filter ─────────────────────
       recordRegime(label, regime.regime);
@@ -2850,9 +3042,30 @@ Return EXACTLY 6 lines, no other text:
         parsed.stopLoss, parsed.takeProfit,
         slPips.toFixed(1), tpPips.toFixed(1),
         units, riskPct, riskAmt, lots,
-        `${analysis}\n\nSCORE: ${scored.score}/${scored.maxScore} | SESSION: ${session} | ADX(H4): ${indH4.adx} | M5 Pattern: ${indM5.pattern}`,
+        `${analysis}\n\nSCORE: ${scored.score}/${scored.maxScore} | SESSION: ${session} | ADX(H4): ${indH4.adx} | M5 Pattern: ${indM5.pattern} | STRUCTURE: ${structure.bos}/${structure.choch}`,
         indH4.emaAlignment, indM30.rsi14, indH2.trend
       ).lastInsertRowid;
+
+      // ── Save post-trade attribution context (outcome filled in by reconcileTrades) ──
+      try {
+        db.prepare(`
+          INSERT OR IGNORE INTO trade_attribution
+            (signal_id, pair, direction, session, regime, atr_ratio, score, confidence,
+             spread_pips, atr_pips, adx, rsi_m30, w1_trend, structure_bias, bos, choch,
+             rsi_divergence, compressing, sweep_risk, size_factor)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `).run(
+          signalId, label, parsed.direction, session, regime.regime,
+          parseFloat((regime.atrRatio || 1).toFixed(2)),
+          scored.score, parsed.confidence,
+          parseFloat(spreadPips.toFixed(2)),
+          parseFloat((indH4.atr14 / pipSize).toFixed(1)),
+          indH4.adx, indM30.rsi14, w1Trend,
+          structure.structureBias, structure.bos, structure.choch,
+          rsiDiv, compression.compressing ? 1 : 0,
+          liquidity.sweep_risk, sizeFactor
+        );
+      } catch(e) { console.error('[ATTR]', e.message); }
 
       // ── Build Telegram message — full decision brief ─────────────────
       const passedStr  = scored.checks.filter(c=>c.pass).map(c=>`  ✅ ${c.name}`).join('\n');
@@ -2863,7 +3076,13 @@ Return EXACTLY 6 lines, no other text:
       const spreadDisp = spreadPips > 0 ? `${spreadPips.toFixed(1)} pips (${(slPips/spreadPips).toFixed(1)}× SL)` : 'N/A';
       const heatDisp   = `${heat.heat_level} (${heat.open_positions} open, ${heat.total_risk_pct}% risk on book)`;
       const consecDisp = consecLoss > 0 ? `⚠️ ${consecLoss} consecutive loss(es)` : '✅ None';
-      const regimeDisp = `${regime.regime} — ${regimePersist.score} persistence (${regimePersist.count} scans)`;
+      const regimeDisp = `${regime.regime} (${regime.atrRatio?.toFixed(1)}× ATR) — ${regimePersist.score} persistence`;
+      // Market structure display
+      const bosDisp    = structure.bos   !== 'NONE' ? `BOS ${structure.bos} ✓`   : 'No BOS';
+      const chochDisp  = structure.choch !== 'NONE' ? `CHOCH ${structure.choch} ⚠️` : 'No CHOCH';
+      const nearLiqDisp= (liqZones.nearBuySide || liqZones.nearSellSide)
+        ? `⚠️ NEAR ${liqZones.nearBuySide ? 'BUY-SIDE' : 'SELL-SIDE'} LIQUIDITY`
+        : `Buy-side: ${liqZones.nearestBuySide?.toFixed(dp) || 'N/A'} | Sell-side: ${liqZones.nearestSellSide?.toFixed(dp) || 'N/A'}`;
 
       const tgText =
 `🎯 SIGNAL #${signalId} — ${label} ${parsed.direction} ${dirArrow}
@@ -2885,8 +3104,14 @@ W1 Trend:    ${w1Trend}
 EMA200 (H4): ${ema200dir}  (${indH4.ema200?.toFixed(dp)})
 ATR (H4):    ${atrPips} pips
 Spread:      ${spreadDisp}
-${rsiDiv !== 'NONE' ? `RSI Signal:  ${rsiDiv}` : ''}${compression.compressing ? `\nCompress:    ✓ Squeeze (${compression.ratio}x ATR) — breakout loading` : ''}
-Liquidity:   ${liquidity.sweep_risk === 'HIGH' ? `⚠️ HIGH SWEEP RISK — ${liquidity.note}` : liquidity.note}
+${rsiDiv !== 'NONE' ? `RSI Signal:  ${rsiDiv}\n` : ''}${compression.compressing ? `Compress:    ✓ Squeeze (${compression.ratio}x ATR) — breakout loading\n` : ''}Liquidity:   ${liquidity.sweep_risk === 'HIGH' ? `⚠️ HIGH SWEEP RISK — ${liquidity.note}` : liquidity.note}
+
+🏗 MARKET STRUCTURE
+Bias:        ${structure.structureBias}
+${bosDisp}  |  ${chochDisp}
+Swing High:  ${structure.swingHigh?.toFixed(dp) || 'N/A'}
+Swing Low:   ${structure.swingLow?.toFixed(dp) || 'N/A'}
+Stop Pools:  ${nearLiqDisp}
 
 💼 ACCOUNT STATE
 Balance:     $${balance.toFixed(2)}
@@ -3852,6 +4077,114 @@ app.get('/api/health', (req, res) => {
       pending:  pending.c,
       closed_reconciled: closed.c,
     },
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POST-TRADE ATTRIBUTION & CONFIDENCE CALIBRATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Full attribution breakdown — after 50+ closed trades this reveals what works
+app.get('/api/analytics/attribution', (req, res) => {
+  const rows = db.prepare(`
+    SELECT * FROM trade_attribution WHERE outcome IS NOT NULL ORDER BY created_at DESC
+  `).all();
+
+  if (rows.length < 5) return res.json({ message: `Need more closed trades (have ${rows.length}, need 5+)`, rows });
+
+  const win  = rows.filter(r => r.outcome === 'WIN');
+  const loss = rows.filter(r => r.outcome === 'LOSS');
+
+  const winRate = r => r.length ? Math.round(win.filter(w => rows.filter(x => x[Object.keys(r[0])[0]] === w[Object.keys(r[0])[0]]).length > 0).length / r.length * 100) : null;
+
+  // Group by dimension helper
+  const groupBy = (field) => {
+    const groups = {};
+    for (const r of rows) {
+      const k = r[field] ?? 'UNKNOWN';
+      if (!groups[k]) groups[k] = { total:0, wins:0, totalPL:0, totalPips:0 };
+      groups[k].total++;
+      if (r.outcome === 'WIN') groups[k].wins++;
+      groups[k].totalPL   += r.realized_pl   || 0;
+      groups[k].totalPips += parseFloat(r.actual_pips || 0);
+    }
+    return Object.entries(groups).map(([k, v]) => ({
+      [field]: k,
+      total:    v.total,
+      win_rate: Math.round(v.wins / v.total * 100),
+      avg_pl:   parseFloat((v.totalPL / v.total).toFixed(2)),
+      avg_pips: parseFloat((v.totalPips / v.total).toFixed(1)),
+      total_pl: parseFloat(v.totalPL.toFixed(2)),
+    })).sort((a, b) => b.total - a.total);
+  };
+
+  res.json({
+    summary: {
+      total:    rows.length,
+      wins:     win.length,
+      losses:   loss.length,
+      win_rate: Math.round(win.length / rows.length * 100),
+      total_pl: parseFloat(rows.reduce((s, r) => s + (r.realized_pl || 0), 0).toFixed(2)),
+    },
+    by_pair:       groupBy('pair'),
+    by_session:    groupBy('session'),
+    by_regime:     groupBy('regime'),
+    by_structure:  groupBy('structure_bias'),
+    by_bos:        groupBy('bos'),
+    by_score:      groupBy('score'),
+    by_w1_trend:   groupBy('w1_trend'),
+    by_exit_reason:groupBy('exit_reason'),
+    by_sweep_risk: groupBy('sweep_risk'),
+    raw: rows.slice(0, 50),
+  });
+});
+
+// Confidence calibration: does 90% confidence actually win 90%?
+app.get('/api/analytics/calibration', (req, res) => {
+  const rows = db.prepare(`
+    SELECT confidence, outcome FROM trade_attribution WHERE outcome IS NOT NULL
+  `).all();
+
+  if (rows.length < 10) return res.json({ message: `Need 10+ closed trades (have ${rows.length})`, rows: [] });
+
+  // Group into confidence bands: <70, 70-79, 80-89, 90-95
+  const bands = { '<70':[70,0], '70-79':[70,80], '80-89':[80,90], '90+':[90,100] };
+  const result = Object.entries(bands).map(([label, [lo, hi]]) => {
+    const inBand = rows.filter(r => r.confidence >= lo && r.confidence < hi);
+    const wins   = inBand.filter(r => r.outcome === 'WIN');
+    const avgConf= inBand.length ? inBand.reduce((s,r) => s + r.confidence, 0) / inBand.length : 0;
+    const actualWinPct = inBand.length ? Math.round(wins.length / inBand.length * 100) : null;
+    return {
+      band:           label,
+      trade_count:    inBand.length,
+      stated_conf_avg:parseFloat(avgConf.toFixed(1)),
+      actual_win_pct: actualWinPct,
+      gap:            actualWinPct !== null ? actualWinPct - Math.round(avgConf) : null,
+      calibrated:     actualWinPct !== null && Math.abs(actualWinPct - avgConf) < 10,
+    };
+  }).filter(b => b.trade_count > 0);
+
+  // Save snapshot to DB for trend tracking
+  try {
+    for (const b of result) {
+      if (b.trade_count >= 5) {
+        db.prepare(`
+          INSERT INTO confidence_calibration
+            (confidence_band, trade_count, win_count, actual_win_pct, stated_conf_avg, calibration_gap)
+          VALUES (?,?,?,?,?,?)
+        `).run(b.band, b.trade_count,
+          rows.filter(r => r.outcome==='WIN' && r.confidence >= parseInt(b.band) || 0).length,
+          b.actual_win_pct, b.stated_conf_avg, b.gap);
+      }
+    }
+  } catch {}
+
+  res.json({
+    message: result.some(b => b.gap !== null && Math.abs(b.gap) > 15)
+      ? '⚠️ Confidence is miscalibrated — stated % does not match actual win rate'
+      : '✅ Confidence is roughly calibrated',
+    calibration: result,
+    total_trades: rows.length,
   });
 });
 

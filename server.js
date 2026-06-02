@@ -297,14 +297,42 @@ function completedCandles(candles) {
     .filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; });
 }
 
-// FIX 5 — Friday/weekend position size factor
+// Position size factor: day-of-week + session quality
 function getTimeBasedSizeFactor() {
   const now = new Date();
   const day = now.getUTCDay(), h = now.getUTCHours();
-  if (day === 5 && h >= 20) return 0.5; // Friday close — gap risk
-  if (day === 1 && h < 2)  return 0.5; // Monday open — gap risk
-  if (day === 0 || day === 6) return 0; // Weekend — no trading
-  return 1.0;
+  if (day === 0 || day === 6)     return 0;    // Weekend — no trading
+  if (day === 5 && h >= 20)       return 0.5;  // Friday close — gap risk
+  if (day === 1 && h < 2)        return 0.5;  // Monday open — gap risk
+  if (h >= 22 || h < 1)          return 0.5;  // Late NY / dead zone — thin liquidity
+  if (h >= 1  && h < 6)         return 0.7;  // Asian session — lower liquidity
+  if (h >= 6  && h < 7)         return 0.8;  // Pre-London — waiting for open
+  return 1.0; // London + NY = full size
+}
+
+// Returns human-readable reason for any size reduction
+function getSizeFactorNote(factor) {
+  const now = new Date();
+  const day = now.getUTCDay(), h = now.getUTCHours();
+  if (factor === 0) return 'weekend';
+  if (day === 5 && h >= 20) return 'Friday close';
+  if (day === 1 && h < 2)  return 'Monday gap risk';
+  if (h >= 22 || h < 1)   return 'thin liquidity (late NY)';
+  if (h >= 1  && h < 6)   return 'Asian session';
+  if (h >= 6  && h < 7)   return 'pre-London';
+  return '';
+}
+
+// EMA convergence: EMA9 and EMA21 closing together = trend momentum draining
+// Called before entry — flat/converging EMAs in a trend = structure about to break
+function detectEMAConvergence(h4Ind) {
+  const price = h4Ind.ema21 || 1;
+  const separation = Math.abs(h4Ind.ema9 - h4Ind.ema21);
+  const relSep = (separation / price) * 10000; // in bps
+
+  if (relSep < 3)  return { converging: true,  severity: 'HIGH',   note: 'EMA9/21 nearly crossed — trend exhausting, avoid entry' };
+  if (relSep < 8)  return { converging: true,  severity: 'MEDIUM', note: 'EMA9/21 converging — momentum draining, wait for separation' };
+  return           { converging: false, severity: 'NONE',   note: null };
 }
 
 // FIX 7 — Market gap detection (candle open gaps > 2× ATR = abnormal)
@@ -538,6 +566,28 @@ function inspectCandleQuality(candles, atr) {
   const lowerWick = Math.min(co, cc) - cl;
   if (body > 0 && (upperWick > body * 3 || lowerWick > body * 3)) {
     issues.push('Exhaustion wick: wick > 3× body — possible rejection or trap');
+  }
+
+  // Average body check: current body vs 20-candle average
+  // A body 3× the average is an exhaustion candle — usually means a news spike or end of move
+  if (candles.length >= 20) {
+    const bodies = candles.slice(-20).map(c =>
+      Math.abs(parseFloat(c.mid.c) - parseFloat(c.mid.o))
+    );
+    const avgBody = bodies.reduce((s, b) => s + b, 0) / bodies.length;
+    if (avgBody > 0 && body > avgBody * 3) {
+      issues.push(`Exhaustion body: current body ${(body/avgBody).toFixed(1)}× average — likely news spike or climax`);
+    }
+    // Three consecutive expanding bodies = trend may be exhausting
+    if (candles.length >= 5) {
+      const last3Bodies = candles.slice(-3).map(c =>
+        Math.abs(parseFloat(c.mid.c) - parseFloat(c.mid.o))
+      );
+      const allExpanding = last3Bodies[2] > last3Bodies[1] && last3Bodies[1] > last3Bodies[0];
+      if (allExpanding && last3Bodies[2] > avgBody * 2) {
+        issues.push('Climax sequence: 3 consecutive expanding bodies above average — exhaustion risk');
+      }
+    }
   }
 
   return { ok: issues.length === 0, issues };
@@ -1412,9 +1462,93 @@ async function runTrailingStops() {
           console.log(`[TSL] Trailing SL moved: ${instr} → ${trailSL}`);
         }
       }
+
+      // ── STAGNATION EXIT — trade going nowhere ────────────────────────
+      // If trade has been open 8+ hours with < 0.2R profit, it is wasting margin
+      // and overnight risk. Close it.
+      const hoursOpen = (Date.now() - new Date(trade.openTime).getTime()) / 3600000;
+      const rrReached = slPips > 0 ? plPips / slPips : 0;
+      if (hoursOpen > 8 && rrReached < 0.2 && !_stagnationChecked.has(trade.id)) {
+        _stagnationChecked.add(trade.id);
+        console.warn(`[TSL] Stagnation: ${instr} trade ${trade.id} — ${hoursOpen.toFixed(1)}h open at ${rrReached.toFixed(2)}R`);
+        try {
+          await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/close`, 'PUT');
+          sendTelegramMsg(
+`⏱ STAGNATION EXIT — ${PAIR_LABELS[instr] || instr}
+Trade open ${hoursOpen.toFixed(1)}h with only ${rrReached.toFixed(2)}R profit
+Capital freed. No overnight drift risk.`
+          ).catch(() => {});
+          console.log(`[TSL] Stagnation exit executed: ${instr} trade ${trade.id}`);
+        } catch(e) { console.error(`[TSL] Stagnation close failed ${trade.id}:`, e.message); }
+      }
+
+      // ── DYNAMIC TRADE HEALTH — close if structure flips against position ──
+      // Fetch fresh M30 indicators every 5 minutes (not every 30s — rate limit safe)
+      const healthKey = `${trade.id}_health`;
+      const lastHealthCheck = _tradeHealthCache[healthKey] || 0;
+      if (Date.now() - lastHealthCheck > 300000) { // 5-min cooldown
+        _tradeHealthCache[healthKey] = Date.now();
+        try {
+          const m30r = await oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=M30&price=M`);
+          const m30c  = completedCandles(m30r?.candles || []);
+          const h4r   = await oandaRequest(`/v3/instruments/${instr}/candles?count=60&granularity=H4&price=M`);
+          const h4c   = completedCandles(h4r?.candles || []);
+          if (m30c.length >= 10 && h4c.length >= 26) {
+            const indM30live = buildIndicators(m30c, h4c);
+            const indH4live  = buildIndicators(h4c, []);
+            let healthScore = 100;
+
+            // H4 trend flip against position — most serious
+            if (isBuy  && indH4live.trend === 'BEARISH') healthScore -= 35;
+            if (!isBuy && indH4live.trend === 'BULLISH') healthScore -= 35;
+
+            // M30 EMA cross against position
+            if (isBuy  && indM30live.ema9 < indM30live.ema21) healthScore -= 20;
+            if (!isBuy && indM30live.ema9 > indM30live.ema21) healthScore -= 20;
+
+            // RSI extreme against direction
+            if (isBuy  && indM30live.rsi14 < 35) healthScore -= 15;
+            if (!isBuy && indM30live.rsi14 > 65) healthScore -= 15;
+
+            // ATR expanding dangerously (volatility explosion)
+            if (isATRExpanded(h4c, 2.0)) healthScore -= 15;
+
+            console.log(`[HEALTH] ${instr} trade ${trade.id}: score ${healthScore}/100`);
+
+            if (healthScore <= 30) {
+              // Emergency exit — structure has completely flipped
+              await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/close`, 'PUT');
+              const dir = isBuy ? 'BUY' : 'SELL';
+              sendTelegramMsg(
+`🔴 HEALTH EXIT — ${PAIR_LABELS[instr] || instr} ${dir}
+Health score: ${healthScore}/100
+P&L: ${pl >= 0 ? '+' : ''}${pl.toFixed(2)}
+Market structure flipped against position — closed to protect capital.`
+              ).catch(() => {});
+              console.warn(`[HEALTH] Emergency exit: ${instr} trade ${trade.id} (health ${healthScore})`);
+            } else if (healthScore <= 55 && currentSL) {
+              // Tighten stop to 0.5× ATR from current price — reduce exposure
+              const atr = h1AtrCache[instr] || indM30live.atr14;
+              const tightSL = isBuy
+                ? (currentPx - atr * 0.5).toFixed(dp)
+                : (currentPx + atr * 0.5).toFixed(dp);
+              const tightPrice = parseFloat(tightSL);
+              const shouldTighten = isBuy ? tightPrice > currentSL : tightPrice < currentSL;
+              if (shouldTighten) {
+                await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/orders`, 'PUT', {
+                  stopLoss: { price: tightSL, timeInForce:'GTC' }
+                });
+                console.log(`[HEALTH] SL tightened: ${instr} → ${tightSL} (health ${healthScore})`);
+              }
+            }
+          }
+        } catch(e) { /* health check failed silently — don't block trailing stop */ }
+      }
     }
   } catch(e) { /* silent */ }
 }
+const _stagnationChecked = new Set();
+const _tradeHealthCache  = {};
 const h1AtrCache = {};
 setInterval(runTrailingStops, 30000); // check every 30s
 
@@ -2763,6 +2897,13 @@ async function runAutoScan() {
         continue;
       }
 
+      // ── STAGE 1: EMA Convergence — trend draining, EMAs closing together ─
+      const emaConv = detectEMAConvergence(indH4);
+      if (emaConv.converging && emaConv.severity === 'HIGH') {
+        console.log(`[SCAN] ${label}: EMA convergence (HIGH) — ${emaConv.note}`);
+        continue;
+      }
+
       // ── STAGE 2: Momentum weakening check ────────────────────────────
       const momentum = detectMomentumWeakening(indH4, indM30);
       if (momentum.weakening) {
@@ -3026,8 +3167,13 @@ Return EXACTLY 6 lines, no other text:
       const sizeFactor   = Math.min(lossFactor, timeFactor);
       const sizeReasons  = [];
       if (consecLoss > 0) sizeReasons.push(`${consecLoss} consec loss`);
-      if (timeFactor < 1) sizeReasons.push(`Friday/weekend`);
+      const timeNote = getSizeFactorNote(timeFactor);
+      if (timeNote) sizeReasons.push(timeNote);
       const sizeNote     = sizeFactor < 1 ? ` [REDUCED to ${(sizeFactor*100).toFixed(0)}% — ${sizeReasons.join(', ')}]` : '';
+      // Medium EMA convergence → soft warning (not a block, logged in message)
+      if (emaConv.converging && emaConv.severity === 'MEDIUM') {
+        console.log(`[SCAN] ${label}: EMA convergence (MEDIUM) — ${emaConv.note} — proceeding with caution`);
+      }
 
       const units = Math.floor(riskAmt / (slPips * pipVal) * sizeFactor);
       if (units < 100) continue;
@@ -3077,6 +3223,7 @@ Return EXACTLY 6 lines, no other text:
       const heatDisp   = `${heat.heat_level} (${heat.open_positions} open, ${heat.total_risk_pct}% risk on book)`;
       const consecDisp = consecLoss > 0 ? `⚠️ ${consecLoss} consecutive loss(es)` : '✅ None';
       const regimeDisp = `${regime.regime} (${regime.atrRatio?.toFixed(1)}× ATR) — ${regimePersist.score} persistence`;
+      const emaConvDisp= emaConv.converging ? `⚠️ ${emaConv.severity}: ${emaConv.note}` : '✅ EMAs separated — trend intact';
       // Market structure display
       const bosDisp    = structure.bos   !== 'NONE' ? `BOS ${structure.bos} ✓`   : 'No BOS';
       const chochDisp  = structure.choch !== 'NONE' ? `CHOCH ${structure.choch} ⚠️` : 'No CHOCH';
@@ -3104,6 +3251,7 @@ W1 Trend:    ${w1Trend}
 EMA200 (H4): ${ema200dir}  (${indH4.ema200?.toFixed(dp)})
 ATR (H4):    ${atrPips} pips
 Spread:      ${spreadDisp}
+EMA Conv:    ${emaConvDisp}
 ${rsiDiv !== 'NONE' ? `RSI Signal:  ${rsiDiv}\n` : ''}${compression.compressing ? `Compress:    ✓ Squeeze (${compression.ratio}x ATR) — breakout loading\n` : ''}Liquidity:   ${liquidity.sweep_risk === 'HIGH' ? `⚠️ HIGH SWEEP RISK — ${liquidity.note}` : liquidity.note}
 
 🏗 MARKET STRUCTURE
@@ -3935,7 +4083,7 @@ app.get('/api/intelligence', async (req, res) => {
     const nowMin = new Date().getUTCHours() * 60 + new Date().getUTCMinutes();
     const [hh, mm] = (n.time || '99:99').split(':').map(Number);
     const diff = nowMin - (hh * 60 + mm);
-    return diff >= -45 && diff <= 30;
+    return diff >= -45 && diff <= 60; // 45 min before, 60 min after
   }).length;
 
   // Infrastructure
@@ -4185,6 +4333,91 @@ app.get('/api/analytics/calibration', (req, res) => {
       : '✅ Confidence is roughly calibrated',
     calibration: result,
     total_trades: rows.length,
+  });
+});
+
+// Operator approval analytics — detects if you're lowering your personal threshold
+app.get('/api/analytics/operator', (req, res) => {
+  const approved = db.prepare(`
+    SELECT confidence, realized_pl, outcome FROM trade_attribution
+    WHERE signal_id IN (SELECT id FROM signals WHERE status IN ('EXECUTED','CLOSED'))
+    ORDER BY created_at DESC LIMIT 30
+  `).all();
+  const rejected = db.prepare(`
+    SELECT confidence FROM signals WHERE status='REJECTED'
+    ORDER BY actioned_at DESC LIMIT 30
+  `).all();
+
+  if (approved.length < 3) return res.json({ message: 'Need 3+ approved signals', approved: [], rejected: [] });
+
+  const avgApproved = approved.reduce((s, r) => s + r.confidence, 0) / approved.length;
+  const avgRejected = rejected.length ? rejected.reduce((s, r) => s + r.confidence, 0) / rejected.length : null;
+  const closed      = approved.filter(r => r.outcome);
+  const winRate     = closed.length ? Math.round(closed.filter(r => r.outcome === 'WIN').length / closed.length * 100) : null;
+
+  const warnings = [];
+  if (avgApproved < 82 && approved.length >= 5) {
+    warnings.push(`⚠️ Avg approved confidence ${avgApproved.toFixed(0)}% is below 82% — you may be approving low-quality signals`);
+  }
+  if (avgRejected !== null && avgRejected > avgApproved) {
+    warnings.push(`⚠️ Avg rejected confidence (${avgRejected.toFixed(0)}%) > avg approved (${avgApproved.toFixed(0)}%) — approving weaker signals than rejecting`);
+  }
+
+  res.json({
+    approval_stats: {
+      approved_count:    approved.length,
+      rejected_count:    rejected.length,
+      approval_rate:     Math.round(approved.length / (approved.length + rejected.length) * 100),
+      avg_approved_conf: parseFloat(avgApproved.toFixed(1)),
+      avg_rejected_conf: avgRejected !== null ? parseFloat(avgRejected.toFixed(1)) : null,
+      win_rate_approved: winRate,
+    },
+    warnings,
+    recent_approved: approved.slice(0, 10),
+  });
+});
+
+// Trade distribution health — concentration risk detection
+app.get('/api/analytics/distribution', (req, res) => {
+  const recent = db.prepare(`
+    SELECT pair, session, direction, confidence, outcome
+    FROM trade_attribution ORDER BY created_at DESC LIMIT 50
+  `).all();
+
+  if (recent.length < 5) return res.json({ message: 'Need 5+ signals', data: [] });
+
+  // Pair concentration
+  const pairCounts = {};
+  for (const r of recent) {
+    pairCounts[r.pair] = (pairCounts[r.pair] || 0) + 1;
+  }
+  const topPair    = Object.entries(pairCounts).sort((a,b) => b[1]-a[1])[0];
+  const topPairPct = Math.round(topPair[1] / recent.length * 100);
+
+  // Session concentration
+  const sessCounts = {};
+  for (const r of recent) {
+    sessCounts[r.session] = (sessCounts[r.session] || 0) + 1;
+  }
+  const topSess    = Object.entries(sessCounts).sort((a,b) => b[1]-a[1])[0];
+  const topSessPct = Math.round(topSess[1] / recent.length * 100);
+
+  // Direction bias
+  const buys  = recent.filter(r => r.direction === 'BUY').length;
+  const sells = recent.filter(r => r.direction === 'SELL').length;
+  const dirBiasPct = Math.round(Math.max(buys, sells) / recent.length * 100);
+
+  const alerts = [];
+  if (topPairPct > 60)  alerts.push(`⚠️ ${topPair[0]} = ${topPairPct}% of recent signals — over-concentrated in one pair`);
+  if (topSessPct > 80)  alerts.push(`⚠️ ${topSess[0]} = ${topSessPct}% of signals — all trades from one session`);
+  if (dirBiasPct > 80)  alerts.push(`⚠️ ${dirBiasPct}% ${buys > sells ? 'BUY' : 'SELL'} bias — system heavily one-directional`);
+
+  res.json({
+    sample_size:  recent.length,
+    by_pair:      Object.entries(pairCounts).map(([p,c]) => ({ pair:p, count:c, pct: Math.round(c/recent.length*100) })).sort((a,b)=>b.count-a.count),
+    by_session:   Object.entries(sessCounts).map(([s,c]) => ({ session:s, count:c, pct: Math.round(c/recent.length*100) })).sort((a,b)=>b.count-a.count),
+    direction_bias: { buys, sells, bias_pct: dirBiasPct },
+    alerts,
   });
 });
 

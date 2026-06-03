@@ -222,25 +222,52 @@ function calcMACD(closes) {
   return parseFloat((calcEMA(closes, 12) - calcEMA(closes, 26)).toFixed(6));
 }
 
-// ADX — Average Directional Index (trend strength)
+// ADX — Wilder's smoothed Average Directional Index (matches charting platforms)
+// Uses Wilder's RMA (Recursive Moving Average) for TR/+DM/-DM smoothing
 function calcADX(candles, period = 14) {
-  if (candles.length < period + 2) return 0;
-  const slice = candles.slice(-(period + 2));
-  let plusDM = 0, minusDM = 0, trSum = 0;
+  const needed = period * 2 + 2;
+  if (candles.length < needed) return 0;
+  const slice = candles.slice(-needed);
+
+  const trs = [], plusDMs = [], minusDMs = [];
   for (let i = 1; i < slice.length; i++) {
     const h  = parseFloat(slice[i].mid.h),   l  = parseFloat(slice[i].mid.l);
-    const ph = parseFloat(slice[i-1].mid.h), pl = parseFloat(slice[i-1].mid.l), pc = parseFloat(slice[i-1].mid.c);
-    const upMove = h - ph, downMove = pl - l;
-    plusDM  += (upMove > downMove && upMove > 0) ? upMove : 0;
-    minusDM += (downMove > upMove && downMove > 0) ? downMove : 0;
-    trSum   += Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc));
+    const ph = parseFloat(slice[i-1].mid.h), pl = parseFloat(slice[i-1].mid.l);
+    const pc = parseFloat(slice[i-1].mid.c);
+    const tr  = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+    const up  = h - ph, dn = pl - l;
+    trs.push(tr);
+    plusDMs.push(up > dn && up > 0 ? up : 0);
+    minusDMs.push(dn > up && dn > 0 ? dn : 0);
   }
-  if (!trSum) return 0;
-  const diPlus  = (plusDM  / trSum) * 100;
-  const diMinus = (minusDM / trSum) * 100;
-  const diSum   = diPlus + diMinus;
-  if (!diSum) return 0;
-  return parseFloat((Math.abs(diPlus - diMinus) / diSum * 100).toFixed(1));
+
+  // Initial Wilder sum (first `period` bars)
+  let trW  = trs.slice(0, period).reduce((s, v) => s + v, 0);
+  let pdmW = plusDMs.slice(0, period).reduce((s, v) => s + v, 0);
+  let mdmW = minusDMs.slice(0, period).reduce((s, v) => s + v, 0);
+
+  const dxValues = [];
+  const addDX = () => {
+    if (!trW) return;
+    const diP = (pdmW / trW) * 100;
+    const diM = (mdmW / trW) * 100;
+    const sum = diP + diM;
+    if (sum > 0) dxValues.push(Math.abs(diP - diM) / sum * 100);
+  };
+  addDX();
+
+  // Continue Wilder smoothing
+  for (let i = period; i < trs.length; i++) {
+    trW  = trW  - trW  / period + trs[i];
+    pdmW = pdmW - pdmW / period + plusDMs[i];
+    mdmW = mdmW - mdmW / period + minusDMs[i];
+    addDX();
+  }
+
+  if (!dxValues.length) return 0;
+  // ADX = Wilder average of DX
+  const adx = dxValues.reduce((s, v) => s + v, 0) / dxValues.length;
+  return parseFloat(adx.toFixed(1));
 }
 
 // Spread acceptable? — reject if spread > 25% of ATR (thin market / news spike)
@@ -260,19 +287,52 @@ function isATRExpanded(candles, threshold = 1.8) {
   return (recentATR / historicATR) > threshold;
 }
 
-// FIX 1 — Only use completed candles (OANDA marks last candle complete:false)
+// FIX 1 — Only use completed candles; also deduplicate by timestamp
+// Dedup prevents duplicate candles (OANDA retries / race conditions) from
+// corrupting EMA/RSI/ATR calculations with phantom repeated bars
 function completedCandles(candles) {
-  return candles.filter(c => c.complete !== false);
+  const seen = new Set();
+  return candles
+    .filter(c => c.complete !== false)
+    .filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; });
 }
 
-// FIX 5 — Friday/weekend position size factor
+// Position size factor: day-of-week + session quality
 function getTimeBasedSizeFactor() {
   const now = new Date();
   const day = now.getUTCDay(), h = now.getUTCHours();
-  if (day === 5 && h >= 20) return 0.5; // Friday close — gap risk
-  if (day === 1 && h < 2)  return 0.5; // Monday open — gap risk
-  if (day === 0 || day === 6) return 0; // Weekend — no trading
-  return 1.0;
+  if (day === 0 || day === 6)     return 0;    // Weekend — no trading
+  if (day === 5 && h >= 20)       return 0.5;  // Friday close — gap risk
+  if (day === 1 && h < 2)        return 0.5;  // Monday open — gap risk
+  if (h >= 22 || h < 1)          return 0.5;  // Late NY / dead zone — thin liquidity
+  if (h >= 1  && h < 6)         return 0.7;  // Asian session — lower liquidity
+  if (h >= 6  && h < 7)         return 0.8;  // Pre-London — waiting for open
+  return 1.0; // London + NY = full size
+}
+
+// Returns human-readable reason for any size reduction
+function getSizeFactorNote(factor) {
+  const now = new Date();
+  const day = now.getUTCDay(), h = now.getUTCHours();
+  if (factor === 0) return 'weekend';
+  if (day === 5 && h >= 20) return 'Friday close';
+  if (day === 1 && h < 2)  return 'Monday gap risk';
+  if (h >= 22 || h < 1)   return 'thin liquidity (late NY)';
+  if (h >= 1  && h < 6)   return 'Asian session';
+  if (h >= 6  && h < 7)   return 'pre-London';
+  return '';
+}
+
+// EMA convergence: EMA9 and EMA21 closing together = trend momentum draining
+// Called before entry — flat/converging EMAs in a trend = structure about to break
+function detectEMAConvergence(h4Ind) {
+  const price = h4Ind.ema21 || 1;
+  const separation = Math.abs(h4Ind.ema9 - h4Ind.ema21);
+  const relSep = (separation / price) * 10000; // in bps
+
+  if (relSep < 3)  return { converging: true,  severity: 'HIGH',   note: 'EMA9/21 nearly crossed — trend exhausting, avoid entry' };
+  if (relSep < 8)  return { converging: true,  severity: 'MEDIUM', note: 'EMA9/21 converging — momentum draining, wait for separation' };
+  return           { converging: false, severity: 'NONE',   note: null };
 }
 
 // FIX 7 — Market gap detection (candle open gaps > 2× ATR = abnormal)
@@ -407,33 +467,71 @@ function buildIndicators(candles, refCandles = []) {
 // STAGE 1 — MARKET REGIME CLASSIFIER
 // Returns regime type + tradeability flag based on ADX, EMA slope, ATR
 // ═══════════════════════════════════════════════════════════════════
-function classifyRegime(h4Ind, m30Ind) {
+function classifyRegime(h4Ind, m30Ind, h4Candles = []) {
   const adx      = h4Ind.adx;
   const emaSlope = Math.abs(h4Ind.emaSlope || 0);
   const macdSlope= h4Ind.macdSlope || 0;
   const rsi      = m30Ind.rsi14;
 
-  // Strong trend — ideal for trend-following entries
+  // ATR expansion ratio: is volatility currently expanding vs recent history?
+  let atrRatio = 1;
+  if (h4Candles.length >= 35) {
+    const recentATR  = calcATR(h4Candles.slice(-14), 14);
+    const historicATR= calcATR(h4Candles.slice(-35, -14), 14);
+    if (historicATR > 0) atrRatio = recentATR / historicATR;
+  }
+
+  // VOLATILE_EXHAUSTION: RSI extreme + high ADX + momentum fading
+  if (adx >= 25 && (rsi > 75 || rsi < 25) && macdSlope !== 0) {
+    return { regime:'VOLATILE_EXHAUSTION', tradeable:false, atrRatio,
+      note:'RSI exhaustion + elevated ADX — momentum reversal risk, avoid entry' };
+  }
+
+  // EXPANSION: ATR exploding > 2× historical average — news or breakout chaos
+  if (atrRatio > 2.0) {
+    return { regime:'EXPANSION', tradeable:false, atrRatio,
+      note:`ATR ${atrRatio.toFixed(1)}× historical — volatility explosion, wait for settle` };
+  }
+
+  // DISTRIBUTION: price at highs, compression forming, momentum dying
+  // Hallmarks: ADX > 20, EMA slope flattening, RSI diverging downward from overbought
+  if (adx >= 20 && emaSlope < 0.8 && rsi > 65 && h4Ind.trend === 'BULLISH') {
+    return { regime:'DISTRIBUTION', tradeable:false, atrRatio,
+      note:'Price extended + EMA flattening at highs — distribution phase, BUY entries dangerous' };
+  }
+
+  // ACCUMULATION: price at lows, compression, RSI recovering from oversold
+  if (adx >= 15 && emaSlope < 0.8 && rsi < 35 && h4Ind.trend === 'BEARISH') {
+    return { regime:'ACCUMULATION', tradeable:false, atrRatio,
+      note:'Price compressed at lows — accumulation phase, SELL entries dangerous' };
+  }
+
+  // TRENDING_STRONG — ideal for trend-following entries
   if (adx >= 28 && emaSlope >= 2.0) {
-    return { regime:'TRENDING_STRONG', tradeable:true, note:'Strong directional momentum — ideal entry conditions' };
+    return { regime:'TRENDING_STRONG', tradeable:true, atrRatio,
+      note:'Strong directional momentum — ideal entry conditions' };
   }
-  // Moderate trend — acceptable with confirmation
+
+  // TRENDING — acceptable with confirmation
   if (adx >= 20 && emaSlope >= 1.0) {
-    return { regime:'TRENDING', tradeable:true, note:'Moderate trend — entry acceptable with full confirmation' };
+    return { regime:'TRENDING', tradeable:true, atrRatio,
+      note:'Moderate trend — entry acceptable with full confirmation' };
   }
-  // Choppy — ADX low AND flat EMA
-  if (adx < 20 && emaSlope < 1.0) {
-    return { regime:'CHOPPY', tradeable:false, note:'Flat EMA + weak ADX — trend-following systems fail here' };
-  }
-  // Ranging — very low ADX
+
+  // RANGING — very low ADX
   if (adx < 15) {
-    return { regime:'RANGING', tradeable:false, note:'Price ranging without direction — false signals likely' };
+    return { regime:'RANGING', tradeable:false, atrRatio,
+      note:'Price ranging without direction — false signals likely' };
   }
-  // High volatility — ADX high but momentum reversing
-  if (adx >= 25 && Math.abs(macdSlope) > 0 && rsi > 75) {
-    return { regime:'VOLATILE_EXHAUSTION', tradeable:false, note:'High volatility + RSI exhaustion — momentum reversal risk' };
+
+  // CHOPPY — ADX low + flat EMA
+  if (adx < 20 && emaSlope < 1.0) {
+    return { regime:'CHOPPY', tradeable:false, atrRatio,
+      note:'Flat EMA + weak ADX — trend-following systems fail here' };
   }
-  return { regime:'MIXED', tradeable:true, note:'Mixed conditions — proceed with extra caution' };
+
+  return { regime:'MIXED', tradeable:true, atrRatio,
+    note:'Mixed conditions — proceed with extra caution' };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -468,6 +566,28 @@ function inspectCandleQuality(candles, atr) {
   const lowerWick = Math.min(co, cc) - cl;
   if (body > 0 && (upperWick > body * 3 || lowerWick > body * 3)) {
     issues.push('Exhaustion wick: wick > 3× body — possible rejection or trap');
+  }
+
+  // Average body check: current body vs 20-candle average
+  // A body 3× the average is an exhaustion candle — usually means a news spike or end of move
+  if (candles.length >= 20) {
+    const bodies = candles.slice(-20).map(c =>
+      Math.abs(parseFloat(c.mid.c) - parseFloat(c.mid.o))
+    );
+    const avgBody = bodies.reduce((s, b) => s + b, 0) / bodies.length;
+    if (avgBody > 0 && body > avgBody * 3) {
+      issues.push(`Exhaustion body: current body ${(body/avgBody).toFixed(1)}× average — likely news spike or climax`);
+    }
+    // Three consecutive expanding bodies = trend may be exhausting
+    if (candles.length >= 5) {
+      const last3Bodies = candles.slice(-3).map(c =>
+        Math.abs(parseFloat(c.mid.c) - parseFloat(c.mid.o))
+      );
+      const allExpanding = last3Bodies[2] > last3Bodies[1] && last3Bodies[1] > last3Bodies[0];
+      if (allExpanding && last3Bodies[2] > avgBody * 2) {
+        issues.push('Climax sequence: 3 consecutive expanding bodies above average — exhaustion risk');
+      }
+    }
   }
 
   return { ok: issues.length === 0, issues };
@@ -601,6 +721,132 @@ function analyzeLiquidity(h4Ind, price, direction, atr) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE ENGINE
+// Swing Highs/Lows → BOS → CHOCH → Liquidity Zones
+// ═══════════════════════════════════════════════════════════════════
+
+// Find significant swing highs and lows in candle data
+function detectSwings(candles, lookback = 3) {
+  const highs = [], lows = [];
+  const len = candles.length;
+  if (len < lookback * 2 + 1) return { highs, lows };
+
+  for (let i = lookback; i < len - lookback; i++) {
+    const currH = parseFloat(candles[i].mid.h);
+    const currL = parseFloat(candles[i].mid.l);
+
+    let isHigh = true, isLow = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue;
+      if (parseFloat(candles[j].mid.h) >= currH) isHigh = false;
+      if (parseFloat(candles[j].mid.l) <= currL)  isLow  = false;
+    }
+    if (isHigh) highs.push({ idx: i, price: currH });
+    if (isLow)  lows.push({ idx: i, price: currL });
+  }
+  return { highs, lows };
+}
+
+// BOS = Break of Structure (continuation signal)
+// CHOCH = Change of Character (reversal warning)
+function detectMarketStructure(candles, direction) {
+  if (candles.length < 30) return { bos:'NONE', choch:'NONE', structureBias:'NEUTRAL', swingHigh:null, swingLow:null };
+
+  const slice = candles.slice(-60);
+  const { highs, lows } = detectSwings(slice, 3);
+  const price = parseFloat(candles[candles.length - 1].mid.c);
+
+  const lastHigh = highs[highs.length - 1] || null;
+  const prevHigh = highs[highs.length - 2] || null;
+  const lastLow  = lows[lows.length  - 1] || null;
+  const prevLow  = lows[lows.length  - 2] || null;
+
+  let bos = 'NONE', choch = 'NONE';
+
+  // Structure bias: higher highs + higher lows = bullish structure
+  const higherHighs = lastHigh && prevHigh && lastHigh.price > prevHigh.price;
+  const higherLows  = lastLow  && prevLow  && lastLow.price  > prevLow.price;
+  const lowerHighs  = lastHigh && prevHigh && lastHigh.price < prevHigh.price;
+  const lowerLows   = lastLow  && prevLow  && lastLow.price  < prevLow.price;
+  const structureBias =
+    (higherHighs && higherLows) ? 'BULLISH' :
+    (lowerHighs  && lowerLows)  ? 'BEARISH' : 'NEUTRAL';
+
+  if (direction === 'BUY') {
+    // BOS bullish: price breaks above the last swing high (structure continuation)
+    if (lastHigh && price > lastHigh.price) bos = 'BULLISH';
+    // CHOCH: market was bullish but last low broke below previous low (structure flip)
+    if (lastLow && prevLow && lastLow.price < prevLow.price) choch = 'BEARISH';
+  } else {
+    // BOS bearish: price breaks below the last swing low
+    if (lastLow && price < lastLow.price) bos = 'BEARISH';
+    // CHOCH: market was bearish but last high broke above previous high
+    if (lastHigh && prevHigh && lastHigh.price > prevHigh.price) choch = 'BULLISH';
+  }
+
+  return {
+    bos,
+    choch,
+    structureBias,
+    swingHigh: lastHigh?.price || null,
+    swingLow:  lastLow?.price  || null,
+    prevSwingHigh: prevHigh?.price || null,
+    prevSwingLow:  prevLow?.price  || null,
+    higherHighs, higherLows, lowerHighs, lowerLows,
+  };
+}
+
+// Liquidity zones: stop clusters above swing highs (buy-side) and below swing lows (sell-side)
+// These are where institutional orders hunt before reversing
+function detectLiquidityZones(candles, atr) {
+  if (candles.length < 20 || !atr) return { buySide:[], sellSide:[], nearBuySide:false, nearSellSide:false };
+
+  const slice = candles.slice(-100);
+  const { highs, lows } = detectSwings(slice, 3);
+  const price     = parseFloat(candles[candles.length - 1].mid.c);
+  const threshold = atr * 0.8; // "near" = within 0.8 ATR
+
+  const buySide  = highs.filter(h => h.price > price).map(h => h.price).sort((a,b) => a - b).slice(0, 3);
+  const sellSide = lows.filter(l => l.price < price).map(l => l.price).sort((a,b) => b - a).slice(0, 3);
+
+  return {
+    buySide,
+    sellSide,
+    nearestBuySide:  buySide[0]  || null,
+    nearestSellSide: sellSide[0] || null,
+    nearBuySide:  buySide[0]  != null && (buySide[0]  - price) < threshold,
+    nearSellSide: sellSide[0] != null && (price - sellSide[0]) < threshold,
+  };
+}
+
+// Structure confidence adjustment — called after calcTradeSetup
+// Returns a delta to add/subtract from confidence
+function scoreMarketStructure(structure, direction, liquidity) {
+  let delta = 0;
+  const isBuy = direction === 'BUY';
+
+  // BOS confirmed in trade direction = strong continuation signal
+  if (structure.bos === (isBuy ? 'BULLISH' : 'BEARISH')) delta += 8;
+
+  // CHOCH against trade direction = structure is flipping — dangerous
+  if (structure.choch !== 'NONE' && structure.choch !== (isBuy ? 'BULLISH' : 'BEARISH')) delta -= 15;
+
+  // Structure bias agrees with trade = extra confidence
+  if (structure.structureBias === (isBuy ? 'BULLISH' : 'BEARISH')) delta += 5;
+
+  // Opposing structure bias = penalty
+  if (structure.structureBias !== 'NEUTRAL' &&
+      structure.structureBias !== (isBuy ? 'BULLISH' : 'BEARISH')) delta -= 8;
+
+  // Near buy-side liquidity on a BUY = smart money may sweep before reversal
+  if (isBuy  && liquidity.nearBuySide)  delta -= 6;
+  // Near sell-side liquidity on a SELL = sweep risk
+  if (!isBuy && liquidity.nearSellSide) delta -= 6;
+
+  return delta;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // STAGE 4 — PORTFOLIO HEAT CALCULATOR
 // getPortfolioHeat() defined after CORR_WEIGHTS (further down)
 
@@ -674,6 +920,405 @@ function checkDrawdownVelocity() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// QUANTITATIVE LEARNING ENGINE
+//
+// Design principle: learn statistically, not emotionally.
+// A single losing trade proves nothing. 30+ trades on a condition
+// begins to reveal real edge (or lack of it).
+//
+// Thresholds (conservative — avoids false conclusions):
+//   MIN_LEARN  = 20  — minimum trades before applying score adjustment
+//   MIN_LESSON = 10  — minimum trades before flagging a pattern
+//   ANALYSIS   = 25  — run full pattern analysis every N closed trades
+// ═══════════════════════════════════════════════════════════════════
+
+const LEARN_MIN_ADJUST  = 20;  // trades needed before changing future scoring
+const LEARN_MIN_LESSON  = 10;  // trades needed before generating a lesson
+const LEARN_ANALYSIS_N  = 25;  // run full analysis every N closed trades
+
+function _upsertConditionStat(condition, isWin, pl) {
+  try {
+    const existing = db.prepare('SELECT * FROM condition_stats WHERE condition=?').get(condition);
+    if (existing) {
+      const t = existing.trades + 1;
+      const w = existing.wins    + (isWin ? 1 : 0);
+      const l = existing.losses  + (isWin ? 0 : 1);
+      db.prepare(`UPDATE condition_stats SET trades=?,wins=?,losses=?,win_rate=?,total_pl=?,updated_at=CURRENT_TIMESTAMP WHERE condition=?`)
+        .run(t, w, l, parseFloat((w/t*100).toFixed(1)), parseFloat((existing.total_pl+(pl||0)).toFixed(2)), condition);
+    } else {
+      db.prepare(`INSERT INTO condition_stats (condition,trades,wins,losses,win_rate,total_pl) VALUES (?,1,?,?,?,?)`)
+        .run(condition, isWin?1:0, isWin?0:1, isWin?100:0, pl||0);
+    }
+  } catch(e) { console.error('[LEARN]', e.message); }
+}
+
+function _getConditionStat(condition) {
+  return db.prepare('SELECT * FROM condition_stats WHERE condition=?').get(condition) ||
+         { condition, trades:0, wins:0, losses:0, win_rate:50, total_pl:0 };
+}
+
+// ── LOSS ATTRIBUTION ─────────────────────────────────────────────────
+// Classify WHY a trade likely lost based on its entry conditions.
+// This is not blame — it is categorisation for pattern detection.
+// Each reason is a hypothesis. It becomes a fact only after 20+ samples.
+function classifyLossReasons(attr, realizedPL, exitReason) {
+  const reasons = [];
+  if (!attr) return reasons;
+
+  // Execution / timing reasons
+  if (exitReason === 'SL_HIT') {
+    if (attr.spread_pips > 2.0)  reasons.push({ code:'SPREAD_HIGH',    note:`Spread was ${attr.spread_pips} pips — high spread eats into edge before trade moves` });
+    if (attr.atr_pips && attr.spread_pips / attr.atr_pips > 0.15)
+                                  reasons.push({ code:'SPREAD_VS_ATR',  note:`Spread was ${(attr.spread_pips/attr.atr_pips*100).toFixed(0)}% of ATR — cost too large relative to volatility` });
+  }
+
+  // Market condition reasons
+  if (attr.adx < 20)            reasons.push({ code:'ADX_WEAK',       note:`ADX was ${attr.adx} at entry — market was not strongly trending (< 20)` });
+  if (attr.regime === 'TRENDING' && attr.adx < 22)
+                                  reasons.push({ code:'WEAK_TREND',     note:`Regime TRENDING but ADX marginal (${attr.adx}) — borderline trending conditions` });
+  if (attr.rsi_m30 > 70)        reasons.push({ code:'RSI_OVERBOUGHT', note:`RSI M30 was ${attr.rsi_m30} at BUY entry — overbought zone, mean reversion risk` });
+  if (attr.rsi_m30 < 30)        reasons.push({ code:'RSI_OVERSOLD',   note:`RSI M30 was ${attr.rsi_m30} at SELL entry — oversold zone, bounce risk` });
+
+  // Structure reasons
+  if (attr.sweep_risk === 'HIGH') reasons.push({ code:'SWEEP_RISK',    note:`Entry was near liquidity zone — price likely swept stops before reversing` });
+  if (attr.bos === 'NONE')       reasons.push({ code:'NO_BOS',        note:`No Break of Structure confirmed — entry lacked structural confirmation` });
+  if (attr.structure_bias !== 'NEUTRAL' &&
+      attr.structure_bias !== (attr.direction === 'BUY' ? 'BULLISH' : 'BEARISH'))
+                                  reasons.push({ code:'STRUCTURE_BIAS', note:`Market structure bias was ${attr.structure_bias} — against trade direction` });
+
+  // Timing / session reasons
+  if (attr.session === 'OFF_HOURS') reasons.push({ code:'OFF_HOURS',   note:`Trade entered during off-hours — lower liquidity, wider spreads, weaker moves` });
+  if (attr.session === 'ASIAN')   reasons.push({ code:'ASIAN_SESSION', note:`Asian session entry — historically lower directional follow-through` });
+
+  // Confidence / score reasons
+  if (attr.score === 9)          reasons.push({ code:'MIN_SCORE',     note:`Score was exactly 9/12 — minimum threshold, lowest-confidence entry band` });
+  if (attr.confidence < 80)      reasons.push({ code:'LOW_CONF',      note:`Confidence was ${attr.confidence}% — below 80% threshold, weaker setup` });
+
+  // W1 alignment
+  if (attr.w1_trend && attr.w1_trend !== 'UNKNOWN' &&
+      attr.w1_trend !== (attr.direction === 'BUY' ? 'BULLISH' : 'BEARISH'))
+                                  reasons.push({ code:'HTF_MISALIGNED', note:`W1 trend was ${attr.w1_trend} — trade was partially against higher timeframe` });
+
+  return reasons;
+}
+
+// ── POST-TRADE MESSAGE ───────────────────────────────────────────────
+// Called after every closed trade. Records conditions, generates attribution.
+// Only draws pattern conclusions from statistically sufficient samples.
+async function generateTradeLessons(sig, outcome, realizedPL, exitReason) {
+  try {
+    const isWin = outcome === 'WIN';
+    const attr  = db.prepare('SELECT * FROM trade_attribution WHERE signal_id=?').get(sig.id);
+
+    // Update condition stats regardless of whether attr exists (use signal data)
+    const attrForStats = attr || {
+      session: 'UNKNOWN', regime: 'UNKNOWN', pair: sig.pair,
+      direction: sig.direction, score: 0, bos: 'NONE',
+      sweep_risk: 'LOW', w1_trend: 'UNKNOWN', structure_bias: 'NEUTRAL',
+    };
+    const conditions = [
+      `session:${attrForStats.session}:${attrForStats.direction}`,
+      `regime:${attrForStats.regime}`,
+      `pair:${attrForStats.pair}:${attrForStats.direction}`,
+      `score:${attrForStats.score}`,
+      `bos:${attrForStats.bos}`,
+      `sweep_risk:${attrForStats.sweep_risk}`,
+      `w1_trend:${attrForStats.w1_trend}:${attrForStats.direction}`,
+      `structure:${attrForStats.structure_bias}:${attrForStats.direction}`,
+    ];
+    if (attr?.rsi_divergence && attr.rsi_divergence !== 'NONE') {
+      conditions.push(`rsi_div:${attr.rsi_divergence}`);
+    }
+    // ADX band — this is the most important single predictor
+    if (attr?.adx != null) {
+      const adxBand = attr.adx < 18 ? 'adx:<18' : attr.adx < 22 ? 'adx:18-22' :
+                      attr.adx < 26 ? 'adx:22-26' : attr.adx < 30 ? 'adx:26-30' : 'adx:30+';
+      conditions.push(adxBand);
+    }
+    // Spread band
+    if (attr?.spread_pips != null) {
+      const spBand = attr.spread_pips < 1 ? 'spread:<1' : attr.spread_pips < 2 ? 'spread:1-2' : 'spread:2+';
+      conditions.push(spBand);
+    }
+    // Confidence band
+    if (attr?.confidence != null) {
+      const confBand = attr.confidence < 80 ? 'conf:<80' : attr.confidence < 88 ? 'conf:80-88' : 'conf:88+';
+      conditions.push(confBand);
+    }
+    conditions.forEach(c => _upsertConditionStat(c, isWin, realizedPL));
+
+    // ── Loss attribution (categorise, don't blame) ────────────────────
+    const lossReasons = (!isWin && attr) ? classifyLossReasons(attr, realizedPL, exitReason) : [];
+
+    // ── Statistically-grounded lessons (LEARN_MIN_LESSON+ samples only) ─
+    const lessons = [];
+    for (const c of conditions) {
+      const stat = _getConditionStat(c);
+      if (stat.trades < LEARN_MIN_LESSON) continue;
+      if (stat.win_rate < 38) {
+        lessons.push({ type:'AVOID', condition: c,
+          lesson: `${c}: ${stat.win_rate}% win rate over ${stat.trades} trades (${stat.wins}W/${stat.losses}L)`,
+          impact: stat.win_rate < 30 ? 'HIGH' : 'MEDIUM' });
+      } else if (stat.win_rate > 68) {
+        lessons.push({ type:'REINFORCE', condition: c,
+          lesson: `${c}: ${stat.win_rate}% win rate over ${stat.trades} trades (${stat.wins}W/${stat.losses}L)`,
+          impact: 'POSITIVE' });
+      }
+    }
+    for (const l of lessons) {
+      try {
+        db.prepare(`INSERT INTO trade_lessons (signal_id,pair,direction,outcome,lesson_type,condition,lesson,impact,delta) VALUES (?,?,?,?,?,?,?,?,0)`)
+          .run(sig.id, sig.pair, sig.direction, outcome, l.type, l.condition, l.lesson, l.impact);
+      } catch(e) {}
+    }
+
+    // ── Telegram close message ────────────────────────────────────────
+    const plStr  = `${realizedPL >= 0 ? '+' : ''}$${realizedPL.toFixed(2)}`;
+    const durStr = sig.duration_mins
+      ? (sig.duration_mins < 60 ? `${sig.duration_mins}m` : `${(sig.duration_mins/60).toFixed(1)}h`) : '';
+    const exitStr = (exitReason || '').replace(/_/g, ' ');
+
+    // Get MFE/MAE if tracked
+    const mfe = _tradeMfeCache[sig.trade_id];
+    const mae = _tradeMaeCache[sig.trade_id];
+
+    const totalClosed = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
+
+    // Fetch live account balance
+    let balanceStr = '';
+    try {
+      const keys = getApiKeys();
+      const acctR = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
+      const bal = parseFloat(acctR?.account?.balance || 0);
+      if (bal > 0) balanceStr = `$${bal.toFixed(2)}`;
+    } catch(e) {}
+
+    // ── Header: result + pair + P&L ──────────────────────────────────
+    const resultWord = isWin ? '🏆 TRADE WON' : '❌ TRADE LOST';
+    let msg = `${resultWord}\nPair: ${sig.pair} ${sig.direction === 'BUY' ? '▲' : '▼'}\n`;
+    msg += `Profit/Loss: ${plStr}`;
+    if (balanceStr) msg += `\nBalance now: ${balanceStr}`;
+    msg += `\nDuration: ${durStr || '—'}  |  Exit: ${exitStr}`;
+
+    if (mfe != null || mae != null) {
+      msg += `\nBest reached: +${mfe != null ? mfe.toFixed(1) : '?'} pips  |  Max adverse: ${mae != null ? mae.toFixed(1) : '?'} pips`;
+    }
+
+    // ── What I learned ───────────────────────────────────────────────
+    msg += `\n\n📚 WHAT I LEARNED FROM THIS TRADE:`;
+
+    if (isWin) {
+      // Win — identify what worked and reinforce it
+      const winConditions = [];
+      if (attr) {
+        if (attr.session && attr.session !== 'UNKNOWN') winConditions.push(`trading in ${attr.session} session`);
+        if (attr.regime && ['TRENDING_STRONG','TRENDING'].includes(attr.regime)) winConditions.push(`market was in a clear ${attr.regime.toLowerCase().replace('_',' ')} regime`);
+        if (attr.bos && attr.bos !== 'NONE') winConditions.push(`BOS was ${attr.bos.toLowerCase()} — structure confirmed direction`);
+        if (attr.score >= 10) winConditions.push(`high entry score (${attr.score}/12) — many filters aligned`);
+        if (attr.adx && attr.adx >= 22) winConditions.push(`strong ADX (${attr.adx}) — trend had real momentum`);
+        if (attr.spread_pips && attr.spread_pips < 1.5) winConditions.push(`tight spread (${attr.spread_pips} pips) — clean execution`);
+      }
+      if (winConditions.length > 0) {
+        msg += `\n✅ What worked: ${winConditions.slice(0, 3).join(', ')}.`;
+      }
+      if (lessons.some(l => l.type === 'REINFORCE')) {
+        msg += `\n✅ Confirmed pattern: keep trading this way — the data backs it up.`;
+      } else {
+        msg += `\n✅ Good execution. I'm recording these conditions — the more wins like this, the stronger the pattern becomes.`;
+      }
+      msg += `\n💡 I will keep improving: repeating setups with these conditions confirmed by data.`;
+    } else {
+      // Loss — explain what went wrong in plain language
+      if (lossReasons.length > 0) {
+        msg += `\n❌ What went wrong:`;
+        for (const r of lossReasons.slice(0, 3)) {
+          msg += `\n• ${r.note}`;
+        }
+      } else if (attr) {
+        msg += `\n❌ The setup met all filters but the market moved against the trade.`;
+        if (mfe != null && mfe > 8) {
+          msg += ` The trade was profitable at +${mfe.toFixed(1)} pips before reversing.`;
+        }
+      }
+
+      // Confirmed avoid patterns
+      const avoidLessons = lessons.filter(l => l.type === 'AVOID');
+      if (avoidLessons.length > 0) {
+        msg += `\n\n🚫 Statistically confirmed — will avoid:`;
+        for (const l of avoidLessons) {
+          const [condType, condVal] = l.condition.split(':');
+          msg += `\n• ${condType} "${condVal}" has only ${l.lesson.match(/(\d+)% win rate/)?.[1]}% win rate — I will weight against this entry condition going forward`;
+        }
+      } else {
+        msg += `\n\n⚠️ Single loss — I record it but won't change strategy yet. Patterns only become real after ${LEARN_MIN_LESSON}+ similar trades. I keep improving as data builds.`;
+      }
+      msg += `\n💡 I will keep improving: each loss is recorded, patterns are tracked, and the system adjusts when the data is statistically significant.`;
+    }
+
+    // ── Statistically reinforced wins (shown for both) ───────────────
+    const reinforceLessons = lessons.filter(l => l.type === 'REINFORCE');
+    if (reinforceLessons.length > 0) {
+      msg += `\n\n📈 KEEP DOING THIS (data confirmed):`;
+      for (const l of reinforceLessons) {
+        msg += `\n✅ ${l.lesson}`;
+      }
+    }
+
+    // Milestones
+    const milestoneMsg = {
+      10: `\n\n🎯 10 trades — early patterns forming. Type REPORT to see analysis.`,
+      25: `\n\n🎯 25 trades — running full pattern analysis now...`,
+      50: `\n\n🎯 50 trades — system has solid statistical data. Type REPORT.`,
+      100:`\n\n🎯 100 trades — institutional-level self-knowledge reached. Type REPORT.`,
+    }[totalClosed] || '';
+    msg += milestoneMsg;
+
+    await sendTelegramMsg(msg).catch(() => {});
+    console.log(`[LEARN] #${sig.id} ${outcome}: ${lossReasons.length} reasons, ${lessons.length} lessons`);
+
+    // Clean up MFE/MAE cache for closed trade
+    if (sig.trade_id) {
+      delete _tradeMfeCache[sig.trade_id];
+      delete _tradeMaeCache[sig.trade_id];
+    }
+
+    // Trigger pattern analysis every LEARN_ANALYSIS_N trades
+    if (totalClosed > 0 && totalClosed % LEARN_ANALYSIS_N === 0) {
+      setTimeout(() => runPatternAnalysis(totalClosed).catch(() => {}), 5000);
+    }
+
+  } catch(e) { console.error('[LEARN]', e.message); }
+}
+
+// ── MFE / MAE IN-MEMORY CACHE ────────────────────────────────────────
+// runTrailingStops() updates these every 30s while the trade is open
+const _tradeMfeCache = {};  // trade_id → max pips reached (positive)
+const _tradeMaeCache = {};  // trade_id → max adverse pips (negative)
+
+// ── PATTERN ANALYSIS — runs every 25 trades and on REPORT command ────
+async function runPatternAnalysis(totalClosed) {
+  try {
+    const attrs = db.prepare(`SELECT * FROM trade_attribution WHERE outcome IS NOT NULL ORDER BY created_at DESC`).all();
+    if (attrs.length < 10) return;
+
+    const wins   = attrs.filter(a => a.outcome === 'WIN');
+    const losses = attrs.filter(a => a.outcome === 'LOSS');
+    const winRate = Math.round(wins.length / attrs.length * 100);
+    const totalPL = attrs.reduce((s, a) => s + (a.realized_pl || 0), 0);
+    const avgWin  = wins.length   ? wins.reduce((s,a)   => s+(a.realized_pl||0), 0)/wins.length   : 0;
+    const avgLoss = losses.length ? losses.reduce((s,a) => s+(a.realized_pl||0), 0)/losses.length : 0;
+    const pf      = avgLoss < 0 ? Math.abs(avgWin / avgLoss) : null;
+
+    // Find all conditions with MIN_LEARN+ samples, sorted by deviation from 50%
+    const stats = db.prepare(`
+      SELECT condition, trades, wins, losses, win_rate, total_pl
+      FROM condition_stats WHERE trades >= ${LEARN_MIN_ADJUST}
+      ORDER BY ABS(win_rate - 50) DESC
+    `).all();
+
+    const avoid    = stats.filter(s => s.win_rate < 40).slice(0, 5);
+    const reinforce= stats.filter(s => s.win_rate > 65).slice(0, 5);
+
+    // ADX analysis (most important single factor)
+    const adxStats = db.prepare(`
+      SELECT condition, trades, wins, win_rate FROM condition_stats
+      WHERE condition LIKE 'adx:%' ORDER BY condition
+    `).all();
+
+    // Build the report
+    let report =
+`📊 PATTERN ANALYSIS REPORT
+${totalClosed} closed trades analysed
+━━━━━━━━━━━━━━━━━━━━━━━
+Overall: ${winRate}% WR | P&L: ${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(0)}
+Avg Win: +$${avgWin.toFixed(0)} | Avg Loss: $${avgLoss.toFixed(0)}
+${pf ? `Profit Factor: ${pf.toFixed(2)}` : ''}`;
+
+    if (adxStats.length > 0) {
+      report += `\n\n📈 ADX IMPACT (${LEARN_MIN_ADJUST}+ samples):`;
+      for (const s of adxStats) {
+        if (s.trades >= LEARN_MIN_ADJUST) {
+          const bar = s.win_rate >= 60 ? '✅' : s.win_rate <= 40 ? '🔴' : '➖';
+          report += `\n${bar} ${s.condition.replace('adx:','ADX ')}: ${s.win_rate}%WR (${s.wins}W/${s.losses}L)`;
+        }
+      }
+    }
+
+    if (avoid.length > 0) {
+      report += `\n\n🔴 AVOID (statistically weak, ${LEARN_MIN_ADJUST}+ trades):`;
+      for (const s of avoid) {
+        report += `\n• ${s.condition}: ${s.win_rate}%WR (${s.trades} trades, $${s.total_pl.toFixed(0)} P&L)`;
+      }
+    }
+
+    if (reinforce.length > 0) {
+      report += `\n\n✅ REINFORCE (statistically strong):`;
+      for (const s of reinforce) {
+        report += `\n• ${s.condition}: ${s.win_rate}%WR (${s.trades} trades, $${s.total_pl.toFixed(0)} P&L)`;
+      }
+    }
+
+    if (stats.length === 0) {
+      report += `\n\nInsufficient data for condition analysis (need ${LEARN_MIN_ADJUST}+ per condition).`;
+      report += `\nAll entry conditions logged — patterns will emerge after more trades.`;
+    }
+
+    report += `\n\nNext analysis at ${totalClosed + LEARN_ANALYSIS_N} trades.`;
+
+    await sendTelegramMsg(report).catch(() => {});
+    console.log(`[LEARN] Pattern analysis sent (${totalClosed} trades)`);
+
+  } catch(e) { console.error('[LEARN] Analysis failed:', e.message); }
+}
+
+// ── DYNAMIC CONFIDENCE DELTA ─────────────────────────────────────────
+// Applied during scan AFTER calcTradeSetup.
+// Only adjusts when a condition has LEARN_MIN_ADJUST+ data points.
+// Key insight: 45% win rate on 8 trades = noise. 45% on 30 trades = signal.
+function getLearningDelta(attrs) {
+  let delta = 0;
+  const applied = [];
+
+  const conditions = [
+    `session:${attrs.session}:${attrs.direction}`,
+    `regime:${attrs.regime}`,
+    `pair:${attrs.pair}:${attrs.direction}`,
+    `bos:${attrs.bos}`,
+    `sweep_risk:${attrs.sweep_risk}`,
+    `w1_trend:${attrs.w1Trend}:${attrs.direction}`,
+  ];
+  if (attrs.adx != null) {
+    const adxBand = attrs.adx < 18 ? 'adx:<18' : attrs.adx < 22 ? 'adx:18-22' :
+                    attrs.adx < 26 ? 'adx:22-26' : attrs.adx < 30 ? 'adx:26-30' : 'adx:30+';
+    conditions.push(adxBand);
+  }
+
+  for (const cond of conditions) {
+    const stat = _getConditionStat(cond);
+    if (stat.trades < LEARN_MIN_ADJUST) continue; // not enough data — no adjustment
+
+    // Statistically meaningful deviation from expected ~50%
+    if (stat.win_rate > 68) {
+      // Strong historical edge for this condition
+      const bonus = Math.min(8, Math.round((stat.win_rate - 58) / 4));
+      delta += bonus;
+      applied.push(`+${bonus} (${cond}: ${stat.win_rate}%WR n=${stat.trades})`);
+    } else if (stat.win_rate < 38) {
+      // This condition historically underperforms
+      const penalty = -Math.min(12, Math.round((48 - stat.win_rate) / 3));
+      delta += penalty;
+      applied.push(`${penalty} (${cond}: ${stat.win_rate}%WR n=${stat.trades})`);
+    }
+    // 38-68% win rate = normal variance, no adjustment (avoids false learning)
+  }
+
+  if (applied.length > 0) {
+    console.log(`[LEARN] Delta ${delta>0?'+':''}${delta}: ${applied.join(', ')}`);
+  }
+  return delta;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // 12-CHECK PRECISION SCORING ENGINE — top-down: H4 → H2 → M30 → M5
 // Each check = 1 point. Signal only fires if score >= minScore
 // ═══════════════════════════════════════════════════════════════════
@@ -732,7 +1377,7 @@ function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [] }) {
     const eventMin = hh * 60 + mm;
     const nowMin   = nowUTC.getUTCHours() * 60 + nowUTC.getUTCMinutes();
     const diff     = nowMin - eventMin; // positive = event already passed
-    return diff >= -45 && diff <= 30;   // 45 min before, 30 min after
+    return diff >= -45 && diff <= 60;   // 45 min before, 60 min after (post-news volatility window)
   });
   pass('No News Blackout', !hasNews, 2);
 
@@ -1036,21 +1681,24 @@ async function reconcileTrades() {
 
         recordTradePL(realizedPL);
         writeAudit('TRADE_CLOSED', { signal_id: sig.id, pair: sig.pair, pl: realizedPL, exitReason });
-        // Check if this pair now has a losing streak → set pair breaker
         checkAndSetPairBreaker(sig.pair);
 
+        // Fill in attribution outcome for post-trade analysis
+        try {
+          db.prepare(`
+            UPDATE trade_attribution SET
+              realized_pl=?, actual_pips=?, exit_reason=?, duration_mins=?,
+              outcome=CASE WHEN ? > 0 THEN 'WIN' WHEN ? < 0 THEN 'LOSS' ELSE 'BE' END
+            WHERE signal_id=?
+          `).run(realizedPL, actualPips, exitReason, durMins, realizedPL, realizedPL, sig.id);
+        } catch(e) { console.error('[ATTR]', e.message); }
+
+        const outcome = realizedPL > 0 ? 'WIN' : realizedPL < 0 ? 'LOSS' : 'BE';
         console.log(`[RECONCILE] #${sig.id} ${sig.pair} ${sig.direction} → ${exitReason} | P&L: ${realizedPL >= 0 ? '+' : ''}${realizedPL.toFixed(2)} | ${actualPips} pips | ${durMins}m`);
 
-        const icon = realizedPL >= 0 ? '✅' : '❌';
-        const dur  = durMins < 60 ? `${durMins}m` : `${Math.round(durMins/60)}h`;
-        sendTelegramMsg(
-`${icon} TRADE CLOSED — Signal #${sig.id}
-${sig.pair} ${sig.direction}
-Exit: ${exitReason.replace(/_/g, ' ')} @ ${exitPx.toFixed(dp)}
-P&L: ${realizedPL >= 0 ? '+' : ''}${realizedPL.toFixed(2)}
-Pips: ${actualPips >= 0 ? '+' : ''}${actualPips}
-Duration: ${dur}`
-        ).catch(() => {});
+        // Attach outcome to sig object for generateTradeLessons
+        const closedSig = { ...sig, duration_mins: durMins, actual_pips: actualPips };
+        generateTradeLessons(closedSig, outcome, realizedPL, exitReason).catch(() => {});
       }
     }
 
@@ -1122,6 +1770,12 @@ function backupDatabase() {
   }
 }
 
+// ── Partial-TP state — in-memory Set of trade IDs already partially closed ───
+// Persisted across restarts via the execution_log table flag
+const _partialClosedSet = new Set(
+  (() => { try { return db.prepare(`SELECT oanda_trade_id FROM execution_log WHERE partial_closed=1`).all().map(r => r.oanda_trade_id); } catch { return []; } })()
+);
+
 // ── Trailing stop monitor — protects open profits ────────────────────────────
 let _tslBackoffUntil = 0;
 async function runTrailingStops() {
@@ -1152,6 +1806,23 @@ async function runTrailingStops() {
       const slPips = isBuy
         ? (entry - currentSL) / pipSize
         : (currentSL - entry) / pipSize;
+
+      // ── Partial TP at 1:1 R:R — close 50% once trade equals SL distance ────
+      // Locks realized profit before going for full TP; reduces average loss on runners
+      if (plPips >= slPips * 1.0 && !_partialClosedSet.has(trade.id)) {
+        try {
+          const partialUnits = String(Math.floor(Math.abs(units) * 0.5));
+          if (parseInt(partialUnits) >= 100) {
+            await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/close`, 'PUT', { units: partialUnits });
+            _partialClosedSet.add(trade.id);
+            try { db.prepare(`UPDATE execution_log SET partial_closed=1 WHERE signal_id IN (SELECT id FROM signals WHERE trade_id=?)`).run(trade.id); } catch {}
+            console.log(`[TSL] Partial TP: ${instr} trade ${trade.id} — closed ${partialUnits} units at +${plPips.toFixed(1)} pips`);
+            sendTelegramMsg(
+              `📤 PARTIAL TP — ${PAIR_LABELS[instr] || instr}\nClosed 50% at +${plPips.toFixed(1)} pips (1:1 R:R)\nRemainder running to full TP`
+            ).catch(() => {});
+          }
+        } catch(e) { console.warn(`[TSL] Partial close failed ${trade.id}:`, e.message); }
+      }
 
       // Move SL to breakeven once +1:1 reached
       const beThreshold = slPips * 1.0;
@@ -1184,9 +1855,101 @@ async function runTrailingStops() {
           console.log(`[TSL] Trailing SL moved: ${instr} → ${trailSL}`);
         }
       }
+
+      // ── MFE / MAE TRACKING ───────────────────────────────────────────
+      // Track max favorable and max adverse excursion for post-trade analysis
+      if (plPips > 0) {
+        _tradeMfeCache[trade.id] = Math.max(_tradeMfeCache[trade.id] || 0, plPips);
+      } else if (plPips < 0) {
+        _tradeMaeCache[trade.id] = Math.min(_tradeMaeCache[trade.id] || 0, plPips);
+      }
+
+      // ── STAGNATION EXIT — trade going nowhere ────────────────────────
+      // If trade has been open 8+ hours with < 0.2R profit, it is wasting margin
+      // and overnight risk. Close it.
+      const hoursOpen = (Date.now() - new Date(trade.openTime).getTime()) / 3600000;
+      const rrReached = slPips > 0 ? plPips / slPips : 0;
+      if (hoursOpen > 8 && rrReached < 0.2 && !_stagnationChecked.has(trade.id)) {
+        _stagnationChecked.add(trade.id);
+        console.warn(`[TSL] Stagnation: ${instr} trade ${trade.id} — ${hoursOpen.toFixed(1)}h open at ${rrReached.toFixed(2)}R`);
+        try {
+          await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/close`, 'PUT');
+          sendTelegramMsg(
+`⏱ STAGNATION EXIT — ${PAIR_LABELS[instr] || instr}
+Trade open ${hoursOpen.toFixed(1)}h with only ${rrReached.toFixed(2)}R profit
+Capital freed. No overnight drift risk.`
+          ).catch(() => {});
+          console.log(`[TSL] Stagnation exit executed: ${instr} trade ${trade.id}`);
+        } catch(e) { console.error(`[TSL] Stagnation close failed ${trade.id}:`, e.message); }
+      }
+
+      // ── DYNAMIC TRADE HEALTH — close if structure flips against position ──
+      // Fetch fresh M30 indicators every 5 minutes (not every 30s — rate limit safe)
+      const healthKey = `${trade.id}_health`;
+      const lastHealthCheck = _tradeHealthCache[healthKey] || 0;
+      if (Date.now() - lastHealthCheck > 300000) { // 5-min cooldown
+        _tradeHealthCache[healthKey] = Date.now();
+        try {
+          const m30r = await oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=M30&price=M`);
+          const m30c  = completedCandles(m30r?.candles || []);
+          const h4r   = await oandaRequest(`/v3/instruments/${instr}/candles?count=60&granularity=H4&price=M`);
+          const h4c   = completedCandles(h4r?.candles || []);
+          if (m30c.length >= 10 && h4c.length >= 26) {
+            const indM30live = buildIndicators(m30c, h4c);
+            const indH4live  = buildIndicators(h4c, []);
+            let healthScore = 100;
+
+            // H4 trend flip against position — most serious
+            if (isBuy  && indH4live.trend === 'BEARISH') healthScore -= 35;
+            if (!isBuy && indH4live.trend === 'BULLISH') healthScore -= 35;
+
+            // M30 EMA cross against position
+            if (isBuy  && indM30live.ema9 < indM30live.ema21) healthScore -= 20;
+            if (!isBuy && indM30live.ema9 > indM30live.ema21) healthScore -= 20;
+
+            // RSI extreme against direction
+            if (isBuy  && indM30live.rsi14 < 35) healthScore -= 15;
+            if (!isBuy && indM30live.rsi14 > 65) healthScore -= 15;
+
+            // ATR expanding dangerously (volatility explosion)
+            if (isATRExpanded(h4c, 2.0)) healthScore -= 15;
+
+            console.log(`[HEALTH] ${instr} trade ${trade.id}: score ${healthScore}/100`);
+
+            if (healthScore <= 30) {
+              // Emergency exit — structure has completely flipped
+              await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/close`, 'PUT');
+              const dir = isBuy ? 'BUY' : 'SELL';
+              sendTelegramMsg(
+`🔴 HEALTH EXIT — ${PAIR_LABELS[instr] || instr} ${dir}
+Health score: ${healthScore}/100
+P&L: ${pl >= 0 ? '+' : ''}${pl.toFixed(2)}
+Market structure flipped against position — closed to protect capital.`
+              ).catch(() => {});
+              console.warn(`[HEALTH] Emergency exit: ${instr} trade ${trade.id} (health ${healthScore})`);
+            } else if (healthScore <= 55 && currentSL) {
+              // Tighten stop to 0.5× ATR from current price — reduce exposure
+              const atr = h1AtrCache[instr] || indM30live.atr14;
+              const tightSL = isBuy
+                ? (currentPx - atr * 0.5).toFixed(dp)
+                : (currentPx + atr * 0.5).toFixed(dp);
+              const tightPrice = parseFloat(tightSL);
+              const shouldTighten = isBuy ? tightPrice > currentSL : tightPrice < currentSL;
+              if (shouldTighten) {
+                await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades/${trade.id}/orders`, 'PUT', {
+                  stopLoss: { price: tightSL, timeInForce:'GTC' }
+                });
+                console.log(`[HEALTH] SL tightened: ${instr} → ${tightSL} (health ${healthScore})`);
+              }
+            }
+          }
+        } catch(e) { /* health check failed silently — don't block trailing stop */ }
+      }
     }
   } catch(e) { /* silent */ }
 }
+const _stagnationChecked = new Set();
+const _tradeHealthCache  = {};
 const h1AtrCache = {};
 setInterval(runTrailingStops, 30000); // check every 30s
 
@@ -1259,6 +2022,9 @@ async function pollPrices() {
     }
   }
   // Fallback: Twelve Data (only if OANDA unavailable)
+  // Clear spread cache — TwelveData has no spread data; stale OANDA spreads would
+  // mislead spread-efficiency and execution-block checks if left from the last OANDA poll
+  spreadCache = {};
   if (keys.twelve_key) {
     try {
       const r = await axios.get(
@@ -1738,9 +2504,15 @@ db.exec(`
     slippage_pips   REAL,
     slippage_dir    TEXT,
     spread_at_entry REAL,
-    latency_ms      INTEGER
+    latency_ms      INTEGER,
+    oanda_trade_id  TEXT,
+    partial_closed  INTEGER DEFAULT 0
   );
 `);
+// Migrate older execution_log tables that lack the new columns
+['oanda_trade_id TEXT', 'partial_closed INTEGER DEFAULT 0'].forEach(col => {
+  try { db.exec(`ALTER TABLE execution_log ADD COLUMN ${col}`); } catch {}
+});
 
 // Migrate existing DBs — add columns that were added after initial deploy
 [
@@ -2299,11 +3071,125 @@ async function pollTgCallbacks() {
               await sendTelegramMsg(
 `📊 PrecisionTraderPro Status
 Scanner: ${s.enabled ? 'ON' : 'OFF'}
+Mode: ${s.auto_execute ? '⚡ AUTO-EXECUTE' : '👤 Manual approval'}
 Daily P&L: ${daily.realized_pl.toFixed(2)}
 Consecutive losses: ${consec}
 OANDA latency: ${avgLat.toFixed(0)}ms
 Price source: ${priceSource}`
               );
+              continue;
+            }
+            if (txtMsg === 'AUTO ON') {
+              const s = getStorageValue('autotrade_settings') || {};
+              s.auto_execute = true;
+              setStorageValue('autotrade_settings', s);
+              writeAudit('SETTINGS_CHANGED', { auto_execute: true }, 'TELEGRAM');
+              await sendTelegramMsg('⚡ Auto-execute ENABLED\nThe system will now trade automatically without asking for approval.');
+              continue;
+            }
+            if (txtMsg === 'AUTO OFF') {
+              const s = getStorageValue('autotrade_settings') || {};
+              s.auto_execute = false;
+              setStorageValue('autotrade_settings', s);
+              writeAudit('SETTINGS_CHANGED', { auto_execute: false }, 'TELEGRAM');
+              await sendTelegramMsg('👤 Auto-execute DISABLED\nThe system will now send APPROVE / REJECT buttons for every signal.');
+              continue;
+            }
+
+            // RESULTS / RESULTS 48 / RESULTS 7
+            if (txtMsg.startsWith('RESULTS')) {
+              const parts = txtMsg.split(' ');
+              const hours = parseInt(parts[1]) * (parts[1] === '7' ? 24 : 1) || 24;
+              const label = hours <= 24 ? '24h' : hours <= 48 ? '48h' : `${hours/24}d`;
+
+              const trades = db.prepare(`
+                SELECT pair, direction, confidence, realized_pl, actual_pips,
+                       exit_reason, duration_mins, entry_price, exit_price,
+                       stop_loss, take_profit
+                FROM signals
+                WHERE status='CLOSED'
+                  AND closed_at >= datetime('now', '-${hours} hours')
+                ORDER BY closed_at DESC
+              `).all();
+
+              if (!trades.length) {
+                await sendTelegramMsg(`📊 No closed trades in the last ${label}.`);
+                continue;
+              }
+
+              const wins   = trades.filter(t => (t.realized_pl || 0) > 0);
+              const losses = trades.filter(t => (t.realized_pl || 0) < 0);
+              const totalPL= trades.reduce((s, t) => s + (t.realized_pl || 0), 0);
+              const winRate= Math.round(wins.length / trades.length * 100);
+              const avgDur = trades.length
+                ? Math.round(trades.reduce((s,t) => s + (t.duration_mins||0), 0) / trades.length)
+                : 0;
+              const durStr = avgDur < 60 ? `${avgDur}m` : `${(avgDur/60).toFixed(1)}h`;
+
+              const tradeLines = trades.map(t => {
+                const icon = (t.realized_pl||0) > 0 ? '✅' : (t.realized_pl||0) < 0 ? '❌' : '➖';
+                const pl   = t.realized_pl != null ? `${t.realized_pl >= 0 ? '+' : ''}${parseFloat(t.realized_pl).toFixed(2)}` : 'pending';
+                const pips = t.actual_pips != null ? ` (${parseFloat(t.actual_pips) >= 0 ? '+' : ''}${parseFloat(t.actual_pips).toFixed(1)} pips)` : '';
+                const exit = t.exit_reason ? ` — ${t.exit_reason.replace(/_/g,' ')}` : '';
+                const dur  = t.duration_mins ? ` [${t.duration_mins < 60 ? t.duration_mins+'m' : (t.duration_mins/60).toFixed(1)+'h'}]` : '';
+                return `${icon} ${t.pair} ${t.direction} ${t.confidence}%  $${pl}${pips}${exit}${dur}`;
+              }).join('\n');
+
+              await sendTelegramMsg(
+`📊 RESULTS — Last ${label}
+━━━━━━━━━━━━━━━━━━━━
+Trades:   ${trades.length}  (${wins.length}W / ${losses.length}L)
+Win Rate: ${winRate}%
+Total P&L: ${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(2)}
+Avg Duration: ${durStr}
+
+${tradeLines}`
+              );
+              continue;
+            }
+
+            // LESSONS — show what the system has learned so far
+            if (txtMsg === 'LESSONS') {
+              const totalClosed = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
+              if (totalClosed === 0) {
+                await sendTelegramMsg('📚 No closed trades yet.\n\nEvery time a trade closes the system records all entry conditions and updates its statistical model.\n\nPatterns emerge after:\n• 10+ trades: early observations\n• 20+ trades per condition: confirmed adjustments\n• 50+ trades: reliable analysis\n\nType REPORT anytime to see current state.');
+                continue;
+              }
+              // Show conditions with meaningful data (LEARN_MIN_LESSON+)
+              const meaningful = db.prepare(`
+                SELECT condition, trades, wins, losses, win_rate, total_pl
+                FROM condition_stats WHERE trades >= ${LEARN_MIN_LESSON}
+                ORDER BY ABS(win_rate - 50) DESC LIMIT 12
+              `).all();
+              const allCount = db.prepare(`SELECT COUNT(*) as c FROM condition_stats`).get().c;
+
+              let msg = `📚 LEARNING ENGINE STATUS\n━━━━━━━━━━━━━━━━━━━━\n`;
+              msg += `Closed trades: ${totalClosed}\n`;
+              msg += `Conditions tracked: ${allCount}\n`;
+              msg += `Conditions with ${LEARN_MIN_LESSON}+ data: ${meaningful.length}\n`;
+              msg += `Adjustment threshold: ${LEARN_MIN_ADJUST} trades\n`;
+
+              if (meaningful.length > 0) {
+                msg += `\n🔬 PATTERNS EMERGING (${LEARN_MIN_LESSON}+ trades):\n`;
+                for (const c of meaningful) {
+                  const icon = c.win_rate >= 65 ? '✅' : c.win_rate <= 40 ? '🔴' : '➖';
+                  const adj  = c.trades >= LEARN_MIN_ADJUST
+                    ? (c.win_rate > 68 ? ' → +bonus' : c.win_rate < 38 ? ' → -penalty' : ' → no adj')
+                    : ` → (${LEARN_MIN_ADJUST - c.trades} more needed)`;
+                  msg += `${icon} ${c.condition}: ${c.win_rate}%WR (${c.trades} trades)${adj}\n`;
+                }
+              } else {
+                msg += `\nNo condition has ${LEARN_MIN_LESSON}+ trades yet.\nAll conditions are being tracked — keep trading.\n`;
+              }
+              msg += `\nType REPORT for full statistical analysis.`;
+              await sendTelegramMsg(msg);
+              continue;
+            }
+
+            if (txtMsg === 'REPORT') {
+              const totalClosed = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
+              await sendTelegramMsg(`📊 Running pattern analysis on ${totalClosed} trades...`);
+              await runPatternAnalysis(totalClosed);
               continue;
             }
 
@@ -2425,7 +3311,7 @@ async function runAutoScan() {
       // ── Fetch all 5 timeframes in parallel: W1 → H4 → H2 → M30 → M5 ──
       const [w1r, h4r, h2r, m30r, m5r] = await Promise.allSettled([
         oandaRequest(`/v3/instruments/${instr}/candles?count=30&granularity=W&price=M`),
-        oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H4&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=250&granularity=H4&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H2&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=M30&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=M5&price=M`),
@@ -2494,18 +3380,25 @@ async function runAutoScan() {
         continue;
       }
 
-      // ── STAGE 1: Market Regime — reject RANGING / CHOPPY ─────────────
-      const regime = classifyRegime(indH4, indM30);
+      // ── STAGE 1: Market Regime — reject untradeable states ───────────
+      const regime = classifyRegime(indH4, indM30, h4cc);
       if (!regime.tradeable) {
         console.log(`[SCAN] ${label}: Regime ${regime.regime} — ${regime.note}`);
         continue;
       }
-      console.log(`[SCAN] ${label}: Regime ${regime.regime} ✓`);
+      console.log(`[SCAN] ${label}: Regime ${regime.regime} (ATR ratio ${regime.atrRatio?.toFixed(2)}) ✓`);
 
       // ── STAGE 1: Candle Quality — reject spike/doji/exhaustion ───────
       const candleQuality = inspectCandleQuality(h4cc, indH4.atr14);
       if (!candleQuality.ok) {
         console.log(`[SCAN] ${label}: Candle quality fail — ${candleQuality.issues.join('; ')}`);
+        continue;
+      }
+
+      // ── STAGE 1: EMA Convergence — trend draining, EMAs closing together ─
+      const emaConv = detectEMAConvergence(indH4);
+      if (emaConv.converging && emaConv.severity === 'HIGH') {
+        console.log(`[SCAN] ${label}: EMA convergence (HIGH) — ${emaConv.note}`);
         continue;
       }
 
@@ -2524,24 +3417,44 @@ async function runAutoScan() {
       }
 
       // ── FILTER 3: W1 trend — no counter-trend trades ──────────────────
+      let w1Trend = 'UNKNOWN';
       if (w1c.length >= 5) {
-        const w1closes = w1c.map(c => parseFloat(c.mid.c));
-        const w1ema21  = calcEMA(w1closes, Math.min(21, w1closes.length));
-        const w1trend  = w1closes[w1closes.length - 1] > w1ema21 ? 'BULLISH' : 'BEARISH';
-        if ((aiDirection === 'BUY' && w1trend === 'BEARISH') ||
-            (aiDirection === 'SELL' && w1trend === 'BULLISH')) {
-          console.log(`[SCAN] ${label}: W1 ${w1trend} — counter-trend ${aiDirection} rejected`);
-          continue;
+        const w1cc = completedCandles(w1c);
+        if (w1cc.length >= 5) {
+          const w1closes = w1cc.map(c => parseFloat(c.mid.c));
+          const w1ema21  = calcEMA(w1closes, Math.min(21, w1closes.length));
+          w1Trend        = w1closes[w1closes.length - 1] > w1ema21 ? 'BULLISH' : 'BEARISH';
+          if ((aiDirection === 'BUY' && w1Trend === 'BEARISH') ||
+              (aiDirection === 'SELL' && w1Trend === 'BULLISH')) {
+            console.log(`[SCAN] ${label}: W1 ${w1Trend} (${w1cc.length} completed candles) — counter-trend ${aiDirection} rejected`);
+            continue;
+          }
         }
       }
 
       // ── STAGE 2: Supplementary intelligence (logged, not blocking) ───
-      const rsiDiv     = detectRSIDivergence(m30cc, aiDirection);
-      const compression= detectCompression(h4cc);
-      const liquidity  = analyzeLiquidity(indH4, price, aiDirection, indH4.atr14);
+      const rsiDiv      = detectRSIDivergence(m30cc, aiDirection);
+      const compression = detectCompression(h4cc);
+      const liquidity   = analyzeLiquidity(indH4, price, aiDirection, indH4.atr14);
+
+      // ── MARKET STRUCTURE ENGINE ───────────────────────────────────────
+      const structure     = detectMarketStructure(h4cc, aiDirection);
+      const liqZones      = detectLiquidityZones(h4cc, indH4.atr14);
+      const structureDelta= scoreMarketStructure(structure, aiDirection, liqZones);
+
+      console.log(`[SCAN] ${label}: Structure ${structure.structureBias} | BOS ${structure.bos} | CHOCH ${structure.choch} | delta ${structureDelta > 0 ? '+' : ''}${structureDelta}`);
+
+      // CHOCH against trade direction is a hard block — structure is flipping
+      if (structure.choch !== 'NONE' && structure.choch !== (aiDirection === 'BUY' ? 'BULLISH' : 'BEARISH')) {
+        console.log(`[SCAN] ${label}: CHOCH ${structure.choch} against ${aiDirection} — structure change, rejected`);
+        continue;
+      }
 
       if (liquidity.sweep_risk === 'HIGH') {
         console.log(`[SCAN] ${label}: Liquidity warning — ${liquidity.note}`);
+      }
+      if (liqZones.nearBuySide || liqZones.nearSellSide) {
+        console.log(`[SCAN] ${label}: Near liquidity zone — sweep risk`);
       }
       if (compression.compressing) {
         console.log(`[SCAN] ${label}: Compression detected (ATR ratio ${compression.ratio}) — breakout potential ✓`);
@@ -2574,13 +3487,23 @@ async function runAutoScan() {
       });
       console.log(`[SCAN] ${label}: Calc Engine → ${aiDirection} ${setup.confidence}%`);
 
+      // ── Apply learning delta — from accumulated trade history ────────
+      const learningDelta = getLearningDelta({
+        session, regime: regime.regime, pair: label, direction: aiDirection,
+        bos: structure.bos, sweep_risk: liquidity.sweep_risk, w1Trend,
+      });
+
+      const totalDelta = structureDelta + learningDelta;
       let analysis  = setup.analysis;
       let parsed    = {
         direction:  setup.direction,
-        confidence: setup.confidence,
+        confidence: Math.min(95, Math.max(10, setup.confidence + totalDelta)),
         stopLoss:   setup.stopLoss,
         takeProfit: setup.takeProfit,
       };
+      if (totalDelta !== 0) {
+        console.log(`[SCAN] ${label}: Total delta ${totalDelta > 0 ? '+' : ''}${totalDelta} (structure ${structureDelta > 0?'+':''}${structureDelta}, learning ${learningDelta > 0?'+':''}${learningDelta}) → confidence ${setup.confidence}% → ${parsed.confidence}%`);
+      }
 
       // ── FIX 10: Regime persistence — bonus filter ─────────────────────
       recordRegime(label, regime.regime);
@@ -2749,8 +3672,13 @@ Return EXACTLY 6 lines, no other text:
       const sizeFactor   = Math.min(lossFactor, timeFactor);
       const sizeReasons  = [];
       if (consecLoss > 0) sizeReasons.push(`${consecLoss} consec loss`);
-      if (timeFactor < 1) sizeReasons.push(`Friday/weekend`);
+      const timeNote = getSizeFactorNote(timeFactor);
+      if (timeNote) sizeReasons.push(timeNote);
       const sizeNote     = sizeFactor < 1 ? ` [REDUCED to ${(sizeFactor*100).toFixed(0)}% — ${sizeReasons.join(', ')}]` : '';
+      // Medium EMA convergence → soft warning (not a block, logged in message)
+      if (emaConv.converging && emaConv.severity === 'MEDIUM') {
+        console.log(`[SCAN] ${label}: EMA convergence (MEDIUM) — ${emaConv.note} — proceeding with caution`);
+      }
 
       const units = Math.floor(riskAmt / (slPips * pipVal) * sizeFactor);
       if (units < 100) continue;
@@ -2765,48 +3693,113 @@ Return EXACTLY 6 lines, no other text:
         parsed.stopLoss, parsed.takeProfit,
         slPips.toFixed(1), tpPips.toFixed(1),
         units, riskPct, riskAmt, lots,
-        `${analysis}\n\nSCORE: ${scored.score}/${scored.maxScore} | SESSION: ${session} | ADX(H4): ${indH4.adx} | M5 Pattern: ${indM5.pattern}`,
+        `${analysis}\n\nSCORE: ${scored.score}/${scored.maxScore} | SESSION: ${session} | ADX(H4): ${indH4.adx} | M5 Pattern: ${indM5.pattern} | STRUCTURE: ${structure.bos}/${structure.choch}`,
         indH4.emaAlignment, indM30.rsi14, indH2.trend
       ).lastInsertRowid;
 
-      // ── Build Telegram message with full 4-TF breakdown ──────────────
-      const passedStr = scored.checks.filter(c=>c.pass).map(c=>`✅ ${c.name}`).join('\n');
-      const failedStr = scored.checks.filter(c=>!c.pass).map(c=>`❌ ${c.name}`).join('\n');
-      const dirArrow  = parsed.direction==='BUY' ? '▲' : '▼';
+      // ── Save post-trade attribution context (outcome filled in by reconcileTrades) ──
+      try {
+        db.prepare(`
+          INSERT OR IGNORE INTO trade_attribution
+            (signal_id, pair, direction, session, regime, atr_ratio, score, confidence,
+             spread_pips, atr_pips, adx, rsi_m30, w1_trend, structure_bias, bos, choch,
+             rsi_divergence, compressing, sweep_risk, size_factor)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `).run(
+          signalId, label, parsed.direction, session, regime.regime,
+          parseFloat((regime.atrRatio || 1).toFixed(2)),
+          scored.score, parsed.confidence,
+          parseFloat(spreadPips.toFixed(2)),
+          parseFloat((indH4.atr14 / pipSize).toFixed(1)),
+          indH4.adx, indM30.rsi14, w1Trend,
+          structure.structureBias, structure.bos, structure.choch,
+          rsiDiv, compression.compressing ? 1 : 0,
+          liquidity.sweep_risk, sizeFactor
+        );
+      } catch(e) { console.error('[ATTR]', e.message); }
+
+      // ── Build Telegram message — full decision brief ─────────────────
+      const passedStr  = scored.checks.filter(c=>c.pass).map(c=>`  ✅ ${c.name}`).join('\n');
+      const failedStr  = scored.checks.filter(c=>!c.pass).map(c=>`  ❌ ${c.name}`).join('\n');
+      const dirArrow   = parsed.direction==='BUY' ? '▲' : '▼';
+      const ema200dir  = price > indH4.ema200 ? 'ABOVE ✓' : 'BELOW ⚠️';
+      const atrPips    = (indH4.atr14 / pipSize).toFixed(0);
+      const spreadDisp = spreadPips > 0 ? `${spreadPips.toFixed(1)} pips (${(slPips/spreadPips).toFixed(1)}× SL)` : 'N/A';
+      const heatDisp   = `${heat.heat_level} (${heat.open_positions} open, ${heat.total_risk_pct}% risk on book)`;
+      const consecDisp = consecLoss > 0 ? `⚠️ ${consecLoss} consecutive loss(es)` : '✅ None';
+      const regimeDisp = `${regime.regime} (${regime.atrRatio?.toFixed(1)}× ATR) — ${regimePersist.score} persistence`;
+      const emaConvDisp   = emaConv.converging ? `⚠️ ${emaConv.severity}: ${emaConv.note}` : '✅ EMAs separated — trend intact';
+      const learningDisp  = learningDelta !== 0
+        ? `${learningDelta > 0 ? '+' : ''}${learningDelta} from ${Math.abs(learningDelta) > 4 ? 'strong' : 'moderate'} historical pattern`
+        : 'Neutral (insufficient history or no pattern yet)';
+      // Market structure display
+      const bosDisp    = structure.bos   !== 'NONE' ? `BOS ${structure.bos} ✓`   : 'No BOS';
+      const chochDisp  = structure.choch !== 'NONE' ? `CHOCH ${structure.choch} ⚠️` : 'No CHOCH';
+      const nearLiqDisp= (liqZones.nearBuySide || liqZones.nearSellSide)
+        ? `⚠️ NEAR ${liqZones.nearBuySide ? 'BUY-SIDE' : 'SELL-SIDE'} LIQUIDITY`
+        : `Buy-side: ${liqZones.nearestBuySide?.toFixed(dp) || 'N/A'} | Sell-side: ${liqZones.nearestSellSide?.toFixed(dp) || 'N/A'}`;
 
       const tgText =
-`🎯 HIGH-PRECISION SIGNAL #${signalId}
-Score: ${scored.score}/${scored.maxScore} checks | Regime: ${regime.regime}
+`🎯 SIGNAL #${signalId} — ${label} ${parsed.direction} ${dirArrow}
+━━━━━━━━━━━━━━━━━━━━━━━
+SCORE: ${scored.score}/${scored.maxScore} checks | Confidence: ${parsed.confidence}%
 
-Pair:        ${label}
-Direction:   ${parsed.direction} ${dirArrow}
-AI Confidence: ${parsed.confidence}%
+📌 TRADE SETUP
 Entry:       ${price.toFixed(dp)}
-Stop Loss:   ${parsed.stopLoss.toFixed(dp)} (-${slPips.toFixed(1)} pips)
-Take Profit: ${parsed.takeProfit.toFixed(dp)} (+${tpPips.toFixed(1)} pips)
+Stop Loss:   ${parsed.stopLoss.toFixed(dp)}  (${slPips.toFixed(1)} pips)
+Take Profit: ${parsed.takeProfit.toFixed(dp)}  (${tpPips.toFixed(1)} pips)
 R:R Ratio:   1:${rr.toFixed(1)}
-Risk:        ${riskPct}% = $${riskAmt.toFixed(0)}${sizeNote}
-Size:        ${lots} lots${sizeFactor < 1 ? ` ⚠️ scaled ${sizeFactor*100}%` : ''}
+Size:        ${lots} lots  (${units.toLocaleString()} units)${sizeFactor < 1 ? ` ⚠️ scaled ${sizeFactor*100}%` : ''}
+Risk:        ${riskPct}% = $${riskAmt.toFixed(0)} of $${balance.toFixed(0)}${sizeNote}
+
+📊 MARKET CONTEXT
 Session:     ${session}
+Regime:      ${regimeDisp}
+W1 Trend:    ${w1Trend}
+EMA200 (H4): ${ema200dir}  (${indH4.ema200?.toFixed(dp)})
+ATR (H4):    ${atrPips} pips
+Spread:      ${spreadDisp}
+EMA Conv:    ${emaConvDisp}
+Learning:    ${learningDisp}
+${rsiDiv !== 'NONE' ? `RSI Signal:  ${rsiDiv}\n` : ''}${compression.compressing ? `Compress:    ✓ Squeeze (${compression.ratio}x ATR) — breakout loading\n` : ''}Liquidity:   ${liquidity.sweep_risk === 'HIGH' ? `⚠️ HIGH SWEEP RISK — ${liquidity.note}` : liquidity.note}
 
-Checks:
+🏗 MARKET STRUCTURE
+Bias:        ${structure.structureBias}
+${bosDisp}  |  ${chochDisp}
+Swing High:  ${structure.swingHigh?.toFixed(dp) || 'N/A'}
+Swing Low:   ${structure.swingLow?.toFixed(dp) || 'N/A'}
+Stop Pools:  ${nearLiqDisp}
+
+💼 ACCOUNT STATE
+Balance:     $${balance.toFixed(2)}
+Portfolio:   ${heatDisp}
+Consec loss: ${consecDisp}
+
+📈 TIMEFRAME BREAKDOWN
+W1:          ${w1Trend}
+H4 (Master): ${indH4.emaAlignment} | RSI ${indH4.rsi14} | ADX ${indH4.adx} | ${indH4.trend}
+H2 (Confirm):${indH2.trend} | RSI ${indH2.rsi14} | EMA ${indH2.ema9>indH2.ema21?'bullish▲':'bearish▼'}
+M30 (Entry): ${indM30.trend} | RSI ${indM30.rsi14} | MACD ${indM30.macd>0?'▲':'▼'} | ${indM30.pattern}
+M5 (Trigger):${indM5.trend} | RSI ${indM5.rsi14} | ${indM5.pattern}
+
+✅ CHECKS PASSED
 ${passedStr}
-${failedStr ? failedStr : ''}
+${failedStr ? `\n❌ CHECKS FAILED\n${failedStr}` : ''}`;
 
-H4 (Master):  ${indH4.emaAlignment} | RSI ${indH4.rsi14} | ADX ${indH4.adx}
-H2 (Confirm): ${indH2.trend} | RSI ${indH2.rsi14}
-M30 (Entry):  ${indM30.trend} | RSI ${indM30.rsi14} | MACD ${indM30.macd}
-M5 (Trigger): ${indM5.trend} | Pattern: ${indM5.pattern}
-${rsiDiv !== 'NONE' ? `RSI Signal: ${rsiDiv}` : ''}
-${compression.compressing ? `Compression: ✓ Squeeze detected (${compression.ratio}x ATR)` : ''}
-${liquidity.sweep_risk === 'HIGH' ? `⚠️ Liquidity: ${liquidity.note}` : `Liquidity: ${liquidity.note}`}`;
-
-      const r = await tgSendButtons(tgText, [[
-        { text:'✅ APPROVE', callback_data:`approve_${signalId}` },
-        { text:'❌ REJECT',  callback_data:`reject_${signalId}`  },
-      ]]);
-      if (r?.result?.message_id) {
-        db.prepare('UPDATE signals SET tg_message_id=? WHERE id=?').run(r.result.message_id, signalId);
+      // ── AUTO-EXECUTE or send for manual approval ──────────────────────
+      if (settings.auto_execute) {
+        const sigRow = db.prepare('SELECT * FROM signals WHERE id=?').get(signalId);
+        console.log(`[SCAN] ⚡ Auto-executing #${signalId}: ${label} ${parsed.direction} ${parsed.confidence}%`);
+        sendTelegramMsg(`⚡ AUTO-EXECUTING SIGNAL #${signalId}\n${tgText}`).catch(() => {});
+        await executeSignal(sigRow);
+      } else {
+        const r = await tgSendButtons(tgText, [[
+          { text:'✅ APPROVE', callback_data:`approve_${signalId}` },
+          { text:'❌ REJECT',  callback_data:`reject_${signalId}`  },
+        ]]);
+        if (r?.result?.message_id) {
+          db.prepare('UPDATE signals SET tg_message_id=? WHERE id=?').run(r.result.message_id, signalId);
+        }
       }
       console.log(`[SCAN] ✅ Signal #${signalId}: ${label} ${parsed.direction} ${parsed.confidence}% score=${scored.score}/${scored.maxScore}`);
 
@@ -2834,24 +3827,27 @@ setInterval(backupDatabase, 24 * 60 * 60 * 1000);
 
 // ── Signal API endpoints ──────────────────────────────────────────────────────
 app.get('/api/autotrade/settings', (req, res) => {
-  const s = getStorageValue('autotrade_settings') || { enabled:false, threshold:85, risk_pct:1, max_per_day:3, min_score:9 };
+  const s = getStorageValue('autotrade_settings') || { enabled:false, auto_execute:false, threshold:85, risk_pct:1, max_per_day:3, min_score:9 };
   res.json(s);
 });
 
 app.post('/api/autotrade/settings', (req, res) => {
-  const { enabled, threshold, risk_pct, max_per_day, min_score } = req.body;
+  const { enabled, auto_execute, threshold, risk_pct, max_per_day, min_score } = req.body;
+  const prev = getStorageValue('autotrade_settings') || {};
   const s = {
-    enabled:   !!enabled,
-    threshold: parseInt(threshold  || 85),
-    risk_pct:  parseFloat(risk_pct || 1),
-    max_per_day: parseInt(max_per_day || 3),
-    min_score: parseInt(min_score || 9),
+    enabled:      !!enabled,
+    auto_execute: !!auto_execute,
+    threshold:    parseInt(threshold   || 85),
+    risk_pct:     parseFloat(risk_pct  || 1),
+    max_per_day:  parseInt(max_per_day || 3),
+    min_score:    parseInt(min_score   || 9),
   };
   setStorageValue('autotrade_settings', s);
-  writeAudit('SETTINGS_CHANGED', s, 'WEB_UI');
-  const onOff = s.enabled ? 'ON' : 'OFF';
+  writeAudit('SETTINGS_CHANGED', { new: s, prev }, 'WEB_UI');
+  const onOff    = s.enabled ? 'ON' : 'OFF';
+  const execMode = s.auto_execute ? '⚡ AUTO-EXECUTE (trades fire automatically)' : '👤 MANUAL APPROVAL (Telegram buttons)';
   sendTelegramMsg(
-    `Signal Scanner: ${onOff}\nScore filter: ${s.min_score}/12 checks required\nAI threshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax/day: ${s.max_per_day}\n\nOnly the highest-confidence setups will be signalled.`
+    `Signal Scanner: ${onOff}\nMode: ${execMode}\nScore filter: ${s.min_score}/12 checks required\nAI threshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax/day: ${s.max_per_day}`
   );
   res.json({ ok:true, settings:s });
 });
@@ -3175,7 +4171,7 @@ app.post('/api/backtest', async (req, res) => {
       // Slice indicators up to this bar time (walk-forward: no future data)
       const h4End  = h4Times.findIndex(t => t > barMs);
       const h2End  = h2Times.findIndex(t => t > barMs);
-      const h4Slice  = (h4End === -1 ? h4All : h4All.slice(0, h4End)).slice(-100);
+      const h4Slice  = (h4End === -1 ? h4All : h4All.slice(0, h4End)).slice(-250); // 250 needed for real EMA200
       const h2Slice  = (h2End === -1 ? h2All : h2All.slice(0, h2End)).slice(-100);
       const m30Slice = m30All.slice(Math.max(0, i - 100), i + 1);
 
@@ -3596,7 +4592,7 @@ app.get('/api/intelligence', async (req, res) => {
     const nowMin = new Date().getUTCHours() * 60 + new Date().getUTCMinutes();
     const [hh, mm] = (n.time || '99:99').split(':').map(Number);
     const diff = nowMin - (hh * 60 + mm);
-    return diff >= -45 && diff <= 30;
+    return diff >= -45 && diff <= 60; // 45 min before, 60 min after
   }).length;
 
   // Infrastructure
@@ -3738,6 +4734,219 @@ app.get('/api/health', (req, res) => {
       pending:  pending.c,
       closed_reconciled: closed.c,
     },
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POST-TRADE ATTRIBUTION & CONFIDENCE CALIBRATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Full attribution breakdown — after 50+ closed trades this reveals what works
+app.get('/api/analytics/attribution', (req, res) => {
+  const rows = db.prepare(`
+    SELECT * FROM trade_attribution WHERE outcome IS NOT NULL ORDER BY created_at DESC
+  `).all();
+
+  if (rows.length < 5) return res.json({ message: `Need more closed trades (have ${rows.length}, need 5+)`, rows });
+
+  const win  = rows.filter(r => r.outcome === 'WIN');
+  const loss = rows.filter(r => r.outcome === 'LOSS');
+
+  const winRate = r => r.length ? Math.round(win.filter(w => rows.filter(x => x[Object.keys(r[0])[0]] === w[Object.keys(r[0])[0]]).length > 0).length / r.length * 100) : null;
+
+  // Group by dimension helper
+  const groupBy = (field) => {
+    const groups = {};
+    for (const r of rows) {
+      const k = r[field] ?? 'UNKNOWN';
+      if (!groups[k]) groups[k] = { total:0, wins:0, totalPL:0, totalPips:0 };
+      groups[k].total++;
+      if (r.outcome === 'WIN') groups[k].wins++;
+      groups[k].totalPL   += r.realized_pl   || 0;
+      groups[k].totalPips += parseFloat(r.actual_pips || 0);
+    }
+    return Object.entries(groups).map(([k, v]) => ({
+      [field]: k,
+      total:    v.total,
+      win_rate: Math.round(v.wins / v.total * 100),
+      avg_pl:   parseFloat((v.totalPL / v.total).toFixed(2)),
+      avg_pips: parseFloat((v.totalPips / v.total).toFixed(1)),
+      total_pl: parseFloat(v.totalPL.toFixed(2)),
+    })).sort((a, b) => b.total - a.total);
+  };
+
+  res.json({
+    summary: {
+      total:    rows.length,
+      wins:     win.length,
+      losses:   loss.length,
+      win_rate: Math.round(win.length / rows.length * 100),
+      total_pl: parseFloat(rows.reduce((s, r) => s + (r.realized_pl || 0), 0).toFixed(2)),
+    },
+    by_pair:       groupBy('pair'),
+    by_session:    groupBy('session'),
+    by_regime:     groupBy('regime'),
+    by_structure:  groupBy('structure_bias'),
+    by_bos:        groupBy('bos'),
+    by_score:      groupBy('score'),
+    by_w1_trend:   groupBy('w1_trend'),
+    by_exit_reason:groupBy('exit_reason'),
+    by_sweep_risk: groupBy('sweep_risk'),
+    raw: rows.slice(0, 50),
+  });
+});
+
+// Confidence calibration: does 90% confidence actually win 90%?
+app.get('/api/analytics/calibration', (req, res) => {
+  const rows = db.prepare(`
+    SELECT confidence, outcome FROM trade_attribution WHERE outcome IS NOT NULL
+  `).all();
+
+  if (rows.length < 10) return res.json({ message: `Need 10+ closed trades (have ${rows.length})`, rows: [] });
+
+  // Group into confidence bands: <70, 70-79, 80-89, 90-95
+  const bands = { '<70':[70,0], '70-79':[70,80], '80-89':[80,90], '90+':[90,100] };
+  const result = Object.entries(bands).map(([label, [lo, hi]]) => {
+    const inBand = rows.filter(r => r.confidence >= lo && r.confidence < hi);
+    const wins   = inBand.filter(r => r.outcome === 'WIN');
+    const avgConf= inBand.length ? inBand.reduce((s,r) => s + r.confidence, 0) / inBand.length : 0;
+    const actualWinPct = inBand.length ? Math.round(wins.length / inBand.length * 100) : null;
+    return {
+      band:           label,
+      trade_count:    inBand.length,
+      stated_conf_avg:parseFloat(avgConf.toFixed(1)),
+      actual_win_pct: actualWinPct,
+      gap:            actualWinPct !== null ? actualWinPct - Math.round(avgConf) : null,
+      calibrated:     actualWinPct !== null && Math.abs(actualWinPct - avgConf) < 10,
+    };
+  }).filter(b => b.trade_count > 0);
+
+  // Save snapshot to DB for trend tracking
+  try {
+    for (const b of result) {
+      if (b.trade_count >= 5) {
+        db.prepare(`
+          INSERT INTO confidence_calibration
+            (confidence_band, trade_count, win_count, actual_win_pct, stated_conf_avg, calibration_gap)
+          VALUES (?,?,?,?,?,?)
+        `).run(b.band, b.trade_count,
+          rows.filter(r => r.outcome==='WIN' && r.confidence >= parseInt(b.band) || 0).length,
+          b.actual_win_pct, b.stated_conf_avg, b.gap);
+      }
+    }
+  } catch {}
+
+  res.json({
+    message: result.some(b => b.gap !== null && Math.abs(b.gap) > 15)
+      ? '⚠️ Confidence is miscalibrated — stated % does not match actual win rate'
+      : '✅ Confidence is roughly calibrated',
+    calibration: result,
+    total_trades: rows.length,
+  });
+});
+
+// Operator approval analytics — detects if you're lowering your personal threshold
+app.get('/api/analytics/operator', (req, res) => {
+  const approved = db.prepare(`
+    SELECT confidence, realized_pl, outcome FROM trade_attribution
+    WHERE signal_id IN (SELECT id FROM signals WHERE status IN ('EXECUTED','CLOSED'))
+    ORDER BY created_at DESC LIMIT 30
+  `).all();
+  const rejected = db.prepare(`
+    SELECT confidence FROM signals WHERE status='REJECTED'
+    ORDER BY actioned_at DESC LIMIT 30
+  `).all();
+
+  if (approved.length < 3) return res.json({ message: 'Need 3+ approved signals', approved: [], rejected: [] });
+
+  const avgApproved = approved.reduce((s, r) => s + r.confidence, 0) / approved.length;
+  const avgRejected = rejected.length ? rejected.reduce((s, r) => s + r.confidence, 0) / rejected.length : null;
+  const closed      = approved.filter(r => r.outcome);
+  const winRate     = closed.length ? Math.round(closed.filter(r => r.outcome === 'WIN').length / closed.length * 100) : null;
+
+  const warnings = [];
+  if (avgApproved < 82 && approved.length >= 5) {
+    warnings.push(`⚠️ Avg approved confidence ${avgApproved.toFixed(0)}% is below 82% — you may be approving low-quality signals`);
+  }
+  if (avgRejected !== null && avgRejected > avgApproved) {
+    warnings.push(`⚠️ Avg rejected confidence (${avgRejected.toFixed(0)}%) > avg approved (${avgApproved.toFixed(0)}%) — approving weaker signals than rejecting`);
+  }
+
+  res.json({
+    approval_stats: {
+      approved_count:    approved.length,
+      rejected_count:    rejected.length,
+      approval_rate:     Math.round(approved.length / (approved.length + rejected.length) * 100),
+      avg_approved_conf: parseFloat(avgApproved.toFixed(1)),
+      avg_rejected_conf: avgRejected !== null ? parseFloat(avgRejected.toFixed(1)) : null,
+      win_rate_approved: winRate,
+    },
+    warnings,
+    recent_approved: approved.slice(0, 10),
+  });
+});
+
+// Trade distribution health — concentration risk detection
+app.get('/api/analytics/distribution', (req, res) => {
+  const recent = db.prepare(`
+    SELECT pair, session, direction, confidence, outcome
+    FROM trade_attribution ORDER BY created_at DESC LIMIT 50
+  `).all();
+
+  if (recent.length < 5) return res.json({ message: 'Need 5+ signals', data: [] });
+
+  // Pair concentration
+  const pairCounts = {};
+  for (const r of recent) {
+    pairCounts[r.pair] = (pairCounts[r.pair] || 0) + 1;
+  }
+  const topPair    = Object.entries(pairCounts).sort((a,b) => b[1]-a[1])[0];
+  const topPairPct = Math.round(topPair[1] / recent.length * 100);
+
+  // Session concentration
+  const sessCounts = {};
+  for (const r of recent) {
+    sessCounts[r.session] = (sessCounts[r.session] || 0) + 1;
+  }
+  const topSess    = Object.entries(sessCounts).sort((a,b) => b[1]-a[1])[0];
+  const topSessPct = Math.round(topSess[1] / recent.length * 100);
+
+  // Direction bias
+  const buys  = recent.filter(r => r.direction === 'BUY').length;
+  const sells = recent.filter(r => r.direction === 'SELL').length;
+  const dirBiasPct = Math.round(Math.max(buys, sells) / recent.length * 100);
+
+  const alerts = [];
+  if (topPairPct > 60)  alerts.push(`⚠️ ${topPair[0]} = ${topPairPct}% of recent signals — over-concentrated in one pair`);
+  if (topSessPct > 80)  alerts.push(`⚠️ ${topSess[0]} = ${topSessPct}% of signals — all trades from one session`);
+  if (dirBiasPct > 80)  alerts.push(`⚠️ ${dirBiasPct}% ${buys > sells ? 'BUY' : 'SELL'} bias — system heavily one-directional`);
+
+  res.json({
+    sample_size:  recent.length,
+    by_pair:      Object.entries(pairCounts).map(([p,c]) => ({ pair:p, count:c, pct: Math.round(c/recent.length*100) })).sort((a,b)=>b.count-a.count),
+    by_session:   Object.entries(sessCounts).map(([s,c]) => ({ session:s, count:c, pct: Math.round(c/recent.length*100) })).sort((a,b)=>b.count-a.count),
+    direction_bias: { buys, sells, bias_pct: dirBiasPct },
+    alerts,
+  });
+});
+
+// Learning engine full state
+app.get('/api/analytics/learning', (req, res) => {
+  const stats   = db.prepare(`SELECT * FROM condition_stats WHERE trades >= 2 ORDER BY trades DESC`).all();
+  const lessons  = db.prepare(`SELECT * FROM trade_lessons ORDER BY created_at DESC LIMIT 30`).all();
+  const total    = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='CLOSED'`).get().c;
+
+  // Find the strongest patterns (most impactful to act on)
+  const avoid    = stats.filter(s => s.win_rate < 40 && s.trades >= 3).sort((a,b) => a.win_rate - b.win_rate);
+  const reinforce= stats.filter(s => s.win_rate > 65 && s.trades >= 3).sort((a,b) => b.win_rate - a.win_rate);
+
+  res.json({
+    closed_trades: total,
+    data_sufficient: total >= 10,
+    strongest_avoid:    avoid.slice(0, 5),
+    strongest_reinforce: reinforce.slice(0, 5),
+    all_conditions:  stats,
+    recent_lessons:  lessons,
   });
 });
 

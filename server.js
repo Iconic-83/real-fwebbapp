@@ -385,6 +385,84 @@ function detectPattern(candles) {
   return 'BEARISH_CANDLE';
 }
 
+// ── Bollinger Bands ───────────────────────────────────────────────────────────
+function calcBB(closes, period = 20, mult = 2) {
+  if (closes.length < period) return { upper:0, middle:0, lower:0, bw:0, pct:0.5, squeezing:false };
+  const slice = closes.slice(-period);
+  const sma   = slice.reduce((s, v) => s + v, 0) / period;
+  const std   = Math.sqrt(slice.reduce((s, v) => s + (v - sma) ** 2, 0) / period);
+  const upper = sma + mult * std;
+  const lower = sma - mult * std;
+  const bw    = sma > 0 ? (upper - lower) / sma * 100 : 0;
+  const pct   = (upper - lower) > 0 ? (closes[closes.length - 1] - lower) / (upper - lower) : 0.5;
+  // Compare bandwidth to 5-bar-ago bandwidth to detect squeeze
+  const prevBW = closes.length >= period + 5 ? (() => {
+    const ps = closes.slice(-period - 5, -5);
+    const pm = ps.reduce((a, b) => a + b, 0) / period;
+    const pv = Math.sqrt(ps.reduce((s, v) => s + (v - pm) ** 2, 0) / period);
+    return pm > 0 ? (pm + mult * pv - (pm - mult * pv)) / pm * 100 : bw;
+  })() : bw;
+  return {
+    upper:     parseFloat(upper.toFixed(6)),
+    middle:    parseFloat(sma.toFixed(6)),
+    lower:     parseFloat(lower.toFixed(6)),
+    bw:        parseFloat(bw.toFixed(4)),
+    pct:       parseFloat(pct.toFixed(3)),   // 0 = at lower band, 1 = at upper band
+    squeezing: bw < prevBW * 0.75,           // bandwidth contracting = squeeze building
+    std,
+  };
+}
+
+// ── Weighted Moving Average (WMA) ─────────────────────────────────────────────
+function calcWMA(values, period) {
+  const slice = values.slice(-period);
+  if (!slice.length) return 0;
+  let num = 0, den = 0;
+  for (let i = 0; i < slice.length; i++) { const w = i + 1; num += slice[i] * w; den += w; }
+  return den > 0 ? num / den : 0;
+}
+
+// ── Hull Moving Average (HMA) — faster, smoother EMA ─────────────────────────
+// Formula: WMA(sqrt(n)) of [ 2·WMA(n/2) − WMA(n) ]
+function calcHMA(closes, period = 21) {
+  if (closes.length < period) return closes[closes.length - 1] || 0;
+  const half  = Math.floor(period / 2);
+  const sqrtp = Math.round(Math.sqrt(period));
+  const rawLen = sqrtp + period;
+  const src    = closes.slice(-rawLen);
+  const diff   = [];
+  for (let i = period - 1; i < src.length; i++) {
+    const sl = src.slice(0, i + 1);
+    diff.push(2 * calcWMA(sl, half) - calcWMA(sl, period));
+  }
+  return parseFloat(calcWMA(diff, sqrtp).toFixed(6));
+}
+
+// ── VWAP — tick-volume weighted average price ─────────────────────────────────
+// OANDA provides tick volume per candle; used to approximate institutional VWAP.
+function calcVWAP(candles) {
+  if (!candles.length) return 0;
+  let tpv = 0, vol = 0;
+  for (const c of candles) {
+    const tp = (parseFloat(c.mid.h) + parseFloat(c.mid.l) + parseFloat(c.mid.c)) / 3;
+    const v  = c.volume || 1;
+    tpv += tp * v; vol += v;
+  }
+  return vol > 0 ? parseFloat((tpv / vol).toFixed(6)) : 0;
+}
+
+// ── Classic Pivot Points (previous 6 H4 bars ≈ 24 h) ─────────────────────────
+function calcPivotPoints(h4Candles) {
+  if (h4Candles.length < 7) return null;
+  const prev  = h4Candles.slice(-7, -1);
+  const high  = Math.max(...prev.map(c => parseFloat(c.mid.h)));
+  const low   = Math.min(...prev.map(c => parseFloat(c.mid.l)));
+  const close = parseFloat(prev[prev.length - 1].mid.c);
+  const pp    = (high + low + close) / 3;
+  return { pp, r1: 2*pp - low, r2: pp + (high-low), r3: high + 2*(pp-low),
+                s1: 2*pp - high, s2: pp - (high-low), s3: low - 2*(high-pp) };
+}
+
 // Build full indicator set for any timeframe
 function buildIndicators(candles, refCandles = []) {
   if (!candles?.length) return null;
@@ -440,6 +518,11 @@ function buildIndicators(candles, refCandles = []) {
 
   const pattern = detectPattern(candles);
 
+  // Advanced indicators
+  const bb      = calcBB(closes, 20);
+  const hma     = calcHMA(closes, 21);
+  const vwap    = calcVWAP(candles);
+
   // FIX 6 — EMA slope: how steeply EMA21 is moving (flat = fake trend)
   const ema21Prev = closes.length >= 26
     ? calcEMA(closes.slice(0, -5), 21) : ema21;
@@ -456,6 +539,7 @@ function buildIndicators(candles, refCandles = []) {
     resistance, support, strongResist, strongSupport,
     trend, emaAlignment, refTrend, last5, pattern, momentum,
     emaSlope, macdSlope,
+    bb, hma, vwap,
     // Derived
     h4Trend: refTrend + ' (ref EMA21)',
     emaAlignmentFull: emaAlignment === 'BULLISH' ? 'BULLISH ALIGNMENT (EMA9>EMA21>EMA50)' :
@@ -844,6 +928,107 @@ function scoreMarketStructure(structure, direction, liquidity) {
   if (!isBuy && liquidity.nearSellSide) delta -= 6;
 
   return delta;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ICT SMART MONEY CONCEPTS
+// Fair Value Gaps, Order Blocks, Turtle Soup, AMD Power of 3
+// ═══════════════════════════════════════════════════════════════════
+
+// ── FAIR VALUE GAP (FVG) ─────────────────────────────────────────────────────
+// 3-candle imbalance: gap between candle[i-2] extremity and candle[i] extremity.
+// Bullish FVG: candle[i].low  > candle[i-2].high  (unfilled gap above price action)
+// Bearish FVG: candle[i].high < candle[i-2].low   (unfilled gap below price action)
+function detectFVG(candles, direction) {
+  if (candles.length < 3) return { found:false, zones:[], nearest:null, testing:false, count:0 };
+  const slice = candles.slice(-40);
+  const price = parseFloat(candles[candles.length - 1].mid.c);
+  const zones = [];
+
+  for (let i = 2; i < slice.length; i++) {
+    const h0 = parseFloat(slice[i-2].mid.h), l0 = parseFloat(slice[i-2].mid.l);
+    const h2 = parseFloat(slice[i].mid.h),   l2 = parseFloat(slice[i].mid.l);
+    if (direction === 'BUY'  && l2 > h0) zones.push({ type:'BULL_FVG', top:l2, bottom:h0, size:l2-h0 });
+    if (direction === 'SELL' && h2 < l0) zones.push({ type:'BEAR_FVG', top:l0, bottom:h2, size:l0-h2 });
+  }
+
+  // Is price currently inside a FVG (testing imbalance)?
+  const testing = zones.some(z => price >= z.bottom * 0.9998 && price <= z.top * 1.0002);
+  const nearest = zones[zones.length - 1] || null;
+  return { found:zones.length > 0, zones:zones.slice(-5), nearest, testing, count:zones.length };
+}
+
+// ── ORDER BLOCKS ─────────────────────────────────────────────────────────────
+// Last opposing candle before a significant impulsive move.
+// Bullish OB: last bearish candle before ≥2 bullish candles that break above its high
+// Bearish OB: last bullish candle before ≥2 bearish candles that break below its low
+function detectOrderBlocks(candles, direction, lookback = 60) {
+  if (candles.length < 6) return { found:false, blocks:[], testing:false, nearest:null };
+  const slice = candles.slice(-Math.min(lookback, candles.length));
+  const price = parseFloat(candles[candles.length - 1].mid.c);
+  const blocks = [];
+
+  for (let i = 1; i < slice.length - 3; i++) {
+    const c  = slice[i];
+    const co = parseFloat(c.mid.o), cc = parseFloat(c.mid.c);
+    const ch = parseFloat(c.mid.h), cl = parseFloat(c.mid.l);
+    const after = slice.slice(i + 1, i + 4);
+
+    if (direction === 'BUY' && cc < co) {
+      const bullCount  = after.filter(ac => parseFloat(ac.mid.c) > parseFloat(ac.mid.o)).length;
+      const breakHigh  = after.some(ac => parseFloat(ac.mid.h) > ch);
+      if (bullCount >= 2 && breakHigh) blocks.push({ type:'BULL_OB', top:ch, bottom:cl, mid:(ch+cl)/2 });
+    }
+    if (direction === 'SELL' && cc > co) {
+      const bearCount  = after.filter(ac => parseFloat(ac.mid.c) < parseFloat(ac.mid.o)).length;
+      const breakLow   = after.some(ac => parseFloat(ac.mid.l) < cl);
+      if (bearCount >= 2 && breakLow) blocks.push({ type:'BEAR_OB', top:ch, bottom:cl, mid:(ch+cl)/2 });
+    }
+  }
+
+  // Price testing the order block zone?
+  const testing = blocks.some(b => price >= b.bottom * 0.9998 && price <= b.top * 1.0002);
+  const nearest = blocks[blocks.length - 1] || null;
+  return { found:blocks.length > 0, blocks:blocks.slice(-3), testing, nearest };
+}
+
+// ── ICT TURTLE SOUP — stop hunt reversal ──────────────────────────────────────
+// Price sweeps a previous N-bar extreme then immediately recovers — classic stop hunt.
+// Bullish: sweeps below 20-bar low → closes back above → BUY confluence
+// Bearish: sweeps above 20-bar high → closes back below → SELL confluence
+function detectTurtleSoup(candles, direction, lookback = 20) {
+  if (candles.length < lookback + 3) return { found:false, signal:null };
+  const hist  = candles.slice(-(lookback + 3));
+  const prior = hist.slice(0, lookback);
+  const last3 = hist.slice(-3);
+  const dp    = 5;
+
+  if (direction === 'BUY') {
+    const prevLow = Math.min(...prior.map(c => parseFloat(c.mid.l)));
+    if (parseFloat(last3[0].mid.l) < prevLow && parseFloat(last3[last3.length-1].mid.c) > prevLow)
+      return { found:true, signal:'BULL_TURTLE_SOUP', level:prevLow,
+        note:`Stop sweep below ${lookback}-bar low ${prevLow.toFixed(dp)} — reversal confirmed` };
+  } else {
+    const prevHigh = Math.max(...prior.map(c => parseFloat(c.mid.h)));
+    if (parseFloat(last3[0].mid.h) > prevHigh && parseFloat(last3[last3.length-1].mid.c) < prevHigh)
+      return { found:true, signal:'BEAR_TURTLE_SOUP', level:prevHigh,
+        note:`Stop sweep above ${lookback}-bar high ${prevHigh.toFixed(dp)} — reversal confirmed` };
+  }
+  return { found:false, signal:null };
+}
+
+// ── AMD / POWER OF 3 — session cycle phase ───────────────────────────────────
+// Accumulation (Asia 00-07): price builds range, institutions load positions
+// Manipulation (Early London 07-09 / NY open 12-14): false break, stops swept
+// Distribution (London body 09-12 / NY body 14-17): real directional move
+function detectAMDPhase() {
+  const h = new Date().getUTCHours();
+  if (h >= 0  && h < 7)  return { phase:'ACCUMULATION',    tradeable:false, note:'Asian range building — wait for sweep' };
+  if (h >= 7  && h < 9)  return { phase:'MANIPULATION',    tradeable:false, note:'Early London — watch for false break / stop sweep' };
+  if (h >= 9  && h < 12) return { phase:'DISTRIBUTION',    tradeable:true,  note:'London distribution — directional move underway' };
+  if (h >= 12 && h < 14) return { phase:'MANIPULATION_NY', tradeable:false, note:'NY open re-sweep — wait for direction to confirm' };
+  if (h >= 14 && h < 17) return { phase:'DISTRIBUTION_NY', tradeable:true,  note:'NY distribution — carry London direction or reversal' };
+  return                  { phase:'DEAD_ZONE',             tradeable:false, note:'Off-hours — no institutional activity expected' };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1278,7 +1463,7 @@ function getLearningDelta(attrs) {
 // 12-CHECK PRECISION SCORING ENGINE — top-down: H4 → H2 → M30 → M5
 // Each check = 1 point. Signal only fires if score >= minScore
 // ═══════════════════════════════════════════════════════════════════
-function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [] }) {
+function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [], fvg = null, ob = null, turtle = null }) {
   const isBuy = direction === 'BUY';
   const checks = [];
 
@@ -1344,6 +1529,23 @@ function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [] }) {
     isBuy ? bullishPatterns.includes(m5.pattern) :
              bearishPatterns.includes(m5.pattern), 1);
 
+  // ── CHECK 13: Bollinger Band setup — price at correct band or in squeeze ──
+  const bb = h4.bb;
+  pass('BB Setup',
+    bb && (isBuy ? bb.pct < 0.35 || bb.squeezing : bb.pct > 0.65 || bb.squeezing), 1);
+
+  // ── CHECK 14: HMA direction agrees ────────────────────────────────────────
+  pass('HMA Direction',
+    h4.hma ? (isBuy ? price > h4.hma : price < h4.hma) : false, 1);
+
+  // ── CHECK 15: VWAP alignment — price on correct side of institutional average ─
+  pass('VWAP Alignment',
+    h4.vwap ? (isBuy ? price > h4.vwap : price < h4.vwap) : false, 1);
+
+  // ── CHECK 16: Fair Value Gap or Order Block present in trade direction ─────
+  pass('FVG / Order Block',
+    (fvg?.found || ob?.found || turtle?.found), 1);
+
   const totalWeight  = checks.reduce((s,c) => s + c.weight, 0);
   const passedWeight = checks.reduce((s,c) => s + (c.pass ? c.weight : 0), 0);
   const score        = checks.filter(c => c.pass).length;
@@ -1357,7 +1559,7 @@ function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [] }) {
 // PURE CALCULATION ENGINE — replaces AI API
 // Institutional-grade rule-based analysis: S/R, confidence, SL/TP
 // ═══════════════════════════════════════════════════════════════════
-function calcTradeSetup({ direction, price, h4, h2, m30, m5, scored, session }) {
+function calcTradeSetup({ direction, price, h4, h2, m30, m5, scored, session, fvg = null, ob = null, turtle = null, amd = null }) {
   const isBuy = direction === 'BUY';
   const dp    = price > 100 ? 2 : 5;
   const atr   = h4.atr14 || m30.atr14 || 0.001;
@@ -1412,6 +1614,32 @@ function calcTradeSetup({ direction, price, h4, h2, m30, m5, scored, session }) 
   // +3  H2 EMA9 agrees with direction
   if ( isBuy && h2.ema9 > h2.ema21) conf += 3;
   if (!isBuy && h2.ema9 < h2.ema21) conf += 3;
+
+  // ── ICT Smart Money Concept bonuses ───────────────────────────────
+  // +5  Fair Value Gap imbalance exists in trade direction (price drawn to it)
+  if (fvg?.found) conf += 5;
+  // +8  FVG is being actively tested right now (price inside the gap)
+  if (fvg?.testing) conf += 8;
+  // +6  Price is retesting a key Order Block
+  if (ob?.testing) conf += 6;
+  // +5  Order Block confirmed in direction (even if not testing yet)
+  else if (ob?.found) conf += 5;
+  // +9  ICT Turtle Soup — institutional stop hunt confirmed (high-probability)
+  if (turtle?.found) conf += 9;
+  // -8  AMD Manipulation phase — false breakout risk, avoid entry
+  if (amd?.phase === 'MANIPULATION' || amd?.phase === 'MANIPULATION_NY') conf -= 8;
+  // +4  BB squeeze — volatility about to expand, momentum trade loading
+  if (h4.bb?.squeezing) conf += 4;
+  // +4  Price on correct side of VWAP (institutional average price)
+  if (h4.vwap) {
+    if ( isBuy && price > h4.vwap) conf += 4;
+    if (!isBuy && price < h4.vwap) conf += 4;
+  }
+  // +3  HMA direction confirms — fast trend filter
+  if (h4.hma) {
+    if ( isBuy && price > h4.hma) conf += 3;
+    if (!isBuy && price < h4.hma) conf += 3;
+  }
 
   // Cap: never claim 100% (markets always have uncertainty)
   conf = Math.min(95, Math.max(10, Math.round(conf)));
@@ -3398,6 +3626,13 @@ async function runAutoScan() {
       const liqZones      = detectLiquidityZones(h4cc, indH4.atr14);
       const structureDelta= scoreMarketStructure(structure, aiDirection, liqZones);
 
+      // ── ICT SMART MONEY CONCEPTS ──────────────────────────────────────
+      const fvg    = detectFVG(h4cc, aiDirection);
+      const ob     = detectOrderBlocks(h4cc, aiDirection);
+      const turtle = detectTurtleSoup(h4cc, aiDirection);
+      const amd    = detectAMDPhase();
+      const pivots = calcPivotPoints(h4cc);
+
       console.log(`[SCAN] ${label}: Structure ${structure.structureBias} | BOS ${structure.bos} | CHOCH ${structure.choch} | delta ${structureDelta > 0 ? '+' : ''}${structureDelta}`);
 
       // CHOCH against trade direction is a hard block — structure is flipping
@@ -3419,11 +3654,11 @@ async function runAutoScan() {
         console.log(`[SCAN] ${label}: RSI divergence: ${rsiDiv}`);
       }
 
-      // ── Run 12-check scoring engine ───────────────────────────────────
+      // ── Run 16-check scoring engine ───────────────────────────────────
       const scored = scoreSignal({
         direction: aiDirection, price,
         h4: indH4, h2: indH2, m30: indM30, m5: indM5,
-        newsEvents: currentNews,
+        newsEvents: currentNews, fvg, ob, turtle,
       });
       console.log(`[SCAN] ${label}: ${aiDirection} score ${scored.score}/${scored.maxScore} (${scored.pct}%) — need ${minScore}`);
 
@@ -3439,7 +3674,7 @@ async function runAutoScan() {
       const setup = calcTradeSetup({
         direction: aiDirection, price,
         h4: indH4, h2: indH2, m30: indM30, m5: indM5,
-        scored, session,
+        scored, session, fvg, ob, turtle, amd,
       });
       console.log(`[SCAN] ${label}: Calc Engine → ${aiDirection} ${setup.confidence}%`);
 
@@ -3503,6 +3738,10 @@ H2 (CONFIRM): EMA9=${indH2.ema9.toFixed(dp)} EMA21=${indH2.ema21.toFixed(dp)} RS
 M30 (ENTRY):  EMA9=${indM30.ema9.toFixed(dp)} EMA21=${indM30.ema21.toFixed(dp)} RSI=${indM30.rsi14} MACD=${indM30.macd} Pattern=${indM30.pattern}
 M5 (TRIGGER): RSI=${indM5.rsi14} Pattern=${indM5.pattern}
 H4 Strong Support: ${indH4.strongSupport.toFixed(dp)} | H4 Strong Resistance: ${indH4.strongResist.toFixed(dp)}
+BB: BW=${indH4.bb?.bw.toFixed(2)}% %B=${((indH4.bb?.pct||0.5)*100).toFixed(0)}%${indH4.bb?.squeezing?' SQUEEZE':''} | VWAP: ${indH4.vwap?.toFixed(dp)} | HMA21: ${indH4.hma?.toFixed(dp)}
+FVG: ${fvg.found?`${fvg.count} gaps${fvg.testing?' (TESTING)':''}`:' none'} | OrderBlock: ${ob.found?`${ob.blocks.length} blocks${ob.testing?' (IN ZONE)':''}`:' none'} | TurtleSoup: ${turtle.found?turtle.signal:'none'}
+AMD Phase: ${amd.phase} (tradeable: ${amd.tradeable})
+Pivots: ${pivots?`PP=${pivots.pp.toFixed(dp)} R1=${pivots.r1.toFixed(dp)} S1=${pivots.s1.toFixed(dp)}`:'N/A'}
 Calc Engine SL: ${setup.stopLoss.toFixed(dp)} | Calc Engine TP: ${setup.takeProfit.toFixed(dp)}
 Checks PASSED: ${scored.checks.filter(c=>c.pass).map(c=>c.name).join(', ')}
 Checks FAILED: ${scored.checks.filter(c=>!c.pass).map(c=>c.name).join(', ')||'NONE'}`;
@@ -3695,6 +3934,16 @@ Return EXACTLY 6 lines, no other text:
         ? `⚠️ NEAR ${liqZones.nearBuySide ? 'BUY-SIDE' : 'SELL-SIDE'} LIQUIDITY`
         : `Buy-side: ${liqZones.nearestBuySide?.toFixed(dp) || 'N/A'} | Sell-side: ${liqZones.nearestSellSide?.toFixed(dp) || 'N/A'}`;
 
+      // ICT display strings
+      const fvgDisp    = fvg.found    ? `✅ ${fvg.count} gap(s)${fvg.testing ? ' — TESTING NOW' : ''}` : '—';
+      const obDisp     = ob.found     ? `✅ ${ob.blocks.length} block(s)${ob.testing ? ' — PRICE IN ZONE' : ''}` : '—';
+      const turtleDisp = turtle.found ? `⚡ ${turtle.signal} — ${turtle.note}` : '—';
+      const amdDisp    = `${amd.phase}${amd.tradeable ? ' ✓' : ' ⚠️'} — ${amd.note}`;
+      const pivotsDisp = pivots ? `PP=${pivots.pp.toFixed(dp)} | R1=${pivots.r1.toFixed(dp)} | S1=${pivots.s1.toFixed(dp)}` : '—';
+      const bbDisp     = indH4.bb ? `BW=${indH4.bb.bw.toFixed(2)}% %B=${(indH4.bb.pct*100).toFixed(0)}%${indH4.bb.squeezing?' SQUEEZE':''}` : '—';
+      const vwapDisp   = indH4.vwap ? `${indH4.vwap.toFixed(dp)} (price ${price > indH4.vwap ? 'ABOVE ✓' : 'BELOW ⚠️'})` : '—';
+      const hmaDisp    = indH4.hma  ? `${indH4.hma.toFixed(dp)} (price ${price > indH4.hma ? 'ABOVE ✓' : 'BELOW ⚠️'})` : '—';
+
       const tgText =
 `🎯 SIGNAL #${signalId} — ${label} ${parsed.direction} ${dirArrow}
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -3725,6 +3974,16 @@ ${bosDisp}  |  ${chochDisp}
 Swing High:  ${structure.swingHigh?.toFixed(dp) || 'N/A'}
 Swing Low:   ${structure.swingLow?.toFixed(dp) || 'N/A'}
 Stop Pools:  ${nearLiqDisp}
+
+🧠 ICT SMART MONEY
+AMD Phase:   ${amdDisp}
+FVG:         ${fvgDisp}
+Order Block: ${obDisp}
+Turtle Soup: ${turtleDisp}
+Pivots:      ${pivotsDisp}
+BB:          ${bbDisp}
+VWAP:        ${vwapDisp}
+HMA(21):     ${hmaDisp}
 
 💼 ACCOUNT STATE
 Balance:     $${balance.toFixed(2)}
@@ -4883,6 +5142,111 @@ app.get('/api/analytics/distribution', (req, res) => {
     by_session:   Object.entries(sessCounts).map(([s,c]) => ({ session:s, count:c, pct: Math.round(c/recent.length*100) })).sort((a,b)=>b.count-a.count),
     direction_bias: { buys, sells, bias_pct: dirBiasPct },
     alerts,
+  });
+});
+
+// ── Advanced professional metrics — Sharpe, Sortino, Calmar, Recovery Factor ──
+app.get('/api/analytics/advanced', (req, res) => {
+  const closed = db.prepare(`
+    SELECT realized_pl, confidence, exit_reason, duration_mins, actual_pips
+    FROM signals WHERE status='CLOSED' ORDER BY closed_at ASC
+  `).all();
+
+  if (closed.length < 5) return res.json({ message:`Need 5+ closed trades (have ${closed.length})`, trades:closed.length });
+
+  const pls    = closed.map(t => t.realized_pl || 0);
+  const wins   = pls.filter(p => p > 0);
+  const losses = pls.filter(p => p < 0);
+
+  // Core metrics
+  const totalPL   = pls.reduce((s, p) => s + p, 0);
+  const winRate   = pls.length ? wins.length / pls.length : 0;
+  const avgWin    = wins.length   ? wins.reduce((s,p)  => s+p, 0) / wins.length   : 0;
+  const avgLoss   = losses.length ? losses.reduce((s,p) => s+p, 0) / losses.length : 0;
+  const grossWin  = wins.reduce((s,p) => s+p, 0);
+  const grossLoss = Math.abs(losses.reduce((s,p) => s+p, 0));
+  const profitFactor = grossLoss > 0 ? parseFloat((grossWin / grossLoss).toFixed(3)) : null;
+  const expectancy   = parseFloat(((winRate * avgWin) + ((1 - winRate) * avgLoss)).toFixed(2));
+
+  // Sharpe Ratio = avgReturn / stdDev (risk-free rate = 0 for forex)
+  const avgReturn = totalPL / pls.length;
+  const variance  = pls.reduce((s, p) => s + (p - avgReturn) ** 2, 0) / pls.length;
+  const stdDev    = Math.sqrt(variance);
+  const sharpe    = stdDev > 0 ? parseFloat((avgReturn / stdDev).toFixed(3)) : 0;
+
+  // Sortino Ratio = avgReturn / downside deviation
+  const downsidePLs  = pls.filter(p => p < 0);
+  const downsideVar  = downsidePLs.length ? downsidePLs.reduce((s, p) => s + p ** 2, 0) / downsidePLs.length : 0;
+  const downsideStd  = Math.sqrt(downsideVar);
+  const sortino      = downsideStd > 0 ? parseFloat((avgReturn / downsideStd).toFixed(3)) : 0;
+
+  // Max Drawdown ($) and % from peak equity
+  let peak = 0, maxDD = 0, maxDDPct = 0, cum = 0;
+  const equityCurve = [];
+  for (const p of pls) {
+    cum += p;
+    equityCurve.push(parseFloat(cum.toFixed(2)));
+    if (cum > peak) peak = cum;
+    const dd = peak - cum;
+    if (dd > maxDD) { maxDD = dd; maxDDPct = peak > 0 ? dd / peak * 100 : 0; }
+  }
+
+  // Calmar Ratio = total_profit / max_drawdown (proxy for annualized / MDD)
+  const calmar         = maxDD > 0 ? parseFloat((totalPL / maxDD).toFixed(3)) : null;
+  // Recovery Factor = total_net_profit / max_drawdown
+  const recoveryFactor = maxDD > 0 ? parseFloat((totalPL / maxDD).toFixed(2)) : null;
+
+  // Average trade duration and pips
+  const validDur  = closed.filter(t => t.duration_mins);
+  const avgDurMin = validDur.length ? Math.round(validDur.reduce((s,t) => s + t.duration_mins, 0) / validDur.length) : null;
+  const validPips = closed.filter(t => t.actual_pips != null);
+  const avgPips   = validPips.length ? parseFloat((validPips.reduce((s,t) => s + parseFloat(t.actual_pips||0), 0) / validPips.length).toFixed(1)) : null;
+
+  // Consecutive wins/losses (current streak)
+  let streak = 0;
+  for (let i = pls.length - 1; i >= 0; i--) {
+    if (streak === 0) { streak = pls[i] > 0 ? 1 : pls[i] < 0 ? -1 : 0; continue; }
+    if (streak > 0 && pls[i] > 0) streak++;
+    else if (streak < 0 && pls[i] < 0) streak--;
+    else break;
+  }
+
+  // Grade the system (simple scoring)
+  const grade =
+    (sharpe >= 1.5 && sortino >= 2 && profitFactor >= 2 && winRate >= 0.55) ? 'A — Institutional quality' :
+    (sharpe >= 1.0 && sortino >= 1.5 && profitFactor >= 1.5 && winRate >= 0.50) ? 'B — Professional' :
+    (profitFactor >= 1.2 && winRate >= 0.45) ? 'C — Developing edge' : 'D — Needs improvement';
+
+  res.json({
+    trades: pls.length,
+    grade,
+    performance: {
+      total_pl:       parseFloat(totalPL.toFixed(2)),
+      win_rate_pct:   Math.round(winRate * 100),
+      profit_factor:  profitFactor,
+      expectancy_per_trade: expectancy,
+      avg_win:        parseFloat(avgWin.toFixed(2)),
+      avg_loss:       parseFloat(avgLoss.toFixed(2)),
+      avg_duration_mins: avgDurMin,
+      avg_pips:       avgPips,
+      current_streak: streak,
+    },
+    risk_metrics: {
+      max_drawdown:     parseFloat(maxDD.toFixed(2)),
+      max_dd_pct:       parseFloat(maxDDPct.toFixed(1)),
+      recovery_factor:  recoveryFactor,
+    },
+    ai_metrics: {
+      sharpe_ratio:   sharpe,
+      sortino_ratio:  sortino,
+      calmar_ratio:   calmar,
+      interpretation: {
+        sharpe:  sharpe >= 1.5 ? 'Excellent (>1.5)' : sharpe >= 1.0 ? 'Good (1.0-1.5)' : sharpe >= 0.5 ? 'Acceptable (0.5-1.0)' : 'Weak (<0.5)',
+        sortino: sortino >= 2.0 ? 'Excellent (>2.0)' : sortino >= 1.0 ? 'Good (1.0-2.0)' : 'Weak (<1.0)',
+        calmar:  calmar == null ? 'N/A' : calmar >= 3.0 ? 'Excellent (>3)' : calmar >= 1.0 ? 'Good (1-3)' : 'Weak (<1)',
+      },
+    },
+    equity_curve: equityCurve,
   });
 });
 

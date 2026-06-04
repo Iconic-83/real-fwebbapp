@@ -487,6 +487,51 @@ function calcVWAP(candles) {
   return vol > 0 ? parseFloat((tpv / vol).toFixed(6)) : 0;
 }
 
+// ── Fibonacci Retracement Levels ─────────────────────────────────────────────
+// Drawn from the most recent significant swing high/low in last `lookback` candles.
+// Key zones: 0.382, 0.500, 0.618 (golden), 0.786 (deep). Extensions: 1.272, 1.618.
+function calcFibLevels(candles, lookback = 60) {
+  if (candles.length < 10) return null;
+  const slice    = candles.slice(-Math.min(lookback, candles.length));
+  const highs    = slice.map(c => parseFloat(c.mid.h));
+  const lows     = slice.map(c => parseFloat(c.mid.l));
+  const swingHigh = Math.max(...highs);
+  const swingLow  = Math.min(...lows);
+  const range     = swingHigh - swingLow;
+  if (range <= 0) return null;
+  return {
+    high:  swingHigh,
+    low:   swingLow,
+    range,
+    // Retracement levels (drawn from high downward for BUY setups)
+    f236:  parseFloat((swingHigh - range * 0.236).toFixed(6)),
+    f382:  parseFloat((swingHigh - range * 0.382).toFixed(6)),
+    f500:  parseFloat((swingHigh - range * 0.500).toFixed(6)),
+    f618:  parseFloat((swingHigh - range * 0.618).toFixed(6)),
+    f786:  parseFloat((swingHigh - range * 0.786).toFixed(6)),
+    // Extension levels (drawn from low upward — TP targets)
+    e127:  parseFloat((swingHigh + range * 0.272).toFixed(6)),
+    e162:  parseFloat((swingHigh + range * 0.618).toFixed(6)),
+  };
+}
+
+// Returns the nearest fib level to price and how close (in ATR units)
+function nearestFibLevel(fib, price, atr) {
+  if (!fib || !atr) return { level: null, distance: Infinity, key: null };
+  const levels = [
+    { key:'0.236', val: fib.f236 },
+    { key:'0.382', val: fib.f382 },
+    { key:'0.500', val: fib.f500 },
+    { key:'0.618', val: fib.f618 },
+    { key:'0.786', val: fib.f786 },
+  ];
+  let nearest = levels[0];
+  for (const l of levels) {
+    if (Math.abs(l.val - price) < Math.abs(nearest.val - price)) nearest = l;
+  }
+  return { level: nearest.val, key: nearest.key, distance: Math.abs(nearest.val - price) / atr };
+}
+
 // ── Classic Pivot Points (previous 6 H4 bars ≈ 24 h) ─────────────────────────
 function calcPivotPoints(h4Candles) {
   if (h4Candles.length < 7) return null;
@@ -558,6 +603,7 @@ function buildIndicators(candles, refCandles = []) {
   const bb      = calcBB(closes, 20);
   const hma     = calcHMA(closes, 21);
   const vwap    = calcVWAP(candles);
+  const fib     = calcFibLevels(candles, 60);
 
   // FIX 6 — EMA slope: how steeply EMA21 is moving (flat = fake trend)
   const ema21Prev = closes.length >= 26
@@ -575,7 +621,7 @@ function buildIndicators(candles, refCandles = []) {
     resistance, support, strongResist, strongSupport,
     trend, emaAlignment, refTrend, last5, pattern, momentum,
     emaSlope, macdSlope,
-    bb, hma, vwap,
+    bb, hma, vwap, fib,
     // Derived
     h4Trend: refTrend + ' (ref EMA21)',
     emaAlignmentFull: emaAlignment === 'BULLISH' ? 'BULLISH ALIGNMENT (EMA9>EMA21>EMA50)' :
@@ -1558,7 +1604,7 @@ function getLearningDelta(attrs) {
 // 12-CHECK PRECISION SCORING ENGINE — top-down: H4 → H2 → M30 → M5
 // Each check = 1 point. Signal only fires if score >= minScore
 // ═══════════════════════════════════════════════════════════════════
-function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [], fvg = null, ob = null, turtle = null }) {
+function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [], fvg = null, ob = null, turtle = null, pair = '' }) {
   const isBuy = direction === 'BUY';
   const checks = [];
 
@@ -1605,15 +1651,24 @@ function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [], fvg =
   const h4Dist = Math.abs(price - h4.ema21) / price * 100;
   pass('Not Overextended H4', h4Dist < 0.8, 1); // within 0.8% of H4 EMA21
 
-  // ── CHECK 11: NO high-impact news in next 45 minutes ─────────────
+  // ── CHECK 11: No HIGH-impact news affecting THIS pair's currencies ──────────
+  // Extract the two currencies from the pair label (e.g. "EUR/USD" → ['EUR','USD'])
+  const pairCurrencies = pair
+    ? pair.replace('_','/').split('/').map(c => c.toUpperCase())
+    : [];
   const nowUTC  = new Date();
   const hasNews = newsEvents.some(e => {
     if (e.impact !== 'HIGH') return false;
+    // If we know the pair, only block when news affects that pair's currencies
+    if (pairCurrencies.length === 2) {
+      const newsCur = (e.currency || '').toUpperCase();
+      if (newsCur && !pairCurrencies.includes(newsCur)) return false; // different currency — ignore
+    }
     const [hh, mm] = (e.time || '99:99').split(':').map(Number);
     const eventMin = hh * 60 + mm;
     const nowMin   = nowUTC.getUTCHours() * 60 + nowUTC.getUTCMinutes();
-    const diff     = nowMin - eventMin; // positive = event already passed
-    return diff >= -45 && diff <= 60;   // 45 min before, 60 min after (post-news volatility window)
+    const diff     = nowMin - eventMin;
+    return diff >= -45 && diff <= 60;  // 45 min before, 60 min after
   });
   pass('No News Blackout', !hasNews, 2);
 
@@ -1641,6 +1696,12 @@ function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [], fvg =
   pass('FVG / Order Block',
     (fvg?.found || ob?.found || turtle?.found), 1);
 
+  // ── CHECK 17: Price near a key Fibonacci level (0.382–0.786) ─────────────
+  const fibNear = h4.fib ? nearestFibLevel(h4.fib, price, h4.atr14) : null;
+  pass('Fibonacci Confluence',
+    fibNear != null && fibNear.distance <= 1.2 &&
+    ['0.382','0.500','0.618','0.786'].includes(fibNear.key), 1);
+
   const totalWeight  = checks.reduce((s,c) => s + c.weight, 0);
   const passedWeight = checks.reduce((s,c) => s + (c.pass ? c.weight : 0), 0);
   const score        = checks.filter(c => c.pass).length;
@@ -1654,7 +1715,7 @@ function scoreSignal({ direction, price, h4, h2, m30, m5, newsEvents = [], fvg =
 // PURE CALCULATION ENGINE — replaces AI API
 // Institutional-grade rule-based analysis: S/R, confidence, SL/TP
 // ═══════════════════════════════════════════════════════════════════
-function calcTradeSetup({ direction, price, h4, h2, m30, m5, scored, session, fvg = null, ob = null, turtle = null, amd = null }) {
+function calcTradeSetup({ direction, price, h4, h2, m30, m5, scored, session, fvg = null, ob = null, turtle = null, amd = null, sd = null }) {
   const isBuy = direction === 'BUY';
   const dp    = price > 100 ? 2 : 5;
   const atr   = h4.atr14 || m30.atr14 || 0.001;
@@ -1735,44 +1796,81 @@ function calcTradeSetup({ direction, price, h4, h2, m30, m5, scored, session, fv
     if ( isBuy && price > h4.hma) conf += 3;
     if (!isBuy && price < h4.hma) conf += 3;
   }
+  // +7  Price at golden ratio (0.618) — highest-probability fib zone
+  // +5  Price at 0.5 or 0.786 fib level
+  // +3  Price at 0.382 fib level
+  if (h4.fib && h4.atr14) {
+    const fn = nearestFibLevel(h4.fib, price, h4.atr14);
+    if (fn.distance <= 1.0) {
+      if (fn.key === '0.618') conf += 7;
+      else if (fn.key === '0.500' || fn.key === '0.786') conf += 5;
+      else if (fn.key === '0.382') conf += 3;
+    }
+  }
 
   // Cap: never claim 100% (markets always have uncertainty)
   conf = Math.min(95, Math.max(10, Math.round(conf)));
 
-  // ── STOP LOSS — at nearest H4 strong S/R ──────────────────────────
-  let stopLoss;
+  // ── STOP LOSS — prefer S/D zone boundary, fall back to ATR ──────────
+  let stopLoss, slMethod = 'ATR';
   if (isBuy) {
-    // Below strong H4 support, +0.2 ATR buffer
-    const candidate = h4.strongSupport - (atr * 0.2);
-    const dist = price - candidate;
-    if (dist >= atr * 0.6 && dist <= atr * 3.0) {
-      stopLoss = candidate;
-    } else {
-      stopLoss = price - (atr * 1.6); // fallback: 1.6× ATR
+    // Best SL: just below the nearest fresh demand zone bottom
+    const demandZone = sd?.freshZones?.[sd.freshZones.length - 1] ||
+                       sd?.zones?.filter(z => z.type === 'DEMAND' && z.top < price)?.[0];
+    if (demandZone) {
+      const candidate = demandZone.bottom - atr * 0.15;
+      const dist = price - candidate;
+      if (dist >= atr * 0.5 && dist <= atr * 3.5) { stopLoss = candidate; slMethod = 'S/D Zone'; }
+    }
+    if (!stopLoss) {
+      const candidate = h4.strongSupport - atr * 0.2;
+      const dist = price - candidate;
+      stopLoss = (dist >= atr * 0.6 && dist <= atr * 3.0) ? candidate : price - atr * 1.6;
     }
   } else {
-    // Above strong H4 resistance, +0.2 ATR buffer
-    const candidate = h4.strongResist + (atr * 0.2);
-    const dist = candidate - price;
-    if (dist >= atr * 0.6 && dist <= atr * 3.0) {
-      stopLoss = candidate;
-    } else {
-      stopLoss = price + (atr * 1.6);
+    // Best SL: just above nearest fresh supply zone top
+    const supplyZone = sd?.freshZones?.[sd.freshZones.length - 1] ||
+                       sd?.zones?.filter(z => z.type === 'SUPPLY' && z.bottom > price)?.[0];
+    if (supplyZone) {
+      const candidate = supplyZone.top + atr * 0.15;
+      const dist = candidate - price;
+      if (dist >= atr * 0.5 && dist <= atr * 3.5) { stopLoss = candidate; slMethod = 'S/D Zone'; }
+    }
+    if (!stopLoss) {
+      const candidate = h4.strongResist + atr * 0.2;
+      const dist = candidate - price;
+      stopLoss = (dist >= atr * 0.6 && dist <= atr * 3.0) ? candidate : price + atr * 1.6;
     }
   }
 
-  // ── TAKE PROFIT — at H4 S/R or minimum 1:2.5 R:R ─────────────────
+  // ── TAKE PROFIT — prefer opposing S/D zone, fall back to R:R ──────────
   const slDist = Math.abs(price - stopLoss);
-  let takeProfit;
-  if (isBuy) {
-    const tpSR  = h4.resistance > price + slDist ? h4.resistance : null;
-    const tpRR  = price + slDist * 2.5;
-    // Use H4 resistance if it gives at least 1:2 R:R, else use 2.5× SL
-    takeProfit = (tpSR && tpSR - price >= slDist * 2) ? tpSR : tpRR;
-  } else {
-    const tpSR  = h4.support < price - slDist ? h4.support : null;
-    const tpRR  = price - slDist * 2.5;
-    takeProfit = (tpSR && price - tpSR >= slDist * 2) ? tpSR : tpRR;
+  let takeProfit, tpMethod = 'RR';
+
+  // Look for opposing S/D zone as TP target (supply for BUY, demand for SELL)
+  if (isBuy && sd?.zones) {
+    const supplyAbove = sd.zones.filter(z => z.type === 'SUPPLY' && z.bottom > price + slDist * 1.5);
+    if (supplyAbove.length > 0) {
+      takeProfit = supplyAbove[supplyAbove.length - 1].bottom - atr * 0.1;
+      tpMethod   = 'Supply Zone';
+    }
+  } else if (!isBuy && sd?.zones) {
+    const demandBelow = sd.zones.filter(z => z.type === 'DEMAND' && z.top < price - slDist * 1.5);
+    if (demandBelow.length > 0) {
+      takeProfit = demandBelow[demandBelow.length - 1].top + atr * 0.1;
+      tpMethod   = 'Demand Zone';
+    }
+  }
+
+  if (!takeProfit) {
+    // Fallback: H4 S/R if it gives ≥1:2, else 2.5× SL
+    if (isBuy) {
+      const tpSR = h4.resistance > price + slDist ? h4.resistance : null;
+      takeProfit = (tpSR && tpSR - price >= slDist * 2) ? tpSR : price + slDist * 2.5;
+    } else {
+      const tpSR = h4.support < price - slDist ? h4.support : null;
+      takeProfit = (tpSR && price - tpSR >= slDist * 2) ? tpSR : price - slDist * 2.5;
+    }
   }
 
   stopLoss   = parseFloat(stopLoss.toFixed(dp));
@@ -1785,8 +1883,8 @@ function calcTradeSetup({ direction, price, h4, h2, m30, m5, scored, session, fv
 `Market Bias: ${isBuy ? 'BULLISH' : 'BEARISH'}
 Confidence Score: ${conf}%
 Entry Zone: ${price.toFixed(dp)}
-Stop Loss: ${stopLoss.toFixed(dp)} (${isBuy ? 'below' : 'above'} H4 ${isBuy ? 'Support' : 'Resistance'} + ATR buffer)
-Take Profit: ${takeProfit.toFixed(dp)} (H4 ${isBuy ? 'Resistance' : 'Support'} level)
+Stop Loss: ${stopLoss.toFixed(dp)} [${slMethod}]
+Take Profit: ${takeProfit.toFixed(dp)} [${tpMethod}]
 Risk/Reward: 1:${rr.toFixed(1)}
 
 TIMEFRAME ANALYSIS:
@@ -1861,7 +1959,7 @@ async function checkRiskGovernors(signal) {
   const keys = getApiKeys();
   const blocks = [];
 
-  // 1 — Daily loss limit (3%) + weekly loss limit (6%) — fetch balance once
+  // 1 — Daily loss limit (3%) + weekly loss limit (6%) + HARD 10% DD stop
   try {
     if (keys.oanda_key && keys.oanda_account) {
       const acct    = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
@@ -1874,6 +1972,32 @@ async function checkRiskGovernors(signal) {
         const weekly = getWeeklyPL();
         if (weekly.realized_pl < 0 && Math.abs(weekly.realized_pl) >= balance * 0.06)
           blocks.push(`Weekly loss limit reached: ${weekly.realized_pl.toFixed(2)} / -${(balance*0.06).toFixed(2)} (6%)`);
+
+        // Hard 10% drawdown from peak — track peak equity in storage
+        const storedPeak = getStorageValue('peak_balance') || 0;
+        const peak = Math.max(storedPeak, balance);
+        if (peak > storedPeak) setStorageValue('peak_balance', peak); // update peak
+        const ddPct = peak > 0 ? ((peak - balance) / peak) * 100 : 0;
+        if (ddPct >= 10) {
+          blocks.push(`HARD STOP: Account down ${ddPct.toFixed(1)}% from peak $${peak.toFixed(0)} → current $${balance.toFixed(0)} — trading halted until manual review`);
+          // Send urgent alert only once per day
+          const ddAlertKey = `dd_alert_${new Date().toISOString().slice(0,10)}`;
+          if (!getStorageValue(ddAlertKey)) {
+            setStorageValue(ddAlertKey, true);
+            sendTelegramMsg(
+`🚨 HARD DRAWDOWN STOP TRIGGERED
+Account dropped ${ddPct.toFixed(1)}% from peak
+
+Peak balance:    $${peak.toFixed(2)}
+Current balance: $${balance.toFixed(2)}
+Drawdown:        -$${(peak - balance).toFixed(2)} (${ddPct.toFixed(1)}%)
+
+ALL TRADING SUSPENDED.
+Review your strategy before re-enabling.
+Type STATUS to check system state.`
+            ).catch(() => {});
+          }
+        }
       }
     }
   } catch {}
@@ -3796,9 +3920,9 @@ async function runAutoScan() {
         console.log(`[SCAN] ${label}: RSI divergence: ${rsiDiv}`);
       }
 
-      // ── Run 16-check scoring engine ───────────────────────────────────
+      // ── Run 17-check scoring engine ───────────────────────────────────
       const scored = scoreSignal({
-        direction: aiDirection, price,
+        direction: aiDirection, price, pair: label,
         h4: indH4, h2: indH2, m30: indM30, m5: indM5,
         newsEvents: currentNews, fvg, ob, turtle,
       });
@@ -3816,7 +3940,7 @@ async function runAutoScan() {
       const setup = calcTradeSetup({
         direction: aiDirection, price,
         h4: indH4, h2: indH2, m30: indM30, m5: indM5,
-        scored, session, fvg, ob, turtle, amd,
+        scored, session, fvg, ob, turtle, amd, sd,
       });
       console.log(`[SCAN] ${label}: Calc Engine → ${aiDirection} ${setup.confidence}%`);
 
@@ -4083,6 +4207,10 @@ Return EXACTLY 6 lines, no other text:
       const turtleDisp = turtle.found ? `⚡ ${turtle.signal} — ${turtle.note}` : '—';
       const amdDisp    = `${amd.phase}${amd.tradeable ? ' ✓' : ' ⚠️'} — ${amd.note}`;
       const pivotsDisp = pivots ? `PP=${pivots.pp.toFixed(dp)} | R1=${pivots.r1.toFixed(dp)} | S1=${pivots.s1.toFixed(dp)}` : '—';
+      const fibNear    = indH4.fib ? nearestFibLevel(indH4.fib, price, indH4.atr14) : null;
+      const fibDisp    = indH4.fib
+        ? `H:${indH4.fib.high.toFixed(dp)} L:${indH4.fib.low.toFixed(dp)} | 0.618=${indH4.fib.f618.toFixed(dp)} 0.382=${indH4.fib.f382.toFixed(dp)}${fibNear && fibNear.distance <= 1.2 ? ` ← price near ${fibNear.key} ✅` : ''}`
+        : '—';
       const bbDisp     = indH4.bb ? `BW=${indH4.bb.bw.toFixed(2)}% %B=${(indH4.bb.pct*100).toFixed(0)}%${indH4.bb.squeezing?' SQUEEZE':''}` : '—';
       const vwapDisp   = indH4.vwap ? `${indH4.vwap.toFixed(dp)} (price ${price > indH4.vwap ? 'ABOVE ✓' : 'BELOW ⚠️'})` : '—';
       const hmaDisp    = indH4.hma  ? `${indH4.hma.toFixed(dp)} (price ${price > indH4.hma ? 'ABOVE ✓' : 'BELOW ⚠️'})` : '—';
@@ -4138,6 +4266,7 @@ S/D Zone:    ${sdDisp}
 FVG:         ${fvgDisp}
 Order Block: ${obDisp}
 Turtle Soup: ${turtleDisp}
+Fibonacci:   ${fibDisp}
 Pivots:      ${pivotsDisp}
 BB:          ${bbDisp}
 VWAP:        ${vwapDisp}
@@ -4190,6 +4319,118 @@ ${failedStr ? `\n❌ CHECKS FAILED\n${failedStr}` : ''}`;
 setInterval(runAutoScan, 5 * 60 * 1000);
 // Run once 20s after startup if enabled
 setTimeout(runAutoScan, 20000);
+
+// ─── WEEKLY PERFORMANCE REPORT — every Sunday 08:00 UTC ──────────────────────
+async function sendWeeklyReport() {
+  const keys = getApiKeys();
+  if (!keys.tg_token || !keys.tg_chat) return;
+
+  // Guard: only send once per Sunday (store last sent date)
+  const today = new Date().toISOString().slice(0, 10);
+  const lastSent = getStorageValue('weekly_report_sent');
+  if (lastSent === today) return;
+
+  const now = new Date();
+  if (now.getUTCDay() !== 0) return;           // only Sunday
+  if (now.getUTCHours() < 8 || now.getUTCHours() > 9) return; // 08:00–09:00 window
+
+  setStorageValue('weekly_report_sent', today);
+
+  try {
+    // Closed trades this week
+    const daysFromMon = now.getUTCDay() === 0 ? 6 : now.getUTCDay() - 1;
+    const monday = new Date(now.getTime() - daysFromMon * 86400000).toISOString().slice(0, 10);
+    const weekTrades = db.prepare(`
+      SELECT pair, direction, realized_pl, actual_pips, confidence, exit_reason, duration_mins
+      FROM signals WHERE status='CLOSED' AND date(closed_at) >= ?
+      ORDER BY closed_at ASC
+    `).get ? db.prepare(`
+      SELECT pair, direction, realized_pl, actual_pips, confidence, exit_reason, duration_mins
+      FROM signals WHERE status='CLOSED' AND date(closed_at) >= ?
+      ORDER BY closed_at ASC
+    `).all(monday) : [];
+
+    const wins   = weekTrades.filter(t => (t.realized_pl||0) > 0);
+    const losses = weekTrades.filter(t => (t.realized_pl||0) < 0);
+    const totalPL= weekTrades.reduce((s,t) => s + (t.realized_pl||0), 0);
+    const winRate= weekTrades.length ? Math.round(wins.length / weekTrades.length * 100) : 0;
+    const avgWin = wins.length   ? wins.reduce((s,t)   => s+(t.realized_pl||0), 0)/wins.length   : 0;
+    const avgLoss= losses.length ? losses.reduce((s,t) => s+(t.realized_pl||0), 0)/losses.length : 0;
+    const pf     = avgLoss < 0 && avgWin > 0 ? Math.abs(avgWin/avgLoss).toFixed(2) : '—';
+
+    // Best/worst pair this week
+    const pairMap = {};
+    weekTrades.forEach(t => {
+      if (!pairMap[t.pair]) pairMap[t.pair] = { pl:0, n:0 };
+      pairMap[t.pair].pl += (t.realized_pl||0); pairMap[t.pair].n++;
+    });
+    const pairArr    = Object.entries(pairMap).sort((a,b) => b[1].pl - a[1].pl);
+    const bestPair   = pairArr[0]  ? `${pairArr[0][0]}  +$${pairArr[0][1].pl.toFixed(2)}` : '—';
+    const worstPair  = pairArr.slice(-1)[0] && pairArr.slice(-1)[0][1].pl < 0
+      ? `${pairArr.slice(-1)[0][0]}  -$${Math.abs(pairArr.slice(-1)[0][1].pl).toFixed(2)}` : '—';
+
+    // All-time advanced metrics
+    const allClosed  = db.prepare(`SELECT realized_pl FROM signals WHERE status='CLOSED' ORDER BY closed_at ASC`).all();
+    const allPLs     = allClosed.map(t => t.realized_pl||0);
+    const allAvg     = allPLs.length ? allPLs.reduce((s,p)=>s+p,0)/allPLs.length : 0;
+    const allStd     = allPLs.length > 1
+      ? Math.sqrt(allPLs.reduce((s,p)=>s+(p-allAvg)**2,0)/allPLs.length) : 1;
+    const sharpe     = allStd > 0 ? (allAvg/allStd).toFixed(2) : '—';
+
+    // Current streak
+    const recentPLs = db.prepare(`SELECT realized_pl FROM signals WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 10`).all();
+    let streak = 0;
+    for (const t of recentPLs) {
+      const w = (t.realized_pl||0) > 0;
+      if (streak === 0) { streak = w ? 1 : -1; continue; }
+      if (streak > 0 && w) streak++;
+      else if (streak < 0 && !w) streak--;
+      else break;
+    }
+    const streakStr = streak > 1 ? `🔥 ${streak} wins in a row` : streak < -1 ? `❄️ ${Math.abs(streak)} losses in a row` : 'Neutral';
+
+    const peakBal  = getStorageValue('peak_balance') || 0;
+    let balLine = '';
+    try {
+      if (keys.oanda_key && keys.oanda_account) {
+        const a = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
+        const b = parseFloat(a?.account?.balance || 0);
+        const ddPct = peakBal > 0 ? ((peakBal - b) / peakBal * 100).toFixed(1) : '0.0';
+        balLine = `Balance:      $${b.toFixed(2)}  (DD from peak: ${ddPct}%)`;
+      }
+    } catch {}
+
+    const report =
+`📊 WEEKLY PERFORMANCE REPORT
+Week of ${monday}
+━━━━━━━━━━━━━━━━━━━━━━━
+Trades:       ${weekTrades.length}  (${wins.length}W / ${losses.length}L)
+Win Rate:     ${winRate}%
+Weekly P&L:   ${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(2)}
+Profit Factor:${pf}
+Avg Win:      +$${avgWin.toFixed(2)}
+Avg Loss:     $${avgLoss.toFixed(2)}
+
+Best Pair:    ${bestPair}
+Worst Pair:   ${worstPair}
+Streak:       ${streakStr}
+
+All-Time Sharpe: ${sharpe}
+${balLine}
+━━━━━━━━━━━━━━━━━━━━━━━
+${totalPL >= 0 ? '✅ Profitable week.' : '❌ Losing week — review conditions.'}
+Type REPORT for full pattern analysis.`;
+
+    await sendTelegramMsg(report);
+    console.log(`[WEEKLY] Report sent for week of ${monday}`);
+  } catch(e) {
+    console.error('[WEEKLY]', e.message);
+  }
+}
+
+// Check every 30 minutes if it's time to send weekly report
+setInterval(() => { sendWeeklyReport().catch(() => {}); }, 30 * 60 * 1000);
+setTimeout(() => { sendWeeklyReport().catch(() => {}); }, 60000); // check 1 min after startup
 
 // Reconcile closed trades every 2 minutes
 setInterval(() => { reconcileTrades().catch(() => {}); }, 2 * 60 * 1000);
@@ -4320,6 +4561,14 @@ app.get('/api/risk/status', async (req, res) => {
     trading_allowed: maxDaily > 0
       ? (daily.realized_pl >= 0 || Math.abs(daily.realized_pl) < maxDaily) && consec < 3
       : consec < 3,
+    peak_balance: {
+      peak:    parseFloat((getStorageValue('peak_balance') || balance).toFixed(2)),
+      current: parseFloat(balance.toFixed(2)),
+      dd_pct:  getStorageValue('peak_balance')
+        ? parseFloat((((getStorageValue('peak_balance') - balance) / getStorageValue('peak_balance')) * 100).toFixed(1))
+        : 0,
+      hard_stop_at: '10%',
+    },
     recent_events: recentEvents,
   });
 });

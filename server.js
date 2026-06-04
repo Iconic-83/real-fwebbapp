@@ -108,6 +108,18 @@ const LABEL_TO_OANDA = {
   'NZD/CAD':'NZD_CAD','NZD/CHF':'NZD_CHF',
   // Commodities
   'XAU/USD':'XAU_USD','XAG/USD':'XAG_USD',
+  // Scandinavian
+  'USD/SEK':'USD_SEK','USD/NOK':'USD_NOK','USD/DKK':'USD_DKK',
+  'EUR/SEK':'EUR_SEK','EUR/NOK':'EUR_NOK',
+  // Emerging markets
+  'USD/ZAR':'USD_ZAR','USD/MXN':'USD_MXN','USD/TRY':'USD_TRY',
+  'USD/SGD':'USD_SGD','USD/HKD':'USD_HKD','USD/CNH':'USD_CNH',
+  'USD/PLN':'USD_PLN','EUR/PLN':'EUR_PLN','EUR/TRY':'EUR_TRY',
+  'GBP/ZAR':'GBP_ZAR','EUR/ZAR':'EUR_ZAR',
+  // Asian crosses
+  'SGD/JPY':'SGD_JPY','AUD/SGD':'AUD_SGD',
+  // Platinum / Palladium
+  'XPT/USD':'XPT_USD','XPD/USD':'XPD_USD',
   // Compact aliases
   'EURUSD':'EUR_USD','GBPUSD':'GBP_USD','USDJPY':'USD_JPY',
   'USDCHF':'USD_CHF','USDCAD':'USD_CAD','AUDUSD':'AUD_USD','NZDUSD':'NZD_USD',
@@ -126,6 +138,18 @@ const PAIR_LABELS = {
   CAD_JPY:'CAD/JPY', NZD_JPY:'NZD/JPY', CHF_JPY:'CHF/JPY',
   NZD_CAD:'NZD/CAD', NZD_CHF:'NZD/CHF',
   XAU_USD:'XAU/USD', XAG_USD:'XAG/USD',
+  // Scandinavian
+  USD_SEK:'USD/SEK', USD_NOK:'USD/NOK', USD_DKK:'USD/DKK',
+  EUR_SEK:'EUR/SEK', EUR_NOK:'EUR/NOK',
+  // Emerging markets
+  USD_ZAR:'USD/ZAR', USD_MXN:'USD/MXN', USD_TRY:'USD/TRY',
+  USD_SGD:'USD/SGD', USD_HKD:'USD/HKD', USD_CNH:'USD/CNH',
+  USD_PLN:'USD/PLN', EUR_PLN:'EUR/PLN', EUR_TRY:'EUR/TRY',
+  GBP_ZAR:'GBP/ZAR', EUR_ZAR:'EUR/ZAR',
+  // Asian crosses
+  SGD_JPY:'SGD/JPY', AUD_SGD:'AUD/SGD',
+  // Precious metals
+  XPT_USD:'XPT/USD', XPD_USD:'XPD/USD',
 };
 
 // Pip sizes
@@ -146,6 +170,18 @@ const PIP = {
   NZD_CAD:0.0001, NZD_CHF:0.0001,
   // Commodities
   XAU_USD:0.1, XAG_USD:0.01,
+  // Scandinavian (large price levels — pip = 0.0001)
+  USD_SEK:0.0001, USD_NOK:0.0001, USD_DKK:0.0001,
+  EUR_SEK:0.0001, EUR_NOK:0.0001,
+  // Emerging markets
+  USD_ZAR:0.0001, USD_MXN:0.0001, USD_TRY:0.0001,
+  USD_SGD:0.0001, USD_HKD:0.0001, USD_CNH:0.0001,
+  USD_PLN:0.0001, EUR_PLN:0.0001, EUR_TRY:0.0001,
+  GBP_ZAR:0.0001, EUR_ZAR:0.0001,
+  // Asian crosses
+  SGD_JPY:0.01, AUD_SGD:0.0001,
+  // Precious metals
+  XPT_USD:0.01, XPD_USD:0.1,
 };
 
 // FIX 4 — OANDA latency telemetry
@@ -1029,6 +1065,65 @@ function detectAMDPhase() {
   if (h >= 12 && h < 14) return { phase:'MANIPULATION_NY', tradeable:false, note:'NY open re-sweep — wait for direction to confirm' };
   if (h >= 14 && h < 17) return { phase:'DISTRIBUTION_NY', tradeable:true,  note:'NY distribution — carry London direction or reversal' };
   return                  { phase:'DEAD_ZONE',             tradeable:false, note:'Off-hours — no institutional activity expected' };
+}
+
+// ── SUPPLY & DEMAND ZONES ─────────────────────────────────────────────────────
+// Demand zone: base (tight consolidation) → strong bullish impulse upward
+// Supply zone: base (tight consolidation) → strong bearish impulse downward
+// Fresh = price has never returned to the zone since it formed (highest probability)
+// Tested = zone has been visited once (still valid, but weaker)
+function detectSupplyDemandZones(candles, direction) {
+  if (candles.length < 10) return { zones:[], freshZones:[], nearFresh:false, nearest:null, freshCount:0 };
+  const slice = candles.slice(-100);
+  const price = parseFloat(candles[candles.length - 1].mid.c);
+  const atr   = calcATR(candles.slice(-14), 14) || 0.001;
+  const zones = [];
+
+  for (let i = 2; i < slice.length - 1; i++) {
+    const impulse  = slice[i];
+    const iOpen    = parseFloat(impulse.mid.o), iClose = parseFloat(impulse.mid.c);
+    const iHigh    = parseFloat(impulse.mid.h), iLow   = parseFloat(impulse.mid.l);
+    const iRange   = iHigh - iLow;
+    const isBull   = iClose > iOpen;
+    const isBear   = iClose < iOpen;
+
+    // Impulse must be large (>1.5× ATR) and directional (body > 60% of range)
+    if (iRange < atr * 1.5) continue;
+    if (Math.abs(iClose - iOpen) < iRange * 0.55) continue;
+
+    // Base: 1-2 candles immediately before the impulse (tight consolidation)
+    const base = slice.slice(Math.max(0, i - 2), i);
+    const baseHigh   = Math.max(...base.map(c => parseFloat(c.mid.h)));
+    const baseLow    = Math.min(...base.map(c => parseFloat(c.mid.l)));
+    const baseRange  = baseHigh - baseLow;
+
+    // Base must be tighter than the impulse (consolidation, not another impulse)
+    if (baseRange > iRange * 0.85) continue;
+
+    // Check if price returned to zone after formation (tested or fresh)
+    const futureSlice  = slice.slice(i + 1);
+    const wasTested    = futureSlice.some(c =>
+      parseFloat(c.mid.l) <= baseHigh * 1.0002 && parseFloat(c.mid.h) >= baseLow * 0.9998
+    );
+
+    if (direction === 'BUY' && isBull) {
+      zones.push({ type:'DEMAND', top:baseHigh, bottom:baseLow, mid:(baseHigh+baseLow)/2,
+        impulseSize: parseFloat((iRange / atr).toFixed(1)), fresh:!wasTested });
+    }
+    if (direction === 'SELL' && isBear) {
+      zones.push({ type:'SUPPLY', top:baseHigh, bottom:baseLow, mid:(baseHigh+baseLow)/2,
+        impulseSize: parseFloat((iRange / atr).toFixed(1)), fresh:!wasTested });
+    }
+  }
+
+  const freshZones = zones.filter(z => z.fresh);
+  // Price near or inside a fresh zone (within 1.2 ATR)?
+  const nearFresh  = freshZones.some(z =>
+    price >= z.bottom - atr * 1.2 && price <= z.top + atr * 1.2
+  );
+  const nearest    = freshZones[freshZones.length - 1] || zones[zones.length - 1] || null;
+
+  return { zones: zones.slice(-6), freshZones: freshZones.slice(-3), nearFresh, nearest, freshCount: freshZones.length };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2170,8 +2265,17 @@ const PAIRS = [
   'CAD/JPY','NZD/JPY','CHF/JPY','NZD/CAD','NZD/CHF',
   // Commodities
   'XAU/USD','XAG/USD',
+  // Scandinavian
+  'USD/SEK','USD/NOK','USD/DKK','EUR/SEK','EUR/NOK',
+  // Emerging markets
+  'USD/ZAR','USD/MXN','USD/TRY','USD/SGD','USD/HKD','USD/CNH',
+  'USD/PLN','EUR/PLN','EUR/TRY','GBP/ZAR','EUR/ZAR',
+  // Asian crosses
+  'SGD/JPY','AUD/SGD',
+  // Precious metals
+  'XPT/USD','XPD/USD',
 ];
-const OANDA_INSTR = 'EUR_USD,GBP_USD,USD_JPY,USD_CHF,USD_CAD,AUD_USD,NZD_USD,EUR_GBP,EUR_JPY,EUR_CHF,EUR_AUD,EUR_CAD,EUR_NZD,GBP_JPY,GBP_CHF,GBP_AUD,GBP_CAD,GBP_NZD,AUD_JPY,AUD_CAD,AUD_CHF,AUD_NZD,CAD_JPY,NZD_JPY,CHF_JPY,NZD_CAD,NZD_CHF,XAU_USD,XAG_USD';
+const OANDA_INSTR = 'EUR_USD,GBP_USD,USD_JPY,USD_CHF,USD_CAD,AUD_USD,NZD_USD,EUR_GBP,EUR_JPY,EUR_CHF,EUR_AUD,EUR_CAD,EUR_NZD,GBP_JPY,GBP_CHF,GBP_AUD,GBP_CAD,GBP_NZD,AUD_JPY,AUD_CAD,AUD_CHF,AUD_NZD,CAD_JPY,NZD_JPY,CHF_JPY,NZD_CAD,NZD_CHF,XAU_USD,XAG_USD,USD_SEK,USD_NOK,USD_DKK,EUR_SEK,EUR_NOK,USD_ZAR,USD_MXN,USD_TRY,USD_SGD,USD_HKD,USD_CNH,USD_PLN,EUR_PLN,EUR_TRY,GBP_ZAR,EUR_ZAR,SGD_JPY,AUD_SGD,XPT_USD,XPD_USD';
 
 let priceCache = {}, priceCacheTime = 0, priceSource = 'none';
 let spreadCache = {}; // pair → live spread (ask - bid)
@@ -3459,18 +3563,27 @@ async function runAutoScan() {
   const currentNews = newsCache || [];
 
   const scanPairs = [
-    // Major USD
+    // ── Tier 1: Major USD (highest liquidity) ────────────────────────
     'EUR_USD','GBP_USD','USD_JPY','USD_CHF','USD_CAD','AUD_USD','NZD_USD',
-    // EUR crosses
+    // ── Tier 1: EUR crosses ──────────────────────────────────────────
     'EUR_GBP','EUR_JPY','EUR_CHF','EUR_AUD','EUR_CAD','EUR_NZD',
-    // GBP crosses
+    // ── Tier 1: GBP crosses ──────────────────────────────────────────
     'GBP_JPY','GBP_CHF','GBP_AUD','GBP_CAD','GBP_NZD',
-    // AUD crosses
+    // ── Tier 1: AUD crosses ──────────────────────────────────────────
     'AUD_JPY','AUD_CAD','AUD_CHF','AUD_NZD',
-    // Other crosses
+    // ── Tier 1: Other liquid crosses ─────────────────────────────────
     'CAD_JPY','NZD_JPY','CHF_JPY','NZD_CAD','NZD_CHF',
-    // Commodities
+    // ── Tier 1: Commodities ───────────────────────────────────────────
     'XAU_USD','XAG_USD',
+    // ── Tier 2: Scandinavian ─────────────────────────────────────────
+    'USD_SEK','USD_NOK','USD_DKK','EUR_SEK','EUR_NOK',
+    // ── Tier 2: Emerging markets ──────────────────────────────────────
+    'USD_ZAR','USD_MXN','USD_TRY','USD_SGD','USD_HKD','USD_CNH',
+    'USD_PLN','EUR_PLN','EUR_TRY','GBP_ZAR','EUR_ZAR',
+    // ── Tier 2: Asian crosses ─────────────────────────────────────────
+    'SGD_JPY','AUD_SGD',
+    // ── Tier 2: Precious metals ───────────────────────────────────────
+    'XPT_USD','XPD_USD',
   ];
 
   for (const instr of scanPairs) {
@@ -3492,15 +3605,17 @@ async function runAutoScan() {
       const price = parseFloat(priceCache[label] || 0);
       if (!price) continue;
 
-      // ── Fetch all 5 timeframes in parallel: W1 → H4 → H2 → M30 → M5 ──
-      const [w1r, h4r, h2r, m30r, m5r] = await Promise.allSettled([
+      // ── Fetch all 6 timeframes in parallel: W1 → D1 → H4 → H2 → M30 → M5 ──
+      const [w1r, d1r, h4r, h2r, m30r, m5r] = await Promise.allSettled([
         oandaRequest(`/v3/instruments/${instr}/candles?count=30&granularity=W&price=M`),
+        oandaRequest(`/v3/instruments/${instr}/candles?count=60&granularity=D&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=250&granularity=H4&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=H2&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=100&granularity=M30&price=M`),
         oandaRequest(`/v3/instruments/${instr}/candles?count=50&granularity=M5&price=M`),
       ]);
       const w1c  = w1r.status==='fulfilled'  ? w1r.value?.candles||[]  : [];
+      const d1c  = d1r.status==='fulfilled'  ? d1r.value?.candles||[]  : [];
       const h4c  = h4r.status==='fulfilled'  ? h4r.value?.candles||[]  : [];
       const h2c  = h2r.status==='fulfilled'  ? h2r.value?.candles||[]  : [];
       const m30c = m30r.status==='fulfilled' ? m30r.value?.candles||[] : [];
@@ -3600,21 +3715,34 @@ async function runAutoScan() {
         continue;
       }
 
-      // ── FILTER 3: W1 trend — no counter-trend trades ──────────────────
-      let w1Trend = 'UNKNOWN';
+      // ── PIPELINE STAGE 1: HTF Trend — W1 + D1 + H4 must agree (≥2/3) ───
+      let w1Trend = 'UNKNOWN', d1Trend = 'UNKNOWN';
+
       if (w1c.length >= 5) {
         const w1cc = completedCandles(w1c);
         if (w1cc.length >= 5) {
-          const w1closes = w1cc.map(c => parseFloat(c.mid.c));
-          const w1ema21  = calcEMA(w1closes, Math.min(21, w1closes.length));
-          w1Trend        = w1closes[w1closes.length - 1] > w1ema21 ? 'BULLISH' : 'BEARISH';
-          if ((aiDirection === 'BUY' && w1Trend === 'BEARISH') ||
-              (aiDirection === 'SELL' && w1Trend === 'BULLISH')) {
-            console.log(`[SCAN] ${label}: W1 ${w1Trend} (${w1cc.length} completed candles) — counter-trend ${aiDirection} rejected`);
-            continue;
-          }
+          const cls = w1cc.map(c => parseFloat(c.mid.c));
+          w1Trend   = cls[cls.length - 1] > calcEMA(cls, Math.min(21, cls.length)) ? 'BULLISH' : 'BEARISH';
         }
       }
+      if (d1c.length >= 10) {
+        const d1cc = completedCandles(d1c);
+        if (d1cc.length >= 10) {
+          const cls = d1cc.map(c => parseFloat(c.mid.c));
+          d1Trend   = cls[cls.length - 1] > calcEMA(cls, Math.min(21, cls.length)) ? 'BULLISH' : 'BEARISH';
+        }
+      }
+
+      // Count HTF votes: W1, D1, H4
+      const htfBull = [w1Trend, d1Trend, indH4.trend].filter(t => t === 'BULLISH').length;
+      const htfBear = [w1Trend, d1Trend, indH4.trend].filter(t => t === 'BEARISH').length;
+      const htfVotes = aiDirection === 'BUY' ? htfBull : htfBear;
+
+      if (htfVotes < 2) {
+        console.log(`[SCAN] ${label}: HTF misaligned — W1:${w1Trend} D1:${d1Trend} H4:${indH4.trend} (${htfVotes}/3 for ${aiDirection}) — skipped`);
+        continue;
+      }
+      console.log(`[SCAN] ${label}: HTF ✓ ${htfVotes}/3 aligned — W1:${w1Trend} D1:${d1Trend} H4:${indH4.trend}`);
 
       // ── STAGE 2: Supplementary intelligence (logged, not blocking) ───
       const rsiDiv      = detectRSIDivergence(m30cc, aiDirection);
@@ -3626,12 +3754,26 @@ async function runAutoScan() {
       const liqZones      = detectLiquidityZones(h4cc, indH4.atr14);
       const structureDelta= scoreMarketStructure(structure, aiDirection, liqZones);
 
+      // ── PIPELINE STAGE 3: Supply & Demand zones ──────────────────────
+      const sd = detectSupplyDemandZones(h4cc, aiDirection);
+      console.log(`[SCAN] ${label}: S/D — ${sd.freshCount} fresh ${aiDirection==='BUY'?'demand':'supply'} zone(s)${sd.nearFresh?' — NEAR PRICE ✓':''}`);
+
       // ── ICT SMART MONEY CONCEPTS ──────────────────────────────────────
       const fvg    = detectFVG(h4cc, aiDirection);
       const ob     = detectOrderBlocks(h4cc, aiDirection);
       const turtle = detectTurtleSoup(h4cc, aiDirection);
       const amd    = detectAMDPhase();
       const pivots = calcPivotPoints(h4cc);
+
+      // ── PIPELINE STAGE 4: Institutional confirmation gate ─────────────
+      // At least ONE institutional zone must exist: S/D zone, FVG, Order Block, or Turtle Soup
+      // This ensures we only trade from where institutions are positioned
+      const hasInstitutionalZone = sd.freshCount > 0 || fvg.found || ob.found || turtle.found;
+      if (!hasInstitutionalZone) {
+        console.log(`[SCAN] ${label}: No institutional zone (S/D=${sd.freshCount} FVG=${fvg.found} OB=${ob.found} Turtle=${turtle.found}) — skipped`);
+        continue;
+      }
+      console.log(`[SCAN] ${label}: Institutional zone ✓ — S/D:${sd.freshCount} FVG:${fvg.found} OB:${ob.found} Turtle:${turtle.found}`);
 
       console.log(`[SCAN] ${label}: Structure ${structure.structureBias} | BOS ${structure.bos} | CHOCH ${structure.choch} | delta ${structureDelta > 0 ? '+' : ''}${structureDelta}`);
 
@@ -3682,6 +3824,7 @@ async function runAutoScan() {
       const learningDelta = getLearningDelta({
         session, regime: regime.regime, pair: label, direction: aiDirection,
         bos: structure.bos, sweep_risk: liquidity.sweep_risk, w1Trend,
+        adx: indH4.adx,
       });
 
       const totalDelta = structureDelta + learningDelta;
@@ -3839,8 +3982,8 @@ Return EXACTLY 6 lines, no other text:
       const tpPips  = Math.abs(price - parsed.takeProfit) / pipSize;
       if (slPips < 2) continue;
       const rr = tpPips / slPips;
-      if (rr < 1.5) {
-        console.log(`[SCAN] ${label}: R:R ${rr.toFixed(1)} too low — skipped`);
+      if (rr < 2.0) {
+        console.log(`[SCAN] ${label}: R:R ${rr.toFixed(1)} too low (need ≥2.0) — skipped`);
         continue;
       }
 
@@ -3943,9 +4086,23 @@ Return EXACTLY 6 lines, no other text:
       const bbDisp     = indH4.bb ? `BW=${indH4.bb.bw.toFixed(2)}% %B=${(indH4.bb.pct*100).toFixed(0)}%${indH4.bb.squeezing?' SQUEEZE':''}` : '—';
       const vwapDisp   = indH4.vwap ? `${indH4.vwap.toFixed(dp)} (price ${price > indH4.vwap ? 'ABOVE ✓' : 'BELOW ⚠️'})` : '—';
       const hmaDisp    = indH4.hma  ? `${indH4.hma.toFixed(dp)} (price ${price > indH4.hma ? 'ABOVE ✓' : 'BELOW ⚠️'})` : '—';
+      const sdDisp     = sd.freshCount > 0 ? `✅ ${sd.freshCount} fresh zone(s)${sd.nearFresh ? ' — PRICE AT ZONE' : ''}` : sd.zones.length > 0 ? `⚠️ ${sd.zones.length} tested zone(s)` : '—';
+      // Pipeline summary line
+      const newsOk   = newsCache.filter(n => { if(n.impact!=='HIGH') return false; const nm=new Date().getUTCHours()*60+new Date().getUTCMinutes(); const [h,m]=(n.time||'99:99').split(':').map(Number); const d=nm-(h*60+m); return d>=-45&&d<=60; }).length === 0;
+      const pipelineDisp = [
+        `${newsOk?'✅':'❌'} News`,
+        `✅ HTF(${htfVotes}/3)`,
+        `✅ Structure`,
+        `${sd.freshCount>0||fvg.found||ob.found?'✅':'⚠️'} S/D`,
+        `${liquidity.sweep_risk!=='HIGH'?'✅':'⚠️'} Liq`,
+        `✅ Score(${scored.score}/${scored.maxScore})`,
+        `✅ R:R(1:${rr.toFixed(1)})`,
+      ].join(' | ');
 
       const tgText =
 `🎯 SIGNAL #${signalId} — ${label} ${parsed.direction} ${dirArrow}
+━━━━━━━━━━━━━━━━━━━━━━━
+📋 PIPELINE: ${pipelineDisp}
 ━━━━━━━━━━━━━━━━━━━━━━━
 SCORE: ${scored.score}/${scored.maxScore} checks | Confidence: ${parsed.confidence}%
 
@@ -3977,6 +4134,7 @@ Stop Pools:  ${nearLiqDisp}
 
 🧠 ICT SMART MONEY
 AMD Phase:   ${amdDisp}
+S/D Zone:    ${sdDisp}
 FVG:         ${fvgDisp}
 Order Block: ${obDisp}
 Turtle Soup: ${turtleDisp}
@@ -3992,6 +4150,7 @@ Consec loss: ${consecDisp}
 
 📈 TIMEFRAME BREAKDOWN
 W1:          ${w1Trend}
+D1:          ${d1Trend}
 H4 (Master): ${indH4.emaAlignment} | RSI ${indH4.rsi14} | ADX ${indH4.adx} | ${indH4.trend}
 H2 (Confirm):${indH2.trend} | RSI ${indH2.rsi14} | EMA ${indH2.ema9>indH2.ema21?'bullish▲':'bearish▼'}
 M30 (Entry): ${indM30.trend} | RSI ${indM30.rsi14} | MACD ${indM30.macd>0?'▲':'▼'} | ${indM30.pattern}

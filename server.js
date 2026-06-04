@@ -3658,12 +3658,9 @@ async function runAutoScan() {
   const settings = getStorageValue('autotrade_settings');
   if (!settings?.enabled) return;
 
-  const minScore  = parseInt(settings.min_score  || 9);   // out of 12 checks
+  const minScore  = parseInt(settings.min_score  || 9);   // out of 17 checks
   const riskPct   = parseFloat(settings.risk_pct || 1);
-  const maxPerDay = parseInt(settings.max_per_day || 3);
-
-  const todaySent = _stmtTodaySent.get();
-  if (todaySent.c >= maxPerDay) return;
+  // No daily signal cap — every valid setup is sent
 
   const keys = getApiKeys();
   if (!keys.oanda_key || !keys.oanda_account) return; // only OANDA needed now
@@ -3712,8 +3709,6 @@ async function runAutoScan() {
 
   for (const instr of scanPairs) {
     try {
-      const fresh = _stmtTodaySent.get();
-      if (fresh.c >= maxPerDay) break;
 
       const existPending = db.prepare(`SELECT id FROM signals WHERE pair=? AND status='PENDING'`).get(instr.replace('_','/'));
       if (existPending) continue;
@@ -4442,27 +4437,26 @@ setInterval(backupDatabase, 24 * 60 * 60 * 1000);
 
 // ── Signal API endpoints ──────────────────────────────────────────────────────
 app.get('/api/autotrade/settings', (req, res) => {
-  const s = getStorageValue('autotrade_settings') || { enabled:false, auto_execute:false, threshold:85, risk_pct:1, max_per_day:3, min_score:9 };
+  const s = getStorageValue('autotrade_settings') || { enabled:false, auto_execute:false, threshold:85, risk_pct:1, min_score:9 };
   res.json(s);
 });
 
 app.post('/api/autotrade/settings', (req, res) => {
-  const { enabled, auto_execute, threshold, risk_pct, max_per_day, min_score } = req.body;
+  const { enabled, auto_execute, threshold, risk_pct, min_score } = req.body;
   const prev = getStorageValue('autotrade_settings') || {};
   const s = {
     enabled:      !!enabled,
     auto_execute: !!auto_execute,
-    threshold:    parseInt(threshold   || 85),
-    risk_pct:     parseFloat(risk_pct  || 1),
-    max_per_day:  parseInt(max_per_day || 3),
-    min_score:    parseInt(min_score   || 9),
+    threshold:    parseInt(threshold  || 85),
+    risk_pct:     parseFloat(risk_pct || 1),
+    min_score:    parseInt(min_score  || 9),
   };
   setStorageValue('autotrade_settings', s);
   writeAudit('SETTINGS_CHANGED', { new: s, prev }, 'WEB_UI');
   const onOff    = s.enabled ? 'ON' : 'OFF';
   const execMode = s.auto_execute ? '⚡ AUTO-EXECUTE (trades fire automatically)' : '👤 MANUAL APPROVAL (Telegram buttons)';
   sendTelegramMsg(
-    `Signal Scanner: ${onOff}\nMode: ${execMode}\nScore filter: ${s.min_score}/12 checks required\nAI threshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nMax/day: ${s.max_per_day}`
+    `Signal Scanner: ${onOff}\nMode: ${execMode}\nScore filter: ${s.min_score}/17 checks required\nAI threshold: ${s.threshold}%\nRisk/trade: ${s.risk_pct}%\nSignals: unlimited (all valid setups)`
   );
   res.json({ ok:true, settings:s });
 });
@@ -4482,7 +4476,7 @@ app.get('/api/autotrade/status', (req, res) => {
   const pending = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='PENDING'`).get();
   const today   = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now')`).get();
   const total   = db.prepare(`SELECT COUNT(*) as c FROM signals`).get();
-  res.json({ enabled:s.enabled, threshold:s.threshold||80, risk_pct:s.risk_pct||1, max_per_day:s.max_per_day||3,
+  res.json({ enabled:s.enabled, threshold:s.threshold||80, risk_pct:s.risk_pct||1,
     pending_signals:pending.c, today_signals:today.c, total_signals:total.c, scanning:autoScanning });
 });
 

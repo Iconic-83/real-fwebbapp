@@ -1079,60 +1079,57 @@ function Opportunities({ prices, keys, addAlert }) {
   );
 }
 
-// ─── CHARTS ───────────────────────────────────────────────────────────────────
-function Charts({ keys }) {
-  const [pair, setPair]     = useState("EUR_USD");
-  const [tf, setTf]         = useState("H1");
-  const [candles, setCandles] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const cvs = useRef(null);
+// ─── CHARTS — real TradingView widget (own data feed, no OANDA key needed) ────
+const TV_INTERVAL = { M5:"5", M15:"15", H1:"60", H4:"240", D:"D" };
+
+function TradingViewWidget({ symbol, interval }) {
+  const containerRef = useRef(null);
+  const elId = useRef(`tv_${Math.random().toString(36).slice(2)}`);
 
   useEffect(() => {
-    if (!keys.oanda_key || !keys.oanda_account) { setCandles([]); return; }
-    setLoading(true);
-    oandaFetch(`/v3/instruments/${pair}/candles?count=80&granularity=${tf || "H1"}`)
-      .then(d => { setCandles(d.candles || []); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, [pair, tf, keys.oanda_key, keys.oanda_account]);
+    let cancelled = false;
+    function render() {
+      if (cancelled || !containerRef.current || !window.TradingView) return;
+      containerRef.current.innerHTML = "";
+      new window.TradingView.widget({
+        autosize: true,
+        symbol,
+        interval,
+        timezone: "Etc/UTC",
+        theme: "dark",
+        style: "1",
+        locale: "en",
+        toolbar_bg: "#0b0b1f",
+        enable_publishing: false,
+        save_image: false,
+        hide_side_toolbar: false,
+        studies: ["MAExp@tv-basicstudies"],
+        container_id: elId.current,
+      });
+    }
+    if (window.TradingView) {
+      render();
+    } else {
+      let script = document.getElementById("tradingview-widget-script");
+      if (!script) {
+        script = document.createElement("script");
+        script.id = "tradingview-widget-script";
+        script.src = "https://s3.tradingview.com/tv.js";
+        script.async = true;
+        document.body.appendChild(script);
+      }
+      script.addEventListener("load", render);
+    }
+    return () => { cancelled = true; };
+  }, [symbol, interval]);
 
-  useEffect(() => {
-    const c = cvs.current;
-    if (!c || candles.length < 2) return;
-    const w = c.width, h = c.height;
-    const ctx = c.getContext("2d");
-    ctx.clearRect(0, 0, w, h);
-    const data = candles.map(x => ({ o:parseFloat(x.mid.o), h:parseFloat(x.mid.h), l:parseFloat(x.mid.l), c:parseFloat(x.mid.c) }));
-    const mn = Math.min(...data.map(d => d.l)), mx = Math.max(...data.map(d => d.h));
-    const toY = v => h * 0.05 + (h * 0.88) * (1 - (v - mn) / (mx - mn || 1));
+  return <div id={elId.current} ref={containerRef} style={{ width: "100%", height: "100%" }} />;
+}
 
-    ctx.strokeStyle = "#0d0d1e"; ctx.lineWidth = 1;
-    for (let i = 0; i <= 6; i++) { ctx.beginPath(); ctx.moveTo(50, (h/6)*i); ctx.lineTo(w, (h/6)*i); ctx.stroke(); }
-    for (let i = 1; i <= 10; i++) { ctx.beginPath(); ctx.moveTo(50+(w-50)/10*i, 0); ctx.lineTo(50+(w-50)/10*i, h); ctx.stroke(); }
-
-    ctx.fillStyle = "#2a2a4a"; ctx.font = "9px monospace"; ctx.textAlign = "right";
-    for (let i = 0; i <= 4; i++) { const pv = mn + (mx-mn)*i/4; ctx.fillText(pv.toFixed(pair==="XAU_USD"?2:5), 46, h*0.05+(h*0.88)*(1-i/4)+3); }
-
-    const cw = Math.max(2, (w-50)/data.length*0.65);
-    data.forEach((d, i) => {
-      const x = 50 + (i/data.length)*(w-50) + (w-50)/data.length*0.15;
-      const bull = d.c >= d.o;
-      ctx.strokeStyle = bull ? "#00ff88" : "#ff4466"; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(x+cw/2, toY(d.h)); ctx.lineTo(x+cw/2, toY(d.l)); ctx.stroke();
-      const by = Math.min(toY(d.o), toY(d.c)), bh = Math.max(1, Math.abs(toY(d.o)-toY(d.c)));
-      ctx.fillStyle = bull ? "#003322" : "#330011"; ctx.fillRect(x, by, cw, bh);
-      ctx.strokeRect(x, by, cw, bh);
-    });
-
-    ctx.strokeStyle = "#ffcc00"; ctx.lineWidth = 1.5; ctx.beginPath();
-    let ema9 = data[0].c;
-    data.forEach((d, i) => { ema9 = ema9*0.8 + d.c*0.2; const x = 50+(i/data.length)*(w-50)+(w-50)/data.length*0.5; i===0?ctx.moveTo(x,toY(ema9)):ctx.lineTo(x,toY(ema9)); });
-    ctx.stroke();
-
-    ctx.strokeStyle = "#ff88ff"; ctx.lineWidth = 1; ctx.setLineDash([3,3]); ctx.beginPath();
-    let ema21 = data[0].c;
-    data.forEach((d, i) => { ema21 = ema21*0.909 + d.c*0.091; const x = 50+(i/data.length)*(w-50)+(w-50)/data.length*0.5; i===0?ctx.moveTo(x,toY(ema21)):ctx.lineTo(x,toY(ema21)); });
-    ctx.stroke(); ctx.setLineDash([]);
-  }, [candles]);
+function Charts() {
+  const [pair, setPair] = useState("EUR_USD");
+  const [tf, setTf]     = useState("H1");
+  const tvSymbol = `OANDA:${pair.replace("_", "")}`;
 
   return (
     <div>
@@ -1145,16 +1142,10 @@ function Charts({ keys }) {
             {t}
           </button>
         ))}
-        <div style={{ marginLeft:"auto", fontSize:10, color:"#2a2a4a", display:"flex", alignItems:"center", gap:9 }}>
-          <span style={{ color:"#ffcc00" }}>─</span>EMA9 <span style={{ color:"#ff88ff" }}>┄</span>EMA21
-          <span style={{ color:"#00ff88" }}>█</span>Bull <span style={{ color:"#ff4466" }}>█</span>Bear
-        </div>
+        <div style={{ marginLeft:"auto", fontSize:10, color:"#2a2a4a" }}>Live TradingView chart — {tvSymbol}</div>
       </div>
-      <div style={{ ...S.card, padding:0, overflow:"hidden" }}>
-        {!keys.oanda_key && <div style={{ height:400, display:"flex", alignItems:"center", justifyContent:"center", color:"#2a2a4a", fontSize:13 }}>Add OANDA key in Settings to load real candles</div>}
-        {keys.oanda_key && loading && <div style={{ height:400, display:"flex", alignItems:"center", justifyContent:"center", color:"#2a2a4a" }}>Loading candles from OANDA...</div>}
-        {keys.oanda_key && !loading && candles.length === 0 && <div style={{ height:400, display:"flex", alignItems:"center", justifyContent:"center", color:"#2a2a4a" }}>No candle data returned</div>}
-        <canvas ref={cvs} width={960} height={400} style={{ width:"100%", height:400, display:candles.length>0?"block":"none" }} />
+      <div style={{ ...S.card, padding:0, overflow:"hidden", height:560 }}>
+        <TradingViewWidget symbol={tvSymbol} interval={TV_INTERVAL[tf]} />
       </div>
     </div>
   );
@@ -2707,7 +2698,7 @@ export default function App() {
     dashboard:    <Dashboard account={account} trades={trades} prices={prices} prevPrices={prevPrices} oConn={oConn} tConn={tConn} aiReady={aiReady} priceAlerts={priceAlerts} onSetAlert={handleSetAlert} />,
     opportunities:<Opportunities prices={prices} keys={keys} addAlert={addAlert} />,
     trading:      <LiveTrading account={account} trades={trades} prices={prices} keys={keys} addAlert={addAlert} refresh={refresh} />,
-    charts:       <Charts keys={keys} />,
+    charts:       <Charts />,
     journal:      <Journal />,
     news:         <News />,
     alerts:       <Alerts alerts={sessionAlerts} keys={keys} priceAlerts={priceAlerts} setPriceAlerts={setPriceAlerts} />,

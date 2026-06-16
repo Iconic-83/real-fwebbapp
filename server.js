@@ -90,6 +90,135 @@ function getApiKeys() {
 }
 function invalidateKeysCache() { _keysCache = null; }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// DATABASE SCHEMA — every CREATE TABLE / migration / index runs here, before
+// any code below this point prepares statements against them. Previously some
+// of these were scattered ~2800 lines further down, after several top-level
+// db.prepare() calls that referenced 'signals' — so a brand-new deploy with no
+// existing data/precisiontrader.db crashed instantly with "no such table:
+// signals". Keep all schema setup consolidated in this one block.
+// ═════════════════════════════════════════════════════════════════════════════
+db.exec(`
+  CREATE TABLE IF NOT EXISTS daily_pnl (
+    date TEXT PRIMARY KEY,
+    realized_pl REAL NOT NULL DEFAULT 0,
+    trade_count INTEGER NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// signals table — every signal (pending, approved, rejected, executed, failed)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS signals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    actioned_at    DATETIME,
+    pair           TEXT NOT NULL,
+    direction      TEXT NOT NULL,
+    confidence     INTEGER NOT NULL,
+    entry_price    REAL,
+    stop_loss      REAL,
+    take_profit    REAL,
+    sl_pips        REAL,
+    tp_pips        REAL,
+    units          INTEGER,
+    risk_pct       REAL,
+    risk_amount    REAL,
+    lots           TEXT,
+    status         TEXT DEFAULT 'PENDING',
+    oanda_order_id TEXT,
+    trade_id       TEXT,
+    filled_price   REAL,
+    realized_pl    REAL,
+    exit_price     REAL,
+    exit_reason    TEXT,
+    closed_at      DATETIME,
+    duration_mins  INTEGER,
+    actual_pips    REAL,
+    analysis       TEXT,
+    ema_align      TEXT,
+    rsi            REAL,
+    h4_trend       TEXT,
+    tg_message_id  INTEGER
+  );
+`);
+
+// Keep old table for compat (ignore if already exists)
+db.exec(`CREATE TABLE IF NOT EXISTS auto_trades (id INTEGER PRIMARY KEY, timestamp DATETIME, pair TEXT, direction TEXT, confidence INTEGER, units INTEGER, entry_price REAL, stop_loss REAL, take_profit REAL, oanda_order_id TEXT, status TEXT, pl REAL, notes TEXT);`);
+
+// ── Execution fill quality log ────────────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS execution_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    signal_id       INTEGER,
+    pair            TEXT,
+    session         TEXT,
+    expected_px     REAL,
+    actual_px       REAL,
+    slippage_pips   REAL,
+    slippage_dir    TEXT,
+    spread_at_entry REAL,
+    latency_ms      INTEGER,
+    oanda_trade_id  TEXT,
+    partial_closed  INTEGER DEFAULT 0
+  );
+`);
+// Migrate older execution_log tables that lack the new columns
+['oanda_trade_id TEXT', 'partial_closed INTEGER DEFAULT 0'].forEach(col => {
+  try { db.exec(`ALTER TABLE execution_log ADD COLUMN ${col}`); } catch {}
+});
+
+// Migrate existing DBs — add columns that were added after initial deploy
+[
+  'trade_id TEXT',
+  'exit_price REAL',
+  'exit_reason TEXT',
+  'closed_at DATETIME',
+  'duration_mins INTEGER',
+  'actual_pips REAL',
+].forEach(col => { try { db.exec(`ALTER TABLE signals ADD COLUMN ${col}`); } catch {} });
+
+// ── Risk events log — every governor block or circuit breaker fire ───────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS risk_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    event_type   TEXT NOT NULL,
+    detail       TEXT,
+    blocked_pair TEXT,
+    action       TEXT
+  );
+`);
+
+// ── Trade psychology (mood + behavior tags logged per journal note) ──────────
+['stress INTEGER', 'confidence INTEGER', 'fear INTEGER', 'greed INTEGER',
+ 'followed_plan INTEGER', 'mistake_tags TEXT'].forEach(col => {
+  try { db.exec(`ALTER TABLE journal_notes ADD COLUMN ${col}`); } catch {}
+});
+
+// ── AI Coach reports — generated reviews of trade history + psychology data ──
+db.exec(`
+  CREATE TABLE IF NOT EXISTS coach_reports (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    trade_count INTEGER,
+    win_rate    REAL,
+    report      TEXT,
+    stats_json  TEXT
+  );
+`);
+
+// ── Indexes — fast lookups on large signals table ─────────────────────────────
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_signals_status     ON signals(status);
+  CREATE INDEX IF NOT EXISTS idx_signals_created    ON signals(created_at);
+  CREATE INDEX IF NOT EXISTS idx_signals_closed     ON signals(closed_at);
+  CREATE INDEX IF NOT EXISTS idx_signals_trade_id   ON signals(trade_id);
+  CREATE INDEX IF NOT EXISTS idx_risk_events_date   ON risk_events(created_at);
+  CREATE INDEX IF NOT EXISTS idx_daily_pnl_date     ON daily_pnl(date);
+`);
+
 // OANDA instrument map (label → OANDA format)
 const LABEL_TO_OANDA = {
   // Major USD pairs
@@ -2648,16 +2777,7 @@ app.post('/api/trade/size', async (req, res) => {
 // Tracks daily realized P&L — warns and can block trades if limit hit
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Ensure daily_pnl table exists
-db.exec(`
-  CREATE TABLE IF NOT EXISTS daily_pnl (
-    date TEXT PRIMARY KEY,
-    realized_pl REAL NOT NULL DEFAULT 0,
-    trade_count INTEGER NOT NULL DEFAULT 0,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-
+// daily_pnl table is created in the DATABASE SCHEMA block near the top of this file
 function getTodayDate() {
   return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 }
@@ -2864,99 +2984,9 @@ app.post('/api/telegram/setup', async (req, res) => {
 //       User taps ❌ REJECT  → signal logged as rejected, not traded
 // ═════════════════════════════════════════════════════════════════════════════
 
-// signals table — every signal (pending, approved, rejected, executed, failed)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS signals (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-    actioned_at    DATETIME,
-    pair           TEXT NOT NULL,
-    direction      TEXT NOT NULL,
-    confidence     INTEGER NOT NULL,
-    entry_price    REAL,
-    stop_loss      REAL,
-    take_profit    REAL,
-    sl_pips        REAL,
-    tp_pips        REAL,
-    units          INTEGER,
-    risk_pct       REAL,
-    risk_amount    REAL,
-    lots           TEXT,
-    status         TEXT DEFAULT 'PENDING',
-    oanda_order_id TEXT,
-    trade_id       TEXT,
-    filled_price   REAL,
-    realized_pl    REAL,
-    exit_price     REAL,
-    exit_reason    TEXT,
-    closed_at      DATETIME,
-    duration_mins  INTEGER,
-    actual_pips    REAL,
-    analysis       TEXT,
-    ema_align      TEXT,
-    rsi            REAL,
-    h4_trend       TEXT,
-    tg_message_id  INTEGER
-  );
-`);
-
-// Keep old table for compat (ignore if already exists)
-db.exec(`CREATE TABLE IF NOT EXISTS auto_trades (id INTEGER PRIMARY KEY, timestamp DATETIME, pair TEXT, direction TEXT, confidence INTEGER, units INTEGER, entry_price REAL, stop_loss REAL, take_profit REAL, oanda_order_id TEXT, status TEXT, pl REAL, notes TEXT);`);
-
-// ── Execution fill quality log ────────────────────────────────────────────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS execution_log (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-    signal_id       INTEGER,
-    pair            TEXT,
-    session         TEXT,
-    expected_px     REAL,
-    actual_px       REAL,
-    slippage_pips   REAL,
-    slippage_dir    TEXT,
-    spread_at_entry REAL,
-    latency_ms      INTEGER,
-    oanda_trade_id  TEXT,
-    partial_closed  INTEGER DEFAULT 0
-  );
-`);
-// Migrate older execution_log tables that lack the new columns
-['oanda_trade_id TEXT', 'partial_closed INTEGER DEFAULT 0'].forEach(col => {
-  try { db.exec(`ALTER TABLE execution_log ADD COLUMN ${col}`); } catch {}
-});
-
-// Migrate existing DBs — add columns that were added after initial deploy
-[
-  'trade_id TEXT',
-  'exit_price REAL',
-  'exit_reason TEXT',
-  'closed_at DATETIME',
-  'duration_mins INTEGER',
-  'actual_pips REAL',
-].forEach(col => { try { db.exec(`ALTER TABLE signals ADD COLUMN ${col}`); } catch {} });
-
-// ── Risk events log — every governor block or circuit breaker fire ───────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS risk_events (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
-    event_type   TEXT NOT NULL,
-    detail       TEXT,
-    blocked_pair TEXT,
-    action       TEXT
-  );
-`);
-
-// ── Indexes — fast lookups on large signals table ─────────────────────────────
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_signals_status     ON signals(status);
-  CREATE INDEX IF NOT EXISTS idx_signals_created    ON signals(created_at);
-  CREATE INDEX IF NOT EXISTS idx_signals_closed     ON signals(closed_at);
-  CREATE INDEX IF NOT EXISTS idx_signals_trade_id   ON signals(trade_id);
-  CREATE INDEX IF NOT EXISTS idx_risk_events_date   ON risk_events(created_at);
-  CREATE INDEX IF NOT EXISTS idx_daily_pnl_date     ON daily_pnl(date);
-`);
+// signals, auto_trades, execution_log, risk_events, journal_notes migrations,
+// coach_reports and all indexes are created in the DATABASE SCHEMA block near
+// the top of this file (before anything below could prepare statements against them)
 
 // ── Frequently-used prepared statements (compiled once) ───────────────────────
 const _stmtDailyPL = db.prepare('SELECT * FROM daily_pnl WHERE date = ?');
@@ -4925,24 +4955,24 @@ app.post('/api/backtest', async (req, res) => {
 // TRADE JOURNAL API
 // ═════════════════════════════════════════════════════════════════════════════
 
-// GET /api/journal — closed trades from OANDA merged with our signals, plus stats
-app.get('/api/journal', async (req, res) => {
+// Shared by /api/journal and /api/ai/coach — closed OANDA trades merged with
+// our signals + journal notes (including psychology data), plus stats
+async function buildJournalData(count = 200) {
   const keys = getApiKeys();
-  if (!keys.oanda_key || !keys.oanda_account) return res.status(400).json({ error: 'OANDA not configured' });
-  try {
-    const count = parseInt(req.query.count || 200);
-    const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=${count}`);
-    const rawTrades = r?.trades || [];
+  if (!keys.oanda_key || !keys.oanda_account) return null;
 
-    // Pull our signals for this account (to merge confidence, score)
-    const ourSignals = db.prepare(`SELECT * FROM signals WHERE status='EXECUTED' ORDER BY created_at DESC`).all();
-    const sigMap = {};
-    ourSignals.forEach(s => { if (s.oanda_order_id) sigMap[s.oanda_order_id] = s; });
+  const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=${count}`);
+  const rawTrades = r?.trades || [];
 
-    // Pull notes
-    const noteRows = db.prepare('SELECT * FROM journal_notes').all();
-    const noteMap = {};
-    noteRows.forEach(n => { noteMap[n.trade_id] = n.note; });
+  // Pull our signals for this account (to merge confidence, score)
+  const ourSignals = db.prepare(`SELECT * FROM signals WHERE status='EXECUTED' ORDER BY created_at DESC`).all();
+  const sigMap = {};
+  ourSignals.forEach(s => { if (s.oanda_order_id) sigMap[s.oanda_order_id] = s; });
+
+  // Pull notes + psychology data
+  const noteRows = db.prepare('SELECT * FROM journal_notes').all();
+  const noteMap = {};
+  noteRows.forEach(n => { noteMap[n.trade_id] = n; });
 
     const trades = rawTrades.map(t => {
       const sig      = sigMap[t.id] || null;
@@ -4961,6 +4991,7 @@ app.get('/api/journal', async (req, res) => {
       const result   = pl > 0.01 ? 'WIN' : pl < -0.01 ? 'LOSS' : 'BE';
       const priceDiff = Math.abs(close - entry);
       const pips     = (priceDiff / pipSize * (pl >= 0 ? 1 : -1)).toFixed(1);
+      const noteRow  = noteMap[t.id] || null;
 
       return {
         id:           t.id,
@@ -4979,7 +5010,15 @@ app.get('/api/journal', async (req, res) => {
         result:       result,
         confidence:   sig?.confidence || null,
         signal_id:    sig?.id || null,
-        note:         noteMap[t.id] || '',
+        note:         noteRow?.note || '',
+        psych: noteRow ? {
+          stress:       noteRow.stress,
+          confidence:   noteRow.confidence,
+          fear:         noteRow.fear,
+          greed:        noteRow.greed,
+          followedPlan: noteRow.followed_plan === 1 ? true : noteRow.followed_plan === 0 ? false : null,
+          mistakeTags:  noteRow.mistake_tags ? JSON.parse(noteRow.mistake_tags) : [],
+        } : null,
       };
     });
 
@@ -5036,7 +5075,7 @@ app.get('/api/journal', async (req, res) => {
       else break;
     }
 
-    res.json({
+    return {
       trades,
       equityCurve,
       monthlyPL,
@@ -5055,22 +5094,168 @@ app.get('/api/journal', async (req, res) => {
         maxDD:      maxDD.toFixed(2),
         streak,
       },
-    });
+    };
+}
+
+// GET /api/journal — closed trades from OANDA merged with our signals, plus stats
+app.get('/api/journal', async (req, res) => {
+  try {
+    const data = await buildJournalData(parseInt(req.query.count || 200));
+    if (!data) return res.status(400).json({ error: 'OANDA not configured' });
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// POST /api/journal/note — save a note for a trade
+// POST /api/journal/note — save a note + psychology data for a trade
 app.post('/api/journal/note', (req, res) => {
-  const { tradeId, note } = req.body;
+  const { tradeId, note, stress, confidence, fear, greed, followedPlan, mistakeTags } = req.body;
   if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
   db.prepare(`
-    INSERT INTO journal_notes (trade_id, note, updated_at)
-    VALUES (?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(trade_id) DO UPDATE SET note=excluded.note, updated_at=CURRENT_TIMESTAMP
-  `).run(String(tradeId), note || '');
+    INSERT INTO journal_notes (trade_id, note, stress, confidence, fear, greed, followed_plan, mistake_tags, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(trade_id) DO UPDATE SET
+      note=excluded.note, stress=excluded.stress, confidence=excluded.confidence,
+      fear=excluded.fear, greed=excluded.greed, followed_plan=excluded.followed_plan,
+      mistake_tags=excluded.mistake_tags, updated_at=CURRENT_TIMESTAMP
+  `).run(
+    String(tradeId), note || '',
+    stress ?? null, confidence ?? null, fear ?? null, greed ?? null,
+    followedPlan === true ? 1 : followedPlan === false ? 0 : null,
+    mistakeTags && mistakeTags.length ? JSON.stringify(mistakeTags) : null
+  );
   res.json({ ok: true });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AI COACH — psychology-aware performance review (GPT-4o reasons over
+// pre-aggregated stats, never raw trade dumps — same validator-not-oracle
+// pattern used by the scan engine's AI layer)
+// ═════════════════════════════════════════════════════════════════════════════
+function summarizeCoachInput(trades) {
+  const tagged = trades.filter(t => t.psych && (
+    t.psych.stress != null || t.psych.followedPlan !== null || (t.psych.mistakeTags || []).length
+  ));
+  const won  = trades.filter(t => t.result === 'WIN');
+  const lost = trades.filter(t => t.result === 'LOSS');
+
+  const avg = (arr, pick) => {
+    const vals = arr.map(pick).filter(v => v != null);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  };
+
+  const planFollowed = tagged.filter(t => t.psych.followedPlan === true);
+  const planBroken   = tagged.filter(t => t.psych.followedPlan === false);
+
+  const tagStats = {};
+  tagged.forEach(t => {
+    (t.psych.mistakeTags || []).forEach(tag => {
+      if (!tagStats[tag]) tagStats[tag] = { count: 0, wins: 0, pl: 0 };
+      tagStats[tag].count++;
+      if (t.result === 'WIN') tagStats[tag].wins++;
+      tagStats[tag].pl += t.pl;
+    });
+  });
+
+  return {
+    sampleSize: trades.length,
+    psychSampleSize: tagged.length,
+    avgStressWin:      avg(won,  t => t.psych?.stress),
+    avgStressLoss:     avg(lost, t => t.psych?.stress),
+    avgConfidenceWin:  avg(won,  t => t.psych?.confidence),
+    avgConfidenceLoss: avg(lost, t => t.psych?.confidence),
+    avgFearWin:        avg(won,  t => t.psych?.fear),
+    avgFearLoss:       avg(lost, t => t.psych?.fear),
+    avgGreedWin:       avg(won,  t => t.psych?.greed),
+    avgGreedLoss:      avg(lost, t => t.psych?.greed),
+    planFollowedWinRate: planFollowed.length ? planFollowed.filter(t => t.result === 'WIN').length / planFollowed.length : null,
+    planBrokenWinRate:   planBroken.length   ? planBroken.filter(t => t.result === 'WIN').length   / planBroken.length   : null,
+    tagStats,
+  };
+}
+
+app.post('/api/ai/coach', async (req, res) => {
+  const keys = getApiKeys();
+  if (!keys.openai_key) return res.status(400).json({ error: 'OpenAI key not configured' });
+
+  try {
+    const count = parseInt(req.body?.count || 50);
+    const data = await buildJournalData(count);
+    if (!data) return res.status(400).json({ error: 'OANDA not configured' });
+    if (data.trades.length < 5) {
+      return res.status(400).json({ error: `Need at least 5 closed trades to generate a coaching report — you have ${data.trades.length}.` });
+    }
+
+    const summary = summarizeCoachInput(data.trades);
+    const recentNotes = data.trades.filter(t => t.note).slice(-10)
+      .map(t => `- ${t.pair} ${t.direction} ${t.result} (${t.pl >= 0 ? '+' : ''}${t.pl.toFixed(2)}): "${t.note}"`)
+      .join('\n') || 'None logged';
+
+    const tagLines = Object.entries(summary.tagStats)
+      .map(([tag, s]) => `  ${tag}: ${s.count} trades, ${Math.round(s.wins / s.count * 100)}% win rate, $${s.pl.toFixed(2)} total P&L`)
+      .join('\n') || '  No mistake tags logged yet';
+
+    const prompt = `You are reviewing a forex trader's recent performance.
+
+PERFORMANCE SUMMARY (last ${data.trades.length} closed trades):
+Win rate: ${data.stats.winRate}% | Total P&L: $${data.stats.totalPL} | Avg R:R: ${data.stats.avgRR}
+Max drawdown: $${data.stats.maxDD} | Current streak: ${data.stats.streak}
+
+PSYCHOLOGY DATA (${summary.psychSampleSize} of ${summary.sampleSize} trades logged with mood ratings, 1-5 scale):
+Avg stress — wins: ${summary.avgStressWin?.toFixed(1) ?? 'n/a'} | losses: ${summary.avgStressLoss?.toFixed(1) ?? 'n/a'}
+Avg confidence — wins: ${summary.avgConfidenceWin?.toFixed(1) ?? 'n/a'} | losses: ${summary.avgConfidenceLoss?.toFixed(1) ?? 'n/a'}
+Avg fear — wins: ${summary.avgFearWin?.toFixed(1) ?? 'n/a'} | losses: ${summary.avgFearLoss?.toFixed(1) ?? 'n/a'}
+Avg greed — wins: ${summary.avgGreedWin?.toFixed(1) ?? 'n/a'} | losses: ${summary.avgGreedLoss?.toFixed(1) ?? 'n/a'}
+Win rate when plan followed: ${summary.planFollowedWinRate != null ? Math.round(summary.planFollowedWinRate * 100) + '%' : 'n/a'}
+Win rate when plan broken: ${summary.planBrokenWinRate != null ? Math.round(summary.planBrokenWinRate * 100) + '%' : 'n/a'}
+
+MISTAKE TAGS LOGGED:
+${tagLines}
+
+RECENT JOURNAL NOTES:
+${recentNotes}
+
+Based ONLY on this data, write a coaching report with these exact sections:
+1. PATTERNS NOTICED — 2-3 bullets connecting psychology/behavior to outcomes, citing the actual numbers above. If sample size is too small for a pattern, say so explicitly rather than inventing one.
+2. BIGGEST RISK HABIT — the single most costly behavioral pattern, with its $ impact if calculable.
+3. WHAT'S WORKING — 1-2 bullets on what to keep doing.
+4. THREE RECOMMENDATIONS — specific, actionable, tied to the data.
+5. ONE-LINE VERDICT — a single blunt sentence.
+
+Do not give generic trading advice unrelated to this data. Do not be falsely encouraging — if the data shows a real problem, say so plainly.`;
+
+    const openai = new OpenAI({ apiKey: keys.openai_key });
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      max_tokens: 900,
+      temperature: 0.4,
+      messages: [
+        { role: 'system', content: 'You are a blunt, data-driven trading psychology coach. You only reason from the numbers given to you — never invent statistics.' },
+        { role: 'user', content: prompt },
+      ],
+    });
+
+    const report = completion.choices[0].message.content;
+
+    db.prepare(`
+      INSERT INTO coach_reports (trade_count, win_rate, report, stats_json)
+      VALUES (?, ?, ?, ?)
+    `).run(data.trades.length, data.stats.winRate, report, JSON.stringify(summary));
+
+    res.json({ report, summary, stats: data.stats });
+  } catch (e) {
+    res.status(500).json({ error: 'Coach error: ' + (e.response?.data?.error?.message || e.message) });
+  }
+});
+
+app.get('/api/ai/coach/history', (req, res) => {
+  const rows = db.prepare(`
+    SELECT id, created_at, trade_count, win_rate, report, stats_json
+    FROM coach_reports ORDER BY created_at DESC LIMIT 20
+  `).all();
+  const reports = rows.map(({ stats_json, ...r }) => ({ ...r, summary: stats_json ? JSON.parse(stats_json) : null }));
+  res.json({ reports });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

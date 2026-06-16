@@ -30,9 +30,17 @@ const NAV = [
   { id:"news",          label:"News Calendar",  icon:"◉" },
   { id:"alerts",        label:"Alerts",         icon:"◬" },
   { id:"ai",            label:"AI Insights",    icon:"✦" },
+  { id:"coach",         label:"AI Coach",       icon:"◐" },
   { id:"analytics",     label:"Analytics",      icon:"▦" },
   { id:"backtest",      label:"Backtest",       icon:"⏪" },
   { id:"settings",      label:"Settings",       icon:"⊙" },
+];
+
+// Behavior tags a trader can attach to a journal entry — drives the AI Coach's
+// per-mistake win-rate breakdown
+const MISTAKE_TAGS = [
+  "FOMO", "REVENGE_TRADE", "MOVED_SL", "OVERSIZED",
+  "NO_PLAN", "CHASED_ENTRY", "IGNORED_NEWS", "EARLY_EXIT", "HELD_TOO_LONG",
 ];
 
 // ─── FIX 5: Auth token — sent on every API call if configured ────────────────
@@ -132,6 +140,21 @@ async function aiAnalyze(pairLabel, price, systemContext = "") {
 async function fetchNewsCalendar() {
   const r = await apiFetch("/api/news");
   if (!r.ok) throw new Error("News fetch failed");
+  return r.json();
+}
+
+async function aiCoach(count = 50) {
+  const r = await apiFetch("/api/ai/coach", {
+    method: "POST",
+    body: JSON.stringify({ count }),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d; // { report, summary, stats }
+}
+async function fetchCoachHistory() {
+  const r = await apiFetch("/api/ai/coach/history");
+  if (!r.ok) throw new Error("Failed to load coach history");
   return r.json();
 }
 
@@ -1194,18 +1217,21 @@ function MonthlyBars({ data }) {
 }
 
 // ─── JOURNAL ──────────────────────────────────────────────────────────────────
+const EMPTY_PSYCH = { stress: null, confidence: null, fear: null, greed: null, followedPlan: null, mistakeTags: [] };
+
 function Journal() {
   const [data, setData]     = useState(null);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState("ALL");
   const [editId, setEditId] = useState(null);
   const [editText, setEditText] = useState("");
+  const [editPsych, setEditPsych] = useState(EMPTY_PSYCH);
   const [saving, setSaving] = useState(false);
 
   const load = async () => {
     setLoading(true);
     try {
-      const r = await fetch('/api/journal?count=200');
+      const r = await apiFetch('/api/journal?count=200');
       if (r.ok) setData(await r.json());
     } catch {}
     setLoading(false);
@@ -1215,14 +1241,13 @@ function Journal() {
 
   const saveNote = async (tradeId) => {
     setSaving(true);
-    await fetch('/api/journal/note', {
+    await apiFetch('/api/journal/note', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tradeId, note: editText }),
+      body: JSON.stringify({ tradeId, note: editText, ...editPsych }),
     });
     setData(prev => ({
       ...prev,
-      trades: prev.trades.map(t => t.id === tradeId ? { ...t, note: editText } : t),
+      trades: prev.trades.map(t => t.id === tradeId ? { ...t, note: editText, psych: editPsych } : t),
     }));
     setEditId(null);
     setSaving(false);
@@ -1337,7 +1362,7 @@ function Journal() {
                 <span style={{ fontSize:10, color:"#2a2a4a", flex:1 }}>
                   {t.openTime?.slice(5)} → {t.closeTime?.slice(5)}
                 </span>
-                <button onClick={() => { setEditId(isEdit ? null : t.id); setEditText(t.note); }}
+                <button onClick={() => { setEditId(isEdit ? null : t.id); setEditText(t.note); setEditPsych(t.psych || EMPTY_PSYCH); }}
                   style={{ ...S.btn, padding:"3px 9px", background:"transparent", border:"1px solid #13132b", color:"#333", fontSize:9 }}>
                   {t.note ? "Edit" : "+ Note"}
                 </button>
@@ -1356,21 +1381,82 @@ function Journal() {
                   {t.note}
                 </div>
               )}
-              {/* Note edit */}
+              {/* Psychology badges (display mode) */}
+              {!isEdit && t.psych && (t.psych.stress != null || t.psych.followedPlan !== null || (t.psych.mistakeTags||[]).length > 0) && (
+                <div style={{ display:"flex", gap:5, marginTop:7, flexWrap:"wrap" }}>
+                  {t.psych.stress     != null && <span style={{ ...S.badge, fontSize:9, color:"#ff8844" }}>Stress {t.psych.stress}/5</span>}
+                  {t.psych.confidence != null && <span style={{ ...S.badge, fontSize:9, color:"#00ccff" }}>Conf {t.psych.confidence}/5</span>}
+                  {t.psych.fear       != null && <span style={{ ...S.badge, fontSize:9, color:"#ff4466" }}>Fear {t.psych.fear}/5</span>}
+                  {t.psych.greed      != null && <span style={{ ...S.badge, fontSize:9, color:"#ffcc00" }}>Greed {t.psych.greed}/5</span>}
+                  {t.psych.followedPlan === true  && <span style={{ ...S.badge, fontSize:9, color:"#00ff88" }}>Followed Plan</span>}
+                  {t.psych.followedPlan === false && <span style={{ ...S.badge, fontSize:9, color:"#ff4466" }}>Broke Plan</span>}
+                  {(t.psych.mistakeTags||[]).map(tag => (
+                    <span key={tag} style={{ ...S.badge, fontSize:9, color:"#ffcc00", background:"#332200" }}>{tag.replace(/_/g," ")}</span>
+                  ))}
+                </div>
+              )}
+              {/* Note + psychology edit */}
               {isEdit && (
-                <div style={{ marginTop:9, display:"flex", gap:8 }}>
-                  <textarea value={editText} onChange={e => setEditText(e.target.value)} rows={2}
-                    style={{ ...S.inp, flex:1, resize:"vertical", fontSize:11 }}
-                    placeholder="Notes, rationale, lessons learned..." />
-                  <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
-                    <button onClick={() => saveNote(t.id)} disabled={saving}
-                      style={{ ...S.btn, padding:"6px 13px", color:"#00ff88", border:"1px solid #00ff8833", background:"#003322", fontSize:10 }}>
-                      {saving ? "..." : "Save"}
-                    </button>
-                    <button onClick={() => setEditId(null)}
-                      style={{ ...S.btn, padding:"6px 13px", color:"#555", border:"1px solid #13132b", background:"transparent", fontSize:10 }}>
-                      Cancel
-                    </button>
+                <div style={{ marginTop:9, display:"flex", flexDirection:"column", gap:9 }}>
+                  <div style={{ display:"flex", gap:8 }}>
+                    <textarea value={editText} onChange={e => setEditText(e.target.value)} rows={2}
+                      style={{ ...S.inp, flex:1, resize:"vertical", fontSize:11 }}
+                      placeholder="Notes, rationale, lessons learned..." />
+                    <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                      <button onClick={() => saveNote(t.id)} disabled={saving}
+                        style={{ ...S.btn, padding:"6px 13px", color:"#00ff88", border:"1px solid #00ff8833", background:"#003322", fontSize:10 }}>
+                        {saving ? "..." : "Save"}
+                      </button>
+                      <button onClick={() => setEditId(null)}
+                        style={{ ...S.btn, padding:"6px 13px", color:"#555", border:"1px solid #13132b", background:"transparent", fontSize:10 }}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Psychology tracking */}
+                  <div style={{ padding:"9px 10px", background:"#07071a", borderRadius:6, display:"flex", flexDirection:"column", gap:7 }}>
+                    <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1, textTransform:"uppercase" }}>How were you feeling on this trade?</div>
+                    {[["Stress","stress","#ff8844"],["Confidence","confidence","#00ccff"],["Fear","fear","#ff4466"],["Greed","greed","#ffcc00"]].map(([label, key, color]) => (
+                      <div key={key} style={{ display:"flex", alignItems:"center", gap:8, fontSize:10 }}>
+                        <span style={{ color:"#555", minWidth:66 }}>{label}</span>
+                        <input type="range" min={1} max={5} value={editPsych[key] ?? 3}
+                          onChange={e => setEditPsych(p => ({ ...p, [key]: parseInt(e.target.value) }))}
+                          style={{ flex:1 }} />
+                        <span style={{ color, fontFamily:"monospace", minWidth:14, textAlign:"right" }}>{editPsych[key] ?? "—"}</span>
+                      </div>
+                    ))}
+                    <div style={{ display:"flex", gap:6, marginTop:2 }}>
+                      {[["Followed plan", true],["Broke plan", false]].map(([lbl, val]) => {
+                        const active = editPsych.followedPlan === val;
+                        return (
+                          <button key={lbl} onClick={() => setEditPsych(p => ({ ...p, followedPlan: active ? null : val }))}
+                            style={{ ...S.btn, padding:"4px 10px", fontSize:9,
+                              border:`1px solid ${active ? (val ? "#00ff8855" : "#ff446655") : "#13132b"}`,
+                              background:active ? (val ? "#003322" : "#330011") : "transparent",
+                              color:active ? (val ? "#00ff88" : "#ff4466") : "#333" }}>
+                            {lbl}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+                      {MISTAKE_TAGS.map(tag => {
+                        const active = editPsych.mistakeTags.includes(tag);
+                        return (
+                          <button key={tag} onClick={() => setEditPsych(p => ({
+                              ...p,
+                              mistakeTags: active ? p.mistakeTags.filter(x => x !== tag) : [...p.mistakeTags, tag],
+                            }))}
+                            style={{ ...S.btn, padding:"3px 8px", fontSize:8,
+                              border:`1px solid ${active ? "#ffcc0055" : "#13132b"}`,
+                              background:active ? "#332200" : "transparent",
+                              color:active ? "#ffcc00" : "#333" }}>
+                            {tag.replace(/_/g," ")}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
                 </div>
               )}
@@ -1660,6 +1746,126 @@ function AIInsights({ prices }) {
               </div>
             )}
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── AI COACH ─────────────────────────────────────────────────────────────────
+function Coach() {
+  const [count, setCount]         = useState(50);
+  const [loading, setLoading]     = useState(false);
+  const [result, setResult]       = useState(null); // { report, summary, stats }
+  const [error, setError]         = useState(null);
+  const [history, setHistory]     = useState([]);
+
+  const loadHistory = async () => {
+    try { const d = await fetchCoachHistory(); setHistory(d.reports || []); } catch {}
+  };
+  useEffect(() => { loadHistory(); }, []);
+
+  const generate = async () => {
+    setLoading(true); setError(null);
+    try {
+      const d = await aiCoach(count);
+      setResult(d);
+      loadHistory();
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const Stat = ({ label, value, color }) => (
+    <div>{label}: <span style={{ color: color || "#ccc", fontFamily:"monospace" }}>{value}</span></div>
+  );
+
+  return (
+    <div>
+      <div style={S.ph}>AI Coach — Psychology & Performance Review</div>
+      <div style={{ display:"grid", gridTemplateColumns:"260px 1fr", gap:15 }}>
+        <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
+          <div style={S.card}>
+            <div style={S.title}>Generate Report</div>
+            <label style={S.lbl}>Trades to review</label>
+            <select value={count} onChange={e => setCount(parseInt(e.target.value))} style={{ ...S.inp, marginBottom:12 }}>
+              {[20, 30, 50, 100, 200].map(n => <option key={n} value={n}>{n} most recent</option>)}
+            </select>
+            <button onClick={generate} disabled={loading} style={{ ...S.btn, width:"100%", padding:"11px 0", fontWeight:800, letterSpacing:2, background:"#001a2e", color:"#00ccff", border:"1px solid #00ccff55" }}>
+              {loading ? "ANALYZING..." : "✦ RUN COACHING REVIEW"}
+            </button>
+            <div style={{ fontSize:10, color:"#2a2a4a", marginTop:10, lineHeight:1.6 }}>
+              Log mood (stress / confidence / fear / greed) and mistake tags per trade in the Journal tab — the more trades you tag, the sharper this report gets. Needs 5+ closed trades.
+            </div>
+          </div>
+          {history.length > 0 && (
+            <div style={S.card}>
+              <div style={S.title}>Past Reports</div>
+              {history.map(h => (
+                <div key={h.id} onClick={() => setResult({ report: h.report, stats: { winRate: h.win_rate }, summary: h.summary })}
+                  style={{ cursor:"pointer", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
+                  <div style={{ color:"#888" }}>{new Date(h.created_at).toLocaleString()}</div>
+                  <div style={{ color:"#2a2a4a", fontSize:10 }}>{h.trade_count} trades · {h.win_rate}% WR</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
+          <div style={S.card}>
+            {!result && !loading && !error && (
+              <div style={{ height:260, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#1a1a30" }}>
+                <div style={{ fontSize:44, marginBottom:12 }}>✦</div>
+                <div style={{ fontSize:12 }}>Reviews your closed trades + psychology notes</div>
+                <div style={{ fontSize:10, color:"#1a1a30", marginTop:6 }}>GPT-4o reasons only over your real stats — never invents numbers</div>
+              </div>
+            )}
+            {loading && (
+              <div style={{ height:260, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
+                <div style={{ color:"#00ccff", letterSpacing:3, fontSize:12, animation:"pulse 1s infinite" }}>REVIEWING TRADE HISTORY...</div>
+              </div>
+            )}
+            {error && (
+              <div style={{ padding:20, color:"#ff4466", fontSize:13, background:"#1a0808", borderRadius:8, margin:10 }}>⚠ {error}</div>
+            )}
+            {result && (
+              <div>
+                <div style={{ display:"flex", gap:10, alignItems:"center", marginBottom:14, flexWrap:"wrap" }}>
+                  <div style={{ fontSize:10, color:"#00ccff", letterSpacing:2 }}>✦ GPT-4o Coaching Report</div>
+                  {result.stats?.winRate != null && <span style={{ ...S.badge, color:"#ffcc00" }}>{result.stats.winRate}% WR</span>}
+                </div>
+                <div style={{ fontSize:12, color:"#bbb", lineHeight:2, whiteSpace:"pre-wrap", fontFamily:"monospace" }}>{result.report}</div>
+              </div>
+            )}
+          </div>
+
+          {result?.summary && (
+            <div style={{ ...S.card, borderLeft:"3px solid #ffcc00" }}>
+              <div style={S.title}>📊 Behavior Stats Behind This Report</div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"6px 16px", fontSize:11 }}>
+                <Stat label="Sample" value={`${result.summary.sampleSize} trades (${result.summary.psychSampleSize} tagged)`} />
+                <Stat label="Plan followed WR" color="#00ff88" value={result.summary.planFollowedWinRate != null ? `${Math.round(result.summary.planFollowedWinRate * 100)}%` : "—"} />
+                <Stat label="Plan broken WR"   color="#ff4466" value={result.summary.planBrokenWinRate != null ? `${Math.round(result.summary.planBrokenWinRate * 100)}%` : "—"} />
+                <Stat label="Avg stress (win)"  color="#00ff88" value={result.summary.avgStressWin?.toFixed(1) ?? "—"} />
+                <Stat label="Avg stress (loss)" color="#ff4466" value={result.summary.avgStressLoss?.toFixed(1) ?? "—"} />
+                <Stat label="Avg greed (win)"   color="#00ff88" value={result.summary.avgGreedWin?.toFixed(1) ?? "—"} />
+                <Stat label="Avg greed (loss)"  color="#ff4466" value={result.summary.avgGreedLoss?.toFixed(1) ?? "—"} />
+              </div>
+              {Object.keys(result.summary.tagStats || {}).length > 0 && (
+                <div style={{ marginTop:10, display:"flex", flexDirection:"column", gap:4 }}>
+                  <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1, textTransform:"uppercase" }}>Mistake Tag Win Rates</div>
+                  {Object.entries(result.summary.tagStats).map(([tag, s]) => (
+                    <div key={tag} style={{ display:"flex", justifyContent:"space-between", fontSize:11 }}>
+                      <span style={{ color:"#555" }}>{tag.replace(/_/g," ")}</span>
+                      <span style={{ fontFamily:"monospace", color: s.wins/s.count >= 0.5 ? "#00ff88" : "#ff4466" }}>
+                        {Math.round(s.wins / s.count * 100)}% ({s.count}) · {s.pl >= 0 ? "+" : ""}${s.pl.toFixed(2)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -2506,6 +2712,7 @@ export default function App() {
     news:         <News />,
     alerts:       <Alerts alerts={sessionAlerts} keys={keys} priceAlerts={priceAlerts} setPriceAlerts={setPriceAlerts} />,
     ai:           <AIInsights prices={prices} />,
+    coach:        <Coach />,
     analytics:    <Analytics account={account} trades={trades} />,
     backtest:     <Backtest />,
     settings:     <Settings keys={keys} setKeys={k => { setKeys(k); saveKeys(k); }} aiReady={aiReady} />,

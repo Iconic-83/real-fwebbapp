@@ -1,6 +1,6 @@
 #!/bin/bash
 CLOUDFLARED="$HOME/bin/cloudflared"
-URL_FILE="/home/ayuub/Documents/dev/precisiontrader-pro/data/current-url.txt"
+URL_FILE="/home/ayoup/Documents/mvp/lol/iconicfx/real-fwebbapp/data/current-url.txt"
 
 echo "[TUNNEL] Starting Cloudflare tunnel..."
 while true; do

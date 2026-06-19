@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"http://localhost:3001/api/journal?count=200\")",
+      "Bash(node -e ' *)",
+      "Bash(curl -s -X POST http://localhost:3001/api/ai/coach -H \"Content-Type: application/json\" -d '{\"count\":61}')",
+      "Bash(curl -s -X POST http://localhost:3001/api/journal/note -H \"Content-Type: application/json\" -d '{\"tradeId\":\"3234\",\"note\":\"entered late, chased the move down\",\"stress\":4,\"confidence\":2,\"fear\":3,\"greed\":1,\"followedPlan\":false,\"mistakeTags\":[\"CHASED_ENTRY\"]}')",
+      "Bash(curl -s -X POST http://localhost:3001/api/journal/note -H \"Content-Type: application/json\" -d '{\"tradeId\":\"3228\",\"note\":\"revenge trade after the EUR loss\",\"stress\":5,\"confidence\":1,\"fear\":2,\"greed\":4,\"followedPlan\":false,\"mistakeTags\":[\"REVENGE_TRADE\"]}')",
+      "Bash(curl -s -X POST http://localhost:3001/api/journal/note -H \"Content-Type: application/json\" -d '{\"tradeId\":\"3224\",\"note\":\"stuck to the plan, just a normal loss\",\"stress\":2,\"confidence\":4,\"fear\":1,\"greed\":1,\"followedPlan\":true,\"mistakeTags\":[]}')",
+      "Bash(curl -s -X POST http://localhost:3001/api/storage/ptp_keys -H \"Content-Type: application/json\" -d '{\"value\":\"{\\\\\"oanda_key\\\\\":\\\\\"407c456c45c1bb5b65fceebcad7554c3-cfe89ca54c833c2042dc72e651507b57\\\\\",\\\\\"oanda_account\\\\\":\\\\\"101-004-39268525-001\\\\\",\\\\\"openai_key\\\\\":\\\\\"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\\\\\"}\"}')",
+      "Bash(mkdir -p /tmp/shots)",
+      "Bash(curl -s \"http://localhost:3001/api/journal?count=10\")",
+      "Bash(curl -sf http://localhost:5173)",
+      "Bash(node -e \"const db=require\\('./db'\\); console.log\\('journal_notes rows:', db.prepare\\('SELECT COUNT\\(*\\) c FROM journal_notes'\\).get\\(\\).c\\);\")",
+      "Bash(grep -n \"express.static\\\\|client/dist\\\\|isProd\" server.js | head -20 *)",
+      "Read(//home/ayoup/bin/**)",
+      "Bash(curl -s http://localhost:3001/)",
+      "Bash(pkill -f \"node.*vite\")",
+      "Bash(pkill -f \"sh -c vite\")",
+      "Bash(mkdir -p ~/bin)",
+      "Bash(curl -sL -o ~/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64)",
+      "Bash(chmod +x ~/bin/cloudflared)",
+      "Bash(~/bin/cloudflared --version)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" https://superior-circuits-homes-television.trycloudflare.com/)",
+      "Bash(curl -s https://superior-circuits-homes-television.trycloudflare.com/api/health)",
+      "Bash(git commit -m ' *)",
+      "Bash(curl -s -o /dev/null -w \"local HTTP %{http_code}\\\\n\" http://localhost:3001/api/health)",
+      "Bash(curl -s -o /dev/null -w \"tunnel HTTP %{http_code}\\\\n\" --max-time 8 https://superior-circuits-homes-television.trycloudflare.com/api/health)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" --max-time 8 https://rates-shorts-transactions-toward.trycloudflare.com/api/health)",
+      "Bash(curl -s http://localhost:5173)",
+      "Bash(curl -fsSL https://railway.com/install.sh)",
+      "Bash(sh)",
+      "Bash(~/.railway/bin/railway --version)",
+      "Bash(~/.railway/bin/railway login *)",
+      "Bash(~/.railway/bin/railway init *)",
+      "Bash(npx lt *)",
+      "Bash(chmod +x /home/ayoup/Documents/mvp/lol/iconicfx/real-fwebbapp/tunnel.sh)",
+      "Bash(bash /home/ayoup/Documents/mvp/lol/iconicfx/real-fwebbapp/tunnel.sh)"
+    ]
+  }
+}

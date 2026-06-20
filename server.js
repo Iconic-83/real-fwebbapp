@@ -5861,9 +5861,12 @@ app.get('/api/analytics/learning', (req, res) => {
 // SERVE REACT APP — always serve if dist folder exists (dev or prod)
 // ═════════════════════════════════════════════════════════════════════════════
 const clientDist = path.join(__dirname, 'client', 'dist');
+console.log(`[STATIC] Looking for client dist at: ${clientDist} — exists: ${fs.existsSync(clientDist)}`);
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+} else {
+  app.get('/', (req, res) => res.send(`<pre>Build missing. clientDist=${clientDist}\n__dirname=${__dirname}\nls: ${fs.readdirSync(__dirname).join(', ')}</pre>`));
 }
 
 app.listen(PORT, '0.0.0.0', () => {

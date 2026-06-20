@@ -3,7 +3,7 @@ services:
     name: precision-trader-pro
     runtime: node
     plan: free
-    buildCommand: npm install && cd client && npm install --include=dev && npm run build && cd ..
+    buildCommand: npm install && npm install --prefix client --include=dev && npm --prefix client run build
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:

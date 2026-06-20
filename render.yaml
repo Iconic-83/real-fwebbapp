@@ -3,6 +3,7 @@ services:
     name: precision-trader-pro
     runtime: node
     plan: free
+    nodeVersion: 20.19.2
     buildCommand: npm install && npm run build
     startCommand: npm start
     healthCheckPath: /api/health

@@ -5858,15 +5858,32 @@ app.get('/api/analytics/learning', (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// SYNC ENV KEYS → DB so the frontend can read them via /api/storage/ptp_keys
+// ═════════════════════════════════════════════════════════════════════════════
+(function syncEnvKeysToDb() {
+  const existing = getStorageValue('ptp_keys') || {};
+  const merged = {
+    ...existing,
+    ...(process.env.OPENAI_API_KEY    ? { openai_key:    process.env.OPENAI_API_KEY }    : {}),
+    ...(process.env.ANTHROPIC_API_KEY ? { claude_key:    process.env.ANTHROPIC_API_KEY } : {}),
+    ...(process.env.OANDA_API_KEY     ? { oanda_key:     process.env.OANDA_API_KEY }     : {}),
+    ...(process.env.OANDA_ACCOUNT_ID  ? { oanda_account: process.env.OANDA_ACCOUNT_ID }  : {}),
+    ...(process.env.TWELVE_DATA_KEY   ? { twelve_key:    process.env.TWELVE_DATA_KEY }   : {}),
+    ...(process.env.TELEGRAM_TOKEN    ? { tg_token:      process.env.TELEGRAM_TOKEN }    : {}),
+    ...(process.env.TELEGRAM_CHAT_ID  ? { tg_chat:       process.env.TELEGRAM_CHAT_ID }  : {}),
+  };
+  setStorageValue('ptp_keys', merged);
+  invalidateKeysCache();
+  console.log('[KEYS] Env vars synced to DB — frontend will see all keys');
+})();
+
+// ═════════════════════════════════════════════════════════════════════════════
 // SERVE REACT APP — always serve if dist folder exists (dev or prod)
 // ═════════════════════════════════════════════════════════════════════════════
 const clientDist = path.join(__dirname, 'client', 'dist');
-console.log(`[STATIC] Looking for client dist at: ${clientDist} — exists: ${fs.existsSync(clientDist)}`);
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
-} else {
-  app.get('/', (req, res) => res.send(`<pre>Build missing. clientDist=${clientDist}\n__dirname=${__dirname}\nls: ${fs.readdirSync(__dirname).join(', ')}</pre>`));
 }
 
 app.listen(PORT, '0.0.0.0', () => {

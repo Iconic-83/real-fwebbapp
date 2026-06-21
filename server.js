@@ -5,6 +5,12 @@ const https  = require('https');
 const crypto = require('crypto');
 dns.setDefaultResultOrder('ipv4first');
 
+// Prevent Node.js from exiting on unhandled promise rejections (Express 4 doesn't
+// auto-catch async handler rejections — without this, any missing try/catch kills the process)
+process.on('unhandledRejection', (reason) => {
+  console.error('[SAFETY] Unhandled Promise Rejection — crash prevented:', reason?.message || String(reason));
+});
+
 const express = require('express');
 const cors    = require('cors');
 const path    = require('path');
@@ -2581,8 +2587,8 @@ async function pollPrices() {
   }
 }
 
-pollPrices();
-setInterval(pollPrices, 5000);
+pollPrices().catch(e => console.error('[POLL] Initial price poll error:', e.message));
+setInterval(() => pollPrices().catch(e => console.error('[POLL] Price poll error:', e.message)), 5000);
 
 app.get('/api/prices', (req, res) => {
   if (!Object.keys(priceCache).length) return res.status(503).json({ error:'Prices loading...' });
@@ -2794,35 +2800,37 @@ function recordTradePL(pl) {
 }
 
 app.get('/api/trade/daily', async (req, res) => {
-  const keys = getApiKeys();
-  const daily = getDailyPL();
+  try {
+    const keys = getApiKeys();
+    const daily = getDailyPL();
 
-  // Also get real account data for context
-  let balance = 0, maxDailyLoss = 0;
-  if (keys.oanda_key && keys.oanda_account) {
-    try {
-      const d = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
-      balance = parseFloat(d?.account?.balance || 0);
-    } catch {}
+    let balance = 0, maxDailyLoss = 0;
+    if (keys.oanda_key && keys.oanda_account) {
+      try {
+        const d = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
+        balance = parseFloat(d?.account?.balance || 0);
+      } catch {}
+    }
+
+    maxDailyLoss = balance * 0.03;
+    const currentLoss = Math.min(0, daily.realized_pl);
+    const limitHit    = Math.abs(currentLoss) >= maxDailyLoss && maxDailyLoss > 0;
+    const usedPercent = maxDailyLoss > 0 ? Math.abs(currentLoss / maxDailyLoss * 100) : 0;
+
+    res.json({
+      date:         daily.date,
+      realized_pl:  daily.realized_pl.toFixed(2),
+      trade_count:  daily.trade_count,
+      balance:      balance.toFixed(2),
+      max_daily_loss: (-maxDailyLoss).toFixed(2),
+      used_percent: usedPercent.toFixed(1),
+      limit_hit:    limitHit,
+      safe_to_trade: !limitHit,
+      warning:      limitHit ? `⛔ Daily loss limit of ${maxDailyLoss.toFixed(2)} (3%) reached. Stop trading for today.` : null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  // Daily loss limit = 3% of balance (professional standard)
-  maxDailyLoss = balance * 0.03;
-  const currentLoss = Math.min(0, daily.realized_pl); // only negative values
-  const limitHit    = Math.abs(currentLoss) >= maxDailyLoss && maxDailyLoss > 0;
-  const usedPercent = maxDailyLoss > 0 ? Math.abs(currentLoss / maxDailyLoss * 100) : 0;
-
-  res.json({
-    date:         daily.date,
-    realized_pl:  daily.realized_pl.toFixed(2),
-    trade_count:  daily.trade_count,
-    balance:      balance.toFixed(2),
-    max_daily_loss: (-maxDailyLoss).toFixed(2),
-    used_percent: usedPercent.toFixed(1),
-    limit_hit:    limitHit,
-    safe_to_trade: !limitHit,
-    warning:      limitHit ? `⛔ Daily loss limit of ${maxDailyLoss.toFixed(2)} (3%) reached. Stop trading for today.` : null,
-  });
 });
 
 // Record P&L when frontend reports a closed trade
@@ -2909,10 +2917,13 @@ fetchRealNews();
 setInterval(fetchRealNews, 30 * 60 * 1000);
 
 app.get('/api/news', async (req, res) => {
-  const force = req.query.refresh === 'true';
-  if (force) { const data = await fetchRealNews(); return res.json(data); }
-  // Return cache (already fresh from background polling)
-  res.json(newsCache.length > 0 ? newsCache : await fetchRealNews());
+  try {
+    const force = req.query.refresh === 'true';
+    if (force) { const data = await fetchRealNews(); return res.json(data); }
+    res.json(newsCache.length > 0 ? newsCache : await fetchRealNews());
+  } catch (e) {
+    res.status(500).json({ error: e.message, events: [] });
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2948,10 +2959,14 @@ function sendTelegramMsg(text) {
 }
 
 app.post('/api/telegram/send', async (req, res) => {
-  const { message } = req.body;
-  const r = await sendTelegramMsg(message);
-  if (!r.ok) return res.status(r.error==='Telegram not configured'?400:500).json({ error:r.error });
-  res.json({ ok:true });
+  try {
+    const { message } = req.body;
+    const r = await sendTelegramMsg(message);
+    if (!r.ok) return res.status(r.error==='Telegram not configured'?400:500).json({ error:r.error });
+    res.json({ ok:true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Auto-detect chat ID from getUpdates (call after user messages bot)
@@ -4512,12 +4527,17 @@ app.get('/api/autotrade/status', (req, res) => {
 
 // Approve/reject from web UI (fallback if Telegram not available)
 app.post('/api/autotrade/approve/:id', async (req, res) => {
-  const sig = db.prepare('SELECT * FROM signals WHERE id=?').get(parseInt(req.params.id));
-  if (!sig) return res.status(404).json({ error:'Signal not found' });
-  if (sig.status !== 'PENDING') return res.status(400).json({ error:'Signal already processed: '+sig.status });
-  writeAudit('SIGNAL_APPROVE', { signal_id: sig.id, pair: sig.pair, confidence: sig.confidence }, 'WEB_UI', sig.id);
-  await executeSignal(sig);
-  res.json({ ok:true, signal_id:sig.id });
+  try {
+    const sig = db.prepare('SELECT * FROM signals WHERE id=?').get(parseInt(req.params.id));
+    if (!sig) return res.status(404).json({ error:'Signal not found' });
+    if (sig.status !== 'PENDING') return res.status(400).json({ error:'Signal already processed: '+sig.status });
+    writeAudit('SIGNAL_APPROVE', { signal_id: sig.id, pair: sig.pair, confidence: sig.confidence }, 'WEB_UI', sig.id);
+    await executeSignal(sig);
+    res.json({ ok:true, signal_id:sig.id });
+  } catch (e) {
+    console.error('[APPROVE] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/autotrade/reject/:id', (req, res) => {
@@ -5377,123 +5397,128 @@ app.get('/api/execution/slippage', (req, res) => {
 // INTELLIGENCE API — full institutional pre-trade report
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/api/intelligence', async (req, res) => {
-  const keys = getApiKeys();
+  try {
+    const keys = getApiKeys();
 
-  // Portfolio heat
-  const heat = getPortfolioHeat();
+    // Portfolio heat
+    const heat = getPortfolioHeat();
 
-  // System health
-  const ddVel    = checkDrawdownVelocity();
-  const confDrift= checkConfidenceDrift();
-  const freqAnom = checkSignalFrequencyAnomaly();
+    // System health
+    const ddVel    = checkDrawdownVelocity();
+    const confDrift= checkConfidenceDrift();
+    const freqAnom = checkSignalFrequencyAnomaly();
 
-  // Session + news
-  const session  = getSession();
-  const newsCount= newsCache.filter(n => {
-    if (n.impact !== 'HIGH') return false;
-    const nowMin = new Date().getUTCHours() * 60 + new Date().getUTCMinutes();
-    const [hh, mm] = (n.time || '99:99').split(':').map(Number);
-    const diff = nowMin - (hh * 60 + mm);
-    return diff >= -45 && diff <= 60; // 45 min before, 60 min after
-  }).length;
+    // Session + news
+    const session  = getSession();
+    const newsCount= newsCache.filter(n => {
+      if (n.impact !== 'HIGH') return false;
+      const nowMin = new Date().getUTCHours() * 60 + new Date().getUTCMinutes();
+      const [hh, mm] = (n.time || '99:99').split(':').map(Number);
+      const diff = nowMin - (hh * 60 + mm);
+      return diff >= -45 && diff <= 60; // 45 min before, 60 min after
+    }).length;
 
-  // Infrastructure
-  const avgLat  = getOandaAvgLatency();
-  const daily   = getDailyPL();
-  const consec  = getConsecutiveLosses();
+    // Infrastructure
+    const avgLat  = getOandaAvgLatency();
+    const daily   = getDailyPL();
+    const consec  = getConsecutiveLosses();
 
-  // Recent signal quality
-  const recentSignals = db.prepare(`
-    SELECT pair, direction, confidence, status, realized_pl, created_at
-    FROM signals ORDER BY created_at DESC LIMIT 10
-  `).all();
-  const closedRecent  = recentSignals.filter(s => s.status === 'CLOSED');
-  const winRate7d     = closedRecent.length
-    ? Math.round(closedRecent.filter(s => s.realized_pl > 0).length / closedRecent.length * 100) : null;
+    // Recent signal quality
+    const recentSignals = db.prepare(`
+      SELECT pair, direction, confidence, status, realized_pl, created_at
+      FROM signals ORDER BY created_at DESC LIMIT 10
+    `).all();
+    const closedRecent  = recentSignals.filter(s => s.status === 'CLOSED');
+    const winRate7d     = closedRecent.length
+      ? Math.round(closedRecent.filter(s => s.realized_pl > 0).length / closedRecent.length * 100) : null;
 
-  // Per-pair win rates (all time)
-  const pairStats = db.prepare(`
-    SELECT pair,
-      COUNT(*) as total,
-      SUM(CASE WHEN realized_pl > 0 THEN 1 ELSE 0 END) as wins,
-      AVG(confidence) as avg_conf,
-      ROUND(AVG(realized_pl), 2) as avg_pl
-    FROM signals WHERE status='CLOSED'
-    GROUP BY pair ORDER BY total DESC
-  `).all();
+    // Per-pair win rates (all time)
+    const pairStats = db.prepare(`
+      SELECT pair,
+        COUNT(*) as total,
+        SUM(CASE WHEN realized_pl > 0 THEN 1 ELSE 0 END) as wins,
+        AVG(confidence) as avg_conf,
+        ROUND(AVG(realized_pl), 2) as avg_pl
+      FROM signals WHERE status='CLOSED'
+      GROUP BY pair ORDER BY total DESC
+    `).all();
 
-  // Per-session win rates
-  const sessionStats = db.prepare(`
-    SELECT
-      CASE
-        WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 7  AND 11 THEN 'LONDON'
-        WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 12 AND 16 THEN 'NY'
-        WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 0  AND 6  THEN 'ASIAN'
-        ELSE 'OFF_HOURS'
-      END as sess,
-      COUNT(*) as total,
-      SUM(CASE WHEN realized_pl > 0 THEN 1 ELSE 0 END) as wins,
-      ROUND(AVG(realized_pl), 2) as avg_pl
-    FROM signals WHERE status='CLOSED'
-    GROUP BY sess
-  `).all();
+    // Per-session win rates
+    const sessionStats = db.prepare(`
+      SELECT
+        CASE
+          WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 7  AND 11 THEN 'LONDON'
+          WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 12 AND 16 THEN 'NY'
+          WHEN CAST(strftime('%H', created_at) AS INT) BETWEEN 0  AND 6  THEN 'ASIAN'
+          ELSE 'OFF_HOURS'
+        END as sess,
+        COUNT(*) as total,
+        SUM(CASE WHEN realized_pl > 0 THEN 1 ELSE 0 END) as wins,
+        ROUND(AVG(realized_pl), 2) as avg_pl
+      FROM signals WHERE status='CLOSED'
+      GROUP BY sess
+    `).all();
 
-  res.json({
-    timestamp: new Date().toISOString(),
+    res.json({
+      timestamp: new Date().toISOString(),
 
-    // Stage 1 — Market Environment
-    environment: {
-      session,
-      session_tradeable: ['LONDON','NY'].includes(session),
-      high_impact_news_now: newsCount > 0,
-      news_blackout: newsCount > 0 ? `${newsCount} HIGH-impact event(s) within ±45 min — DO NOT TRADE` : 'Clear',
-      oanda_latency_ms: Math.round(avgLat),
-      feed_healthy: avgLat < 3000 || avgLat === 0,
-    },
+      // Stage 1 — Market Environment
+      environment: {
+        session,
+        session_tradeable: ['LONDON','NY'].includes(session),
+        high_impact_news_now: newsCount > 0,
+        news_blackout: newsCount > 0 ? `${newsCount} HIGH-impact event(s) within ±45 min — DO NOT TRADE` : 'Clear',
+        oanda_latency_ms: Math.round(avgLat),
+        feed_healthy: avgLat < 3000 || avgLat === 0,
+      },
 
-    // Stage 4 — Risk
-    risk: {
-      daily_pl:          daily.realized_pl.toFixed(2),
-      consecutive_losses: consec,
-      circuit_breaker:   consec >= 3,
-      drawdown_velocity: ddVel,
-      portfolio_heat:    heat,
-    },
+      // Stage 4 — Risk
+      risk: {
+        daily_pl:          daily.realized_pl.toFixed(2),
+        consecutive_losses: consec,
+        circuit_breaker:   consec >= 3,
+        drawdown_velocity: ddVel,
+        portfolio_heat:    heat,
+      },
 
-    // Stage 5 — Statistical intelligence
-    statistics: {
-      win_rate_7d:    winRate7d,
-      recent_signals: recentSignals.length,
-      by_pair:        pairStats.map(p => ({
-        pair: p.pair, total: p.total,
-        win_rate: p.total ? Math.round(p.wins / p.total * 100) : null,
-        avg_conf: parseFloat((p.avg_conf || 0).toFixed(1)),
-        avg_pl:   p.avg_pl,
-      })),
-      by_session: sessionStats.map(s => ({
-        session: s.sess, total: s.total,
-        win_rate: s.total ? Math.round(s.wins / s.total * 100) : null,
-        avg_pl:   s.avg_pl,
-      })),
-    },
+      // Stage 5 — Statistical intelligence
+      statistics: {
+        win_rate_7d:    winRate7d,
+        recent_signals: recentSignals.length,
+        by_pair:        pairStats.map(p => ({
+          pair: p.pair, total: p.total,
+          win_rate: p.total ? Math.round(p.wins / p.total * 100) : null,
+          avg_conf: parseFloat((p.avg_conf || 0).toFixed(1)),
+          avg_pl:   p.avg_pl,
+        })),
+        by_session: sessionStats.map(s => ({
+          session: s.sess, total: s.total,
+          win_rate: s.total ? Math.round(s.wins / s.total * 100) : null,
+          avg_pl:   s.avg_pl,
+        })),
+      },
 
-    // Stage 5 — AI governance
-    ai_governance: {
-      confidence_drift:    confDrift,
-      signal_frequency:    freqAnom,
-    },
+      // Stage 5 — AI governance
+      ai_governance: {
+        confidence_drift:    confDrift,
+        signal_frequency:    freqAnom,
+      },
 
-    // System verdict
-    verdict: {
-      safe_to_trade: !newsCount && consec < 3 && ddVel.velocity !== 'RAPID' && heat.safe_to_add,
-      blockers: [
-        newsCount > 0 ? 'High-impact news active' : null,
-        consec >= 3 ? `Circuit breaker: ${consec} consecutive losses` : null,
-        ddVel.velocity === 'RAPID' ? ddVel.warning : null,
-        !heat.safe_to_add ? heat.warning : null,
-      ].filter(Boolean),
-    },
-  });
+      // System verdict
+      verdict: {
+        safe_to_trade: !newsCount && consec < 3 && ddVel.velocity !== 'RAPID' && heat.safe_to_add,
+        blockers: [
+          newsCount > 0 ? 'High-impact news active' : null,
+          consec >= 3 ? `Circuit breaker: ${consec} consecutive losses` : null,
+          ddVel.velocity === 'RAPID' ? ddVel.warning : null,
+          !heat.safe_to_add ? heat.warning : null,
+        ].filter(Boolean),
+      },
+    });
+  } catch (e) {
+    console.error('[INTELLIGENCE] Error:', e.message, e.stack);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Portfolio heat endpoint

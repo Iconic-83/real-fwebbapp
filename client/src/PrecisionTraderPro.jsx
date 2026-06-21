@@ -2683,9 +2683,9 @@ export default function App() {
     return (
       <div style={{ display:"flex", height:"100vh", alignItems:"center", justifyContent:"center", background:"#06061a", fontFamily:"monospace", flexDirection:"column", gap:16 }}>
         <div style={{ fontSize:48, color:"#00ff88", fontWeight:900, letterSpacing:4 }}>P</div>
-        <div style={{ fontSize:14, color:"#ccc", letterSpacing:4 }}>PRECISION TRADER PRO</div>
+        <div style={{ fontSize:14, color:"#ffffff", letterSpacing:4 }}>PRECISION TRADER PRO</div>
         <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:8 }}>
-          <div style={{ width:8, height:8, borderRadius:"50%", background:"#00ccff", animation:"pulse 1.2s infinite" }} />
+          <div style={{ width:8, height:8, borderRadius:"50%", background:"#00ccff" }} />
           <span style={{ fontSize:12, color:"#00ccff", letterSpacing:2 }}>Connecting to server...</span>
         </div>
       </div>

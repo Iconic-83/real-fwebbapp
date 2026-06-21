@@ -52,7 +52,10 @@ function getAuthHeaders() {
 // ─── STORAGE API  (backend SQLite — persistent across devices) ────────────────
 async function storageGet(key) {
   try {
-    const r = await fetch(`/api/storage/${key}`, { headers: getAuthHeaders() });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch(`/api/storage/${key}`, { headers: getAuthHeaders(), signal: ctrl.signal });
+    clearTimeout(timer);
     const d = await r.json();
     return d.value ? JSON.parse(d.value) : null;
   } catch { return null; }
@@ -2627,16 +2630,18 @@ export default function App() {
   const [priceAlerts, setPriceAlerts]     = useState([]);
   const [time, setTime]   = useState(new Date());
 
-  // Load keys + alerts on mount — simple, no extra API dependency
+  // Load keys + alerts on mount — 10s hard timeout so app never stays stuck
   useEffect(() => {
+    const bail = setTimeout(() => setKeysLoaded(true), 10000);
     Promise.all([loadKeys(), loadPriceAlerts()])
       .then(([k, pa]) => {
+        clearTimeout(bail);
         setKeys(k || {});
         setPriceAlerts(pa || []);
         setKeysLoaded(true);
       })
       .catch(() => {
-        // Even on error, show the app
+        clearTimeout(bail);
         setKeysLoaded(true);
       });
   }, []);
@@ -2682,12 +2687,13 @@ export default function App() {
   if (!keysLoaded) {
     return (
       <div style={{ display:"flex", height:"100vh", alignItems:"center", justifyContent:"center", background:"#06061a", fontFamily:"monospace", flexDirection:"column", gap:16 }}>
-        <div style={{ fontSize:48, color:"#00ff88", fontWeight:900, letterSpacing:4 }}>P</div>
-        <div style={{ fontSize:14, color:"#ffffff", letterSpacing:4 }}>PRECISION TRADER PRO</div>
+        <div style={{ fontSize:56, color:"#00ff88", fontWeight:900, letterSpacing:4 }}>P</div>
+        <div style={{ fontSize:16, color:"#ffffff", letterSpacing:4, fontWeight:700 }}>PRECISION TRADER PRO</div>
         <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:8 }}>
-          <div style={{ width:8, height:8, borderRadius:"50%", background:"#00ccff" }} />
-          <span style={{ fontSize:12, color:"#00ccff", letterSpacing:2 }}>Connecting to server...</span>
+          <div style={{ width:10, height:10, borderRadius:"50%", background:"#00ccff", animation:"pulse 1.2s infinite" }} />
+          <span style={{ fontSize:13, color:"#00ccff", letterSpacing:2 }}>Connecting to server...</span>
         </div>
+        <div style={{ fontSize:11, color:"#444", marginTop:4 }}>Loading your keys and settings</div>
       </div>
     );
   }

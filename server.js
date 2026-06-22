@@ -3726,8 +3726,8 @@ let autoScanning = false;
 
 async function runAutoScan() {
   if (autoScanning) return;
-  const settings = getStorageValue('autotrade_settings');
-  if (!settings?.enabled) return;
+  const settings = getStorageValue('autotrade_settings') || { enabled:true, auto_execute:true, threshold:85, risk_pct:1, min_score:9 };
+  if (!settings.enabled) return;
 
   const minScore  = parseInt(settings.min_score  || 9);   // out of 17 checks
   const riskPct   = parseFloat(settings.risk_pct || 1);
@@ -4638,7 +4638,7 @@ setInterval(backupDatabase, 24 * 60 * 60 * 1000);
 
 // ── Signal API endpoints ──────────────────────────────────────────────────────
 app.get('/api/autotrade/settings', (req, res) => {
-  const s = getStorageValue('autotrade_settings') || { enabled:false, auto_execute:false, threshold:85, risk_pct:1, min_score:9 };
+  const s = getStorageValue('autotrade_settings') || { enabled:true, auto_execute:true, threshold:85, risk_pct:1, min_score:9 };
   res.json(s);
 });
 
@@ -4686,7 +4686,7 @@ app.get('/api/autotrade/log', (req, res) => {
 });
 
 app.get('/api/autotrade/status', (req, res) => {
-  const s = getStorageValue('autotrade_settings') || { enabled:false };
+  const s = getStorageValue('autotrade_settings') || { enabled:true, auto_execute:true, threshold:85, risk_pct:1, min_score:9 };
   const pending = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='PENDING'`).get();
   const today   = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE date(created_at)=date('now')`).get();
   const total   = db.prepare(`SELECT COUNT(*) as c FROM signals`).get();

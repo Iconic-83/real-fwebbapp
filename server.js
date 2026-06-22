@@ -2094,20 +2094,12 @@ async function checkRiskGovernors(signal) {
   const keys = getApiKeys();
   const blocks = [];
 
-  // 1 — Daily loss limit (3%) + weekly loss limit (6%) + HARD 10% DD stop
+  // 1 — HARD 10% DD stop (daily/weekly limits removed)
   try {
     if (keys.oanda_key && keys.oanda_account) {
       const acct    = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
       const balance = parseFloat(acct?.account?.balance || 0);
       if (balance > 0) {
-        const daily = getDailyPL();
-        if (daily.realized_pl < 0 && Math.abs(daily.realized_pl) >= balance * 0.03)
-          blocks.push(`Daily loss limit reached: ${daily.realized_pl.toFixed(2)} / -${(balance*0.03).toFixed(2)} (3%)`);
-
-        const weekly = getWeeklyPL();
-        if (weekly.realized_pl < 0 && Math.abs(weekly.realized_pl) >= balance * 0.06)
-          blocks.push(`Weekly loss limit reached: ${weekly.realized_pl.toFixed(2)} / -${(balance*0.06).toFixed(2)} (6%)`);
-
         // Hard 10% drawdown from peak — track peak equity in storage
         const storedPeak = getStorageValue('peak_balance') || 0;
         const peak = Math.max(storedPeak, balance);
@@ -2150,12 +2142,7 @@ Type STATUS to check system state.`
   }
 
   // FIX 10 — Extended kill switches
-  // 4. 5 losing trades today regardless of streak
-  const todayLosses = _stmtTodayLosses.get();
-  if (todayLosses.c >= 5)
-    blocks.push(`5 losing trades today — daily loss count kill switch`);
-
-  // 5. OANDA API instability
+  // 4. OANDA API instability (daily loss count kill switch removed)
   const avgLat = getOandaAvgLatency();
   if (avgLat > 5000 && oandaLatencyLog.length >= 5)
     blocks.push(`OANDA API unstable: avg latency ${avgLat.toFixed(0)}ms`);

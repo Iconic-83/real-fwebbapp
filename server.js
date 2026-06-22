@@ -3382,7 +3382,7 @@ Risk Governor:
 • ${reasons}
 
 Review your risk position before resuming.`;
-    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, blockMsg);
+    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, blockMsg).catch(() => sendTelegramMsg(blockMsg));
     else await sendTelegramMsg(blockMsg);
     writeAudit('EXECUTION_BLOCKED', { signal_id: signal.id, pair: signal.pair, reasons: gov.reasons });
     console.log(`[GOVERNOR] ⛔ Blocked #${signal.id} ${signal.pair}: ${reasons}`);
@@ -3400,7 +3400,7 @@ Review your risk position before resuming.`;
   if (exec.blocked) {
     db.prepare(`UPDATE signals SET status='BLOCKED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(signal.id);
     const msg = `⛔ BLOCKED AT EXECUTION — Signal #${signal.id}\n${signal.pair} ${signal.direction}\n\n${exec.reason}`;
-    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, msg);
+    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, msg).catch(() => sendTelegramMsg(msg));
     else await sendTelegramMsg(msg);
     writeAudit('EXECUTION_RECALC_BLOCKED', { signal_id: signal.id, pair: signal.pair, reason: exec.reason });
     console.log(`[EXEC] Blocked #${signal.id} at recalc: ${exec.reason}`);
@@ -3433,7 +3433,8 @@ Review your risk position before resuming.`;
       const rejectReason = orderResult?.orderRejectTransaction?.rejectReason || 'UNKNOWN_REJECTION';
       db.prepare(`UPDATE signals SET status='FAILED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(signal.id);
       const failMsg = `❌ ORDER REJECTED — Signal #${signal.id}\n${signal.pair} ${signal.direction}\nReason: ${rejectReason}`;
-      if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, failMsg);
+      if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, failMsg).catch(() => sendTelegramMsg(failMsg));
+      else await sendTelegramMsg(failMsg);
       writeAudit('ORDER_REJECTED', { signal_id: signal.id, pair: signal.pair, reason: rejectReason });
       console.error(`[EXEC] Order rejected #${signal.id}: ${rejectReason}`);
       return;
@@ -3481,13 +3482,15 @@ Size:       ${exec.lots} lots (${exec.units.toLocaleString()} units)
 Risk:       ${signal.risk_pct}% = $${exec.riskAmt.toFixed(0)} of $${exec.balance.toFixed(0)}
 Spread:     ${exec.spreadPips.toFixed(1)} pips at fill
 OANDA ID:   ${orderId}`;
-    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, msg);
+    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, msg).catch(() => sendTelegramMsg(msg));
+    else await sendTelegramMsg(msg);
     console.log(`[SIGNAL] ✅ Executed #${signal.id} ${signal.pair} ${signal.direction} @ ${filledPx.toFixed(dp)}${driftNote}`);
 
   } catch(e) {
     db.prepare(`UPDATE signals SET status='FAILED', actioned_at=CURRENT_TIMESTAMP WHERE id=?`).run(signal.id);
-    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id,
-      `❌ EXECUTION FAILED — Signal #${signal.id}\n${signal.pair} ${signal.direction}\nError: ${e.message}`);
+    const errMsg = `❌ EXECUTION FAILED — Signal #${signal.id}\n${signal.pair} ${signal.direction}\nError: ${e.message}`;
+    if (signal.tg_message_id) await tgEditMsg(signal.tg_message_id, errMsg).catch(() => sendTelegramMsg(errMsg));
+    else await sendTelegramMsg(errMsg);
     writeAudit('EXECUTION_ERROR', { signal_id: signal.id, pair: signal.pair, error: e.message });
     console.error(`[SIGNAL] Execute failed #${signal.id}:`, e.message);
   }
@@ -4331,9 +4334,13 @@ ${failedStr ? `\n❌ CHECKS FAILED\n${failedStr}` : ''}`;
 
       // ── AUTO-EXECUTE or send for manual approval ──────────────────────
       if (settings.auto_execute) {
-        const sigRow = db.prepare('SELECT * FROM signals WHERE id=?').get(signalId);
         console.log(`[SCAN] ⚡ Auto-executing #${signalId}: ${label} ${parsed.direction} ${parsed.confidence}%`);
-        sendTelegramMsg(`⚡ AUTO-EXECUTING SIGNAL #${signalId}\n${tgText}`).catch(() => {});
+        try {
+          const tgRes = await sendTelegramMsg(`⚡ AUTO-EXECUTING SIGNAL #${signalId}\n${tgText}`);
+          const tgMsgId = tgRes?.result?.message_id || null;
+          if (tgMsgId) db.prepare('UPDATE signals SET tg_message_id=? WHERE id=?').run(tgMsgId, signalId);
+        } catch {}
+        const sigRow = db.prepare('SELECT * FROM signals WHERE id=?').get(signalId);
         await executeSignal(sigRow);
       } else {
         const r = await tgSendButtons(tgText, [[

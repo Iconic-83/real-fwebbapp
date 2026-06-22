@@ -31,6 +31,7 @@ app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // server-side / curl
     if (origin.includes('localhost') || origin.includes('127.0.0.1')) return cb(null, true);
+    if (origin.endsWith('.onrender.com')) return cb(null, true); // production domain
     if (origin.endsWith('.trycloudflare.com')) return cb(null, true);
     if (origin.endsWith('.loca.lt')) return cb(null, true);
     if (EXTRA_ORIGINS.includes(origin)) return cb(null, true);

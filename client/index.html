@@ -45,6 +45,21 @@
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
     <script>
+      // Catch any JS errors and show them on screen so we can diagnose
+      window.onerror = function(msg, src, line, col, err) {
+        document.getElementById('loader-msg').textContent = 'JS Error';
+        document.getElementById('loader-sub').textContent = (msg || '') + ' | ' + (src||'').split('/').pop() + ':' + line;
+        document.getElementById('loader-sub').style.color = '#ff4466';
+        document.getElementById('loader-sub').style.fontSize = '10px';
+        document.getElementById('loader-sub').style.maxWidth = '80vw';
+        document.getElementById('loader-sub').style.wordBreak = 'break-all';
+      };
+      window.addEventListener('unhandledrejection', function(e) {
+        document.getElementById('loader-msg').textContent = 'Load Error';
+        document.getElementById('loader-sub').textContent = String(e.reason?.message || e.reason || 'unknown');
+        document.getElementById('loader-sub').style.color = '#ff4466';
+      });
+
       // Hide the HTML loader once React has mounted into #root
       const obs = new MutationObserver(() => {
         if (document.getElementById('root').children.length > 0) {

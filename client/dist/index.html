@@ -24,8 +24,11 @@
       }
       #html-loader .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
       #html-loader .row span { font-size: 13px; color: #00ccff; letter-spacing: 2px; }
+      #html-loader .progress { width: 180px; height: 2px; background: #111; border-radius: 2px; overflow: hidden; margin-top: 8px; }
+      #html-loader .progress-bar { height: 100%; background: #00ff88; animation: load 30s linear forwards; }
       @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
       @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.2} }
+      @keyframes load { from{width:0%} to{width:100%} }
     </style>
     <script type="module" crossorigin src="/assets/index-BozaXRY0.js"></script>
   </head>
@@ -35,9 +38,10 @@
       <div class="title">PRECISION TRADER PRO</div>
       <div class="row">
         <div class="dot"></div>
-        <span>Starting up...</span>
+        <span id="loader-msg">Starting up...</span>
       </div>
-      <div class="sub">Loading your keys and settings</div>
+      <div class="sub" id="loader-sub">Loading your keys and settings</div>
+      <div class="progress"><div class="progress-bar"></div></div>
     </div>
     <div id="root"></div>
     <script>
@@ -50,6 +54,24 @@
         }
       });
       obs.observe(document.getElementById('root'), { childList: true });
+
+      // If server is cold-starting, JS bundle hangs. Auto-reload after 30s so
+      // the second request hits an awake server and loads instantly.
+      setTimeout(() => {
+        if (document.getElementById('root').children.length === 0) {
+          document.getElementById('loader-msg').textContent = 'Waking server... reloading';
+          document.getElementById('loader-sub').textContent = 'First visit takes ~30s on free hosting';
+          setTimeout(() => window.location.reload(), 2000);
+        }
+      }, 30000);
+
+      // Update message after 5s so user knows it's a cold start, not a crash
+      setTimeout(() => {
+        if (document.getElementById('root').children.length === 0) {
+          document.getElementById('loader-msg').textContent = 'Waking up server...';
+          document.getElementById('loader-sub').textContent = 'First visit takes ~30s — hang tight';
+        }
+      }, 5000);
     </script>
   </body>
 </html>

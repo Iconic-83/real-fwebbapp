@@ -3968,15 +3968,48 @@ async function runAutoScan() {
 
       console.log(`[SCAN] ${label}: Structure ${structure.structureBias} | BOS ${structure.bos} | CHOCH ${structure.choch} | delta ${structureDelta > 0 ? '+' : ''}${structureDelta}`);
 
+      // ── HARD QUALITY FILTERS — skip before expensive scoring ────────────
+
+      // 1. ASIAN session (except JPY pairs) — low liquidity, fake moves
+      const isJpyPair = label.includes('JPY');
+      if (session === 'ASIAN' && !isJpyPair) {
+        console.log(`[SCAN] ${label}: ASIAN session non-JPY — low liquidity, skip`);
+        continue;
+      }
+
+      // 2. ADX < 18 — market is ranging, trend signals fail
+      if (indH4.adx < 18) {
+        console.log(`[SCAN] ${label}: ADX ${indH4.adx.toFixed(1)} < 18 — ranging market, skip`);
+        continue;
+      }
+
+      // 3. EMA200 mandatory — never trade against the big trend
+      if (indH4.ema200) {
+        const isBuyDir = aiDirection === 'BUY';
+        if (isBuyDir && price < indH4.ema200) {
+          console.log(`[SCAN] ${label}: BUY below EMA200 (${indH4.ema200.toFixed(5)}) — against big trend, skip`);
+          continue;
+        }
+        if (!isBuyDir && price > indH4.ema200) {
+          console.log(`[SCAN] ${label}: SELL above EMA200 (${indH4.ema200.toFixed(5)}) — against big trend, skip`);
+          continue;
+        }
+      }
+
+      // 4. High sweep risk — institutional liquidity grab likely, skip
+      if (liquidity.sweep_risk === 'HIGH') {
+        console.log(`[SCAN] ${label}: HIGH sweep risk — ${liquidity.note}, skip`);
+        continue;
+      }
+
+      // ── END HARD QUALITY FILTERS ─────────────────────────────────────────
+
       // CHOCH against trade direction is a hard block — structure is flipping
       if (structure.choch !== 'NONE' && structure.choch !== (aiDirection === 'BUY' ? 'BULLISH' : 'BEARISH')) {
         console.log(`[SCAN] ${label}: CHOCH ${structure.choch} against ${aiDirection} — structure change, rejected`);
         continue;
       }
 
-      if (liquidity.sweep_risk === 'HIGH') {
-        console.log(`[SCAN] ${label}: Liquidity warning — ${liquidity.note}`);
-      }
       if (liqZones.nearBuySide || liqZones.nearSellSide) {
         console.log(`[SCAN] ${label}: Near liquidity zone — sweep risk`);
       }

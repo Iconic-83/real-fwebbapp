@@ -6076,8 +6076,21 @@ app.get('/api/analytics/learning', (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 const clientDist = path.join(__dirname, 'client', 'dist');
 if (fs.existsSync(clientDist)) {
-  app.use(express.static(clientDist));
-  app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+  // Hashed assets (JS/CSS) — cache 1 year, immutable (Vite content-hashes filenames)
+  // This allows Cloudflare to cache at the edge so repeated requests never hit the origin
+  app.use('/assets', express.static(path.join(clientDist, 'assets'), {
+    maxAge: '365d',
+    immutable: true,
+    setHeaders: (res) => {
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  }));
+  // index.html — never cache so deploys propagate immediately
+  app.use(express.static(clientDist, { maxAge: 0, etag: false }));
+  app.get('*', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
 }
 
 app.listen(PORT, '0.0.0.0', () => {

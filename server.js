@@ -2094,12 +2094,48 @@ async function checkRiskGovernors(signal) {
   const keys = getApiKeys();
   const blocks = [];
 
-  // 1 — HARD 10% DD stop (daily/weekly limits removed)
+  // 1 — Daily/weekly loss warnings (notify only — never block) + HARD 10% DD stop
   try {
     if (keys.oanda_key && keys.oanda_account) {
       const acct    = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
       const balance = parseFloat(acct?.account?.balance || 0);
       if (balance > 0) {
+        const today = new Date().toISOString().slice(0, 10);
+
+        // Daily loss warning — notify once per day when 3% hit, but keep trading
+        const daily = getDailyPL();
+        if (daily.realized_pl < 0 && Math.abs(daily.realized_pl) >= balance * 0.03) {
+          const dailyAlertKey = `daily_warn_${today}`;
+          if (!getStorageValue(dailyAlertKey)) {
+            setStorageValue(dailyAlertKey, true);
+            const dayRows = db.prepare(`SELECT realized_pl FROM signals WHERE status='CLOSED' AND date(closed_at)=?`).all(today);
+            const dayWins = dayRows.filter(r => (r.realized_pl||0) > 0).length;
+            const dayLoss = dayRows.filter(r => (r.realized_pl||0) <= 0).length;
+            sendTelegramMsg(
+`⚠️ DAILY LOSS NOTICE — ${today}
+Daily P&L:  $${daily.realized_pl.toFixed(2)} (3% limit: -$${(balance*0.03).toFixed(2)})
+Trades:     ${dayWins}W / ${dayLoss}L
+
+Trading continues — this is info only.`
+            ).catch(() => {});
+          }
+        }
+
+        // Weekly loss warning — notify once per week when 6% hit, but keep trading
+        const weekly = getWeeklyPL();
+        if (weekly.realized_pl < 0 && Math.abs(weekly.realized_pl) >= balance * 0.06) {
+          const weekKey = `week_warn_${today}`;
+          if (!getStorageValue(weekKey)) {
+            setStorageValue(weekKey, true);
+            sendTelegramMsg(
+`⚠️ WEEKLY LOSS NOTICE
+Weekly P&L: $${weekly.realized_pl.toFixed(2)} (limit: -${(balance*0.06).toFixed(2)})
+
+Trading continues — this is info only.`
+            ).catch(() => {});
+          }
+        }
+
         // Hard 10% drawdown from peak — track peak equity in storage
         const storedPeak = getStorageValue('peak_balance') || 0;
         const peak = Math.max(storedPeak, balance);

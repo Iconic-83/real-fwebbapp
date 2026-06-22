@@ -4468,9 +4468,135 @@ Type REPORT for full pattern analysis.`;
   }
 }
 
+// ── Daily Report ─────────────────────────────────────────────────────────────
+async function sendDailyReport() {
+  const keys = getApiKeys();
+  if (!keys.tg_token || !keys.tg_chat) return;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const lastSent = getStorageValue('daily_report_sent');
+  if (lastSent === today) return;
+
+  const now = new Date();
+  if (now.getUTCHours() < 21 || now.getUTCHours() > 22) return; // 21:00–22:00 UTC (NY session close)
+
+  setStorageValue('daily_report_sent', today);
+
+  try {
+    // Today's closed trades
+    const todayTrades = db.prepare(`
+      SELECT pair, direction, realized_pl, actual_pips, confidence, exit_reason, duration_mins
+      FROM signals WHERE status='CLOSED' AND date(closed_at) = ?
+      ORDER BY closed_at ASC
+    `).all(today);
+
+    // Pending signals
+    const pending = db.prepare(`SELECT COUNT(*) as c FROM signals WHERE status='PENDING'`).get();
+
+    const wins    = todayTrades.filter(t => (t.realized_pl||0) > 0);
+    const losses  = todayTrades.filter(t => (t.realized_pl||0) < 0);
+    const totalPL = todayTrades.reduce((s,t) => s + (t.realized_pl||0), 0);
+    const winRate = todayTrades.length ? Math.round(wins.length / todayTrades.length * 100) : 0;
+    const avgWin  = wins.length   ? wins.reduce((s,t)   => s+(t.realized_pl||0),0)/wins.length   : 0;
+    const avgLoss = losses.length ? losses.reduce((s,t) => s+(t.realized_pl||0),0)/losses.length : 0;
+
+    // Best/worst trade today
+    const sorted   = [...todayTrades].sort((a,b) => (b.realized_pl||0)-(a.realized_pl||0));
+    const bestStr  = sorted[0]  ? `${sorted[0].pair} ${sorted[0].direction}  +$${(sorted[0].realized_pl||0).toFixed(2)}` : '—';
+    const worstStr = sorted.slice(-1)[0] && (sorted.slice(-1)[0].realized_pl||0) < 0
+      ? `${sorted.slice(-1)[0].pair} ${sorted.slice(-1)[0].direction}  -$${Math.abs(sorted.slice(-1)[0].realized_pl||0).toFixed(2)}` : '—';
+
+    // Current streak
+    const recentPLs = db.prepare(`SELECT realized_pl FROM signals WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 10`).all();
+    let streak = 0;
+    for (const t of recentPLs) {
+      const w = (t.realized_pl||0) > 0;
+      if (streak === 0) { streak = w ? 1 : -1; continue; }
+      if (streak > 0 && w) streak++;
+      else if (streak < 0 && !w) streak--;
+      else break;
+    }
+    const streakStr = streak > 1 ? `🔥 ${streak}W streak` : streak < -1 ? `❄️ ${Math.abs(streak)}L streak` : 'Neutral';
+
+    // OANDA balance + open trades
+    let balLine = '', openLine = '';
+    try {
+      if (keys.oanda_key && keys.oanda_account) {
+        const [summary, trades] = await Promise.all([
+          oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`),
+          oandaRequest(`/v3/accounts/${keys.oanda_account}/openTrades`)
+        ]);
+        const bal = parseFloat(summary?.account?.balance || 0);
+        const unreal = parseFloat(summary?.account?.unrealizedPL || 0);
+        const peakBal = getStorageValue('peak_balance') || bal;
+        const ddPct = peakBal > 0 ? ((peakBal - bal) / peakBal * 100).toFixed(1) : '0.0';
+        balLine = `Balance:      $${bal.toFixed(2)}  (DD: ${ddPct}%)`;
+        if (unreal !== 0) balLine += `\nUnrealized:   ${unreal >= 0 ? '+' : ''}$${unreal.toFixed(2)}`;
+        const openCount = (trades?.trades || []).length;
+        if (openCount > 0) {
+          const openSummary = (trades.trades || []).slice(0,5).map(t => `  ${t.instrument.replace('_','/')} ${parseFloat(t.unrealizedPL||0)>=0?'+':''}$${parseFloat(t.unrealizedPL||0).toFixed(2)}`).join('\n');
+          openLine = `\nOpen Trades:  ${openCount}\n${openSummary}`;
+        } else {
+          openLine = `\nOpen Trades:  0`;
+        }
+      }
+    } catch {}
+
+    // Autotrade settings
+    const settings = getStorageValue('autotrade_settings') || {};
+    const scannerStatus = settings.enabled ? '✅ Active' : '⏸ Disabled';
+    const execMode = settings.auto_execute ? 'Auto-execute' : 'Telegram approval';
+
+    const plSign = totalPL >= 0 ? '+' : '';
+    const verdict = todayTrades.length === 0
+      ? '📭 No trades today.'
+      : totalPL >= 0
+        ? `✅ Profitable day  ${plSign}$${totalPL.toFixed(2)}`
+        : `❌ Losing day  $${totalPL.toFixed(2)} — review conditions.`;
+
+    const tradeLines = todayTrades.length > 0
+      ? todayTrades.slice(-5).map(t =>
+          `  ${t.pair} ${t.direction}  ${(t.realized_pl||0)>=0?'+':''}$${(t.realized_pl||0).toFixed(2)}  (${t.actual_pips||0}p)`
+        ).join('\n')
+      : '  —';
+
+    const report =
+`📅 DAILY REPORT — ${today}
+━━━━━━━━━━━━━━━━━━━━━━━
+Trades:       ${todayTrades.length}  (${wins.length}W / ${losses.length}L)
+Win Rate:     ${winRate}%
+Daily P&L:    ${plSign}$${totalPL.toFixed(2)}
+Avg Win:      +$${avgWin.toFixed(2)}
+Avg Loss:     $${avgLoss.toFixed(2)}
+
+Best Trade:   ${bestStr}
+Worst Trade:  ${worstStr}
+Streak:       ${streakStr}
+Pending:      ${pending?.c || 0} signals awaiting approval
+${balLine}${openLine}
+
+Scanner:      ${scannerStatus}
+Mode:         ${execMode}
+Threshold:    ${settings.threshold || 85}% confidence
+
+Last Trades:
+${tradeLines}
+━━━━━━━━━━━━━━━━━━━━━━━
+${verdict}`;
+
+    await sendTelegramMsg(report);
+    console.log(`[DAILY] Report sent for ${today}`);
+  } catch(e) {
+    console.error('[DAILY]', e.message);
+  }
+}
+
 // Check every 30 minutes if it's time to send weekly report
 setInterval(() => { sendWeeklyReport().catch(() => {}); }, 30 * 60 * 1000);
 setTimeout(() => { sendWeeklyReport().catch(() => {}); }, 60000); // check 1 min after startup
+
+// Check every 30 minutes if it's time to send daily report
+setInterval(() => { sendDailyReport().catch(() => {}); }, 30 * 60 * 1000);
 
 // Reconcile closed trades every 2 minutes
 setInterval(() => { reconcileTrades().catch(() => {}); }, 2 * 60 * 1000);
@@ -4509,6 +4635,19 @@ app.post('/api/autotrade/settings', (req, res) => {
 app.post('/api/autotrade/scan', (req, res) => {
   runAutoScan().catch(console.error);
   res.json({ ok:true, msg:'Scan started — check Telegram for signals' });
+});
+
+app.post('/api/reports/daily', async (req, res) => {
+  try {
+    // Bypass the time-window guard for manual triggers
+    setStorageValue('daily_report_sent', '');
+    await sendDailyReport();
+    // Restore today's date so the scheduler doesn't fire again tonight
+    setStorageValue('daily_report_sent', new Date().toISOString().slice(0, 10));
+    res.json({ ok: true, msg: 'Daily report sent to Telegram' });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/autotrade/log', (req, res) => {

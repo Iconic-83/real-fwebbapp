@@ -32,6 +32,7 @@ const NAV = [
   { id:"ai",            label:"AI Insights",    icon:"✦" },
   { id:"coach",         label:"AI Coach",       icon:"◐" },
   { id:"analytics",     label:"Analytics",      icon:"▦" },
+  { id:"reports",       label:"Daily Report",   icon:"▥" },
   { id:"backtest",      label:"Backtest",       icon:"⏪" },
   { id:"settings",      label:"Settings",       icon:"⊙" },
 ];
@@ -158,6 +159,11 @@ async function aiCoach(count = 50) {
 async function fetchCoachHistory() {
   const r = await apiFetch("/api/ai/coach/history");
   if (!r.ok) throw new Error("Failed to load coach history");
+  return r.json();
+}
+async function fetchDailyHistory() {
+  const r = await apiFetch("/api/reports/history");
+  if (!r.ok) throw new Error("Failed to load daily reports");
   return r.json();
 }
 
@@ -1866,6 +1872,111 @@ function Coach() {
   );
 }
 
+// ─── DAILY REPORT (day-by-day) ─────────────────────────────────────────────────
+function DailyReports() {
+  const [days, setDays]       = useState([]);
+  const [sel, setSel]         = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState(null);
+
+  const load = async () => {
+    setLoading(true); setError(null);
+    try {
+      const d = await fetchDailyHistory();
+      const list = d.days || [];
+      setDays(list);
+      setSel(prev => (prev && list.some(x => x.date === prev)) ? prev : (list[0]?.date || null));
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, []);
+
+  const plColor  = v => v > 0 ? "#00ff88" : v < 0 ? "#ff4466" : "#ffcc00";
+  const current  = days.find(d => d.date === sel);
+
+  return (
+    <div>
+      <div style={S.ph}>Daily Report — Day by Day</div>
+      <div style={{ display:"grid", gridTemplateColumns:"260px 1fr", gap:15 }}>
+        {/* Day list */}
+        <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
+          <div style={S.card}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+              <div style={{ ...S.title, marginBottom:0 }}>Trading Days</div>
+              <span onClick={load} title="Refresh" style={{ cursor:"pointer", color:"#00ccff", fontSize:13 }}>⟳</span>
+            </div>
+            {loading && <div style={{ color:"#2a2a4a", fontSize:11 }}>Loading…</div>}
+            {!loading && days.length === 0 && <div style={{ color:"#2a2a4a", fontSize:11, lineHeight:1.6 }}>No closed trades yet. Days appear here once trades close.</div>}
+            {days.map(d => (
+              <div key={d.date} onClick={() => setSel(d.date)}
+                style={{ cursor:"pointer", padding:"9px 8px", borderRadius:6, marginBottom:3,
+                  background: d.date===sel ? "#0d0d2a" : "transparent",
+                  borderLeft: d.date===sel ? "2px solid #00ccff" : "2px solid transparent" }}>
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:11 }}>
+                  <span style={{ color:"#bbb" }}>{d.date}</span>
+                  <span style={{ color:plColor(d.total_pl), fontFamily:"monospace" }}>{d.total_pl>=0?"+":""}${d.total_pl}</span>
+                </div>
+                <div style={{ color:"#2a2a4a", fontSize:10, marginTop:2 }}>{d.trade_count} trades · {d.win_rate}% WR</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Selected day detail */}
+        <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
+          {error && <div style={{ padding:16, color:"#ff4466", background:"#1a0808", borderRadius:8, fontSize:12 }}>⚠ {error}</div>}
+          {!current && !loading && !error && (
+            <div style={S.card}><div style={{ color:"#1a1a30", fontSize:12, padding:30, textAlign:"center" }}>Select a day to view its report.</div></div>
+          )}
+          {current && (
+            <>
+              <div style={S.card}>
+                <div style={S.title}>{current.date}</div>
+                <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
+                  {[
+                    ["Net P/L",  `${current.total_pl>=0?"+":""}$${current.total_pl}`, plColor(current.total_pl)],
+                    ["Trades",   current.trade_count, "#ccc"],
+                    ["Win Rate", `${current.win_rate}%`, current.win_rate>=50?"#00ff88":"#ffcc00"],
+                    ["Pips",     `${current.total_pips>=0?"+":""}${current.total_pips}`, plColor(current.total_pips)],
+                  ].map(([l,v,c]) => (
+                    <div key={l} style={{ background:"#0a0a1e", borderRadius:7, padding:"10px 8px" }}>
+                      <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1 }}>{l.toUpperCase()}</div>
+                      <div style={{ fontSize:16, color:c, fontFamily:"monospace", marginTop:4 }}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display:"flex", gap:18, marginTop:13, fontSize:11, color:"#888", flexWrap:"wrap" }}>
+                  <span>✅ {current.wins} wins</span>
+                  <span>❌ {current.losses} losses</span>
+                  <span>Best: <span style={{ color:"#00ff88" }}>+${current.best.toFixed(2)}</span></span>
+                  <span>Worst: <span style={{ color:"#ff4466" }}>${current.worst.toFixed(2)}</span></span>
+                </div>
+              </div>
+
+              <div style={S.card}>
+                <div style={S.title}>Trades ({current.trade_count})</div>
+                {current.trades.slice().reverse().map((t,i) => (
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
+                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                      <span style={{ color:"#ccc", fontWeight:700 }}>{t.pair}</span>
+                      <span style={{ color: t.direction==="BUY" ? "#00ff88" : "#ff4466" }}>{t.direction}</span>
+                      {t.exit_reason && <span style={{ color:"#2a2a4a", fontSize:10 }}>{t.exit_reason}</span>}
+                    </div>
+                    <div style={{ display:"flex", gap:12, fontFamily:"monospace" }}>
+                      <span style={{ color:"#555" }}>{(t.actual_pips||0)>=0?"+":""}{t.actual_pips||0}p</span>
+                      <span style={{ color:plColor(t.realized_pl), minWidth:66, textAlign:"right" }}>{(t.realized_pl||0)>=0?"+":""}${(t.realized_pl||0).toFixed(2)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── ANALYTICS ────────────────────────────────────────────────────────────────
 function Analytics({ account, trades: openTrades }) {
   const [history,  setHistory]  = useState(null);
@@ -2711,6 +2822,7 @@ export default function App() {
     ai:           <AIInsights prices={prices} />,
     coach:        <Coach />,
     analytics:    <Analytics account={account} trades={trades} />,
+    reports:      <DailyReports />,
     backtest:     <Backtest />,
     settings:     <Settings keys={keys} setKeys={k => { setKeys(k); saveKeys(k); }} aiReady={aiReady} />,
   };

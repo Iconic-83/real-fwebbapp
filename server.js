@@ -2536,46 +2536,80 @@ app.post('/api/storage/:key', (req, res) => {
 // Server-side cache → frontend gets instant response, no rate limits ever
 // ═════════════════════════════════════════════════════════════════════════════
 const PAIRS = [
-  // Major USD pairs
+  // ── Major USD pairs ──────────────────────────────────────────────
   'EUR/USD','GBP/USD','USD/JPY','USD/CHF','USD/CAD','AUD/USD','NZD/USD',
-  // EUR crosses
-  'EUR/GBP','EUR/JPY','EUR/CHF','EUR/AUD','EUR/CAD','EUR/NZD',
-  // GBP crosses
-  'GBP/JPY','GBP/CHF','GBP/AUD','GBP/CAD','GBP/NZD',
-  // AUD crosses
-  'AUD/JPY','AUD/CAD','AUD/CHF','AUD/NZD',
-  // Other crosses
-  'CAD/JPY','NZD/JPY','CHF/JPY','NZD/CAD','NZD/CHF',
-  // Commodities
-  'XAU/USD','XAG/USD',
-  // Scandinavian
-  'USD/SEK','USD/NOK','USD/DKK','EUR/SEK','EUR/NOK',
-  // Emerging markets
-  'USD/ZAR','USD/MXN','USD/TRY','USD/SGD','USD/HKD','USD/CNH',
-  'USD/PLN','EUR/PLN','EUR/TRY','GBP/ZAR','EUR/ZAR',
-  // Asian crosses
-  'SGD/JPY','AUD/SGD',
-  // Precious metals
-  'XPT/USD','XPD/USD',
+  // ── EUR crosses ──────────────────────────────────────────────────
+  'EUR/GBP','EUR/JPY','EUR/CHF','EUR/AUD','EUR/CAD','EUR/NZD','EUR/SGD','EUR/HKD',
+  // ── GBP crosses ──────────────────────────────────────────────────
+  'GBP/JPY','GBP/CHF','GBP/AUD','GBP/CAD','GBP/NZD','GBP/SGD','GBP/HKD','GBP/PLN',
+  // ── AUD crosses ──────────────────────────────────────────────────
+  'AUD/JPY','AUD/CAD','AUD/CHF','AUD/NZD','AUD/SGD','AUD/HKD',
+  // ── NZD crosses ──────────────────────────────────────────────────
+  'NZD/JPY','NZD/CAD','NZD/CHF','NZD/SGD','NZD/HKD',
+  // ── CAD crosses ──────────────────────────────────────────────────
+  'CAD/JPY','CAD/CHF','CAD/SGD','CAD/HKD',
+  // ── CHF crosses ──────────────────────────────────────────────────
+  'CHF/JPY','CHF/HKD','CHF/ZAR',
+  // ── Other crosses ────────────────────────────────────────────────
+  'SGD/JPY','SGD/CHF','HKD/JPY','ZAR/JPY','TRY/JPY',
+  // ── Scandinavian ─────────────────────────────────────────────────
+  'USD/SEK','USD/NOK','USD/DKK','EUR/SEK','EUR/NOK','EUR/DKK',
+  // ── Central Europe ───────────────────────────────────────────────
+  'EUR/CZK','EUR/HUF','EUR/PLN','USD/CZK','USD/HUF','USD/PLN',
+  // ── Emerging markets ─────────────────────────────────────────────
+  'USD/ZAR','USD/MXN','USD/TRY','USD/SGD','USD/HKD','USD/CNH','USD/THB','USD/SAR',
+  'EUR/TRY','EUR/ZAR','GBP/ZAR',
+  // ── Precious metals ──────────────────────────────────────────────
+  'XAU/USD','XAG/USD','XPT/USD','XPD/USD',
 ];
-const OANDA_INSTR = 'EUR_USD,GBP_USD,USD_JPY,USD_CHF,USD_CAD,AUD_USD,NZD_USD,EUR_GBP,EUR_JPY,EUR_CHF,EUR_AUD,EUR_CAD,EUR_NZD,GBP_JPY,GBP_CHF,GBP_AUD,GBP_CAD,GBP_NZD,AUD_JPY,AUD_CAD,AUD_CHF,AUD_NZD,CAD_JPY,NZD_JPY,CHF_JPY,NZD_CAD,NZD_CHF,XAU_USD,XAG_USD,USD_SEK,USD_NOK,USD_DKK,EUR_SEK,EUR_NOK,USD_ZAR,USD_MXN,USD_TRY,USD_SGD,USD_HKD,USD_CNH,USD_PLN,EUR_PLN,EUR_TRY,GBP_ZAR,EUR_ZAR,SGD_JPY,AUD_SGD,XPT_USD,XPD_USD';
+// OANDA instrument codes are derived from PAIRS at poll time (slash → underscore).
+// Prices are fetched in resilient chunks (see fetchOandaPricing) so that one
+// unsupported instrument can never 400 the whole request and wipe all prices.
 
 let priceCache = {}, priceCacheTime = 0, priceSource = 'none';
 let spreadCache = {}; // pair → live spread (ask - bid)
 
+// Fetch OANDA pricing for a list of instruments. OANDA returns HTTP 400 for the
+// *entire* request if any single instrument is unsupported, so on failure we
+// binary-split the list and retry each half — this isolates the bad instrument
+// (dropping only it) while keeping every valid pair. O(log n) extra calls, and
+// only when a failure actually occurs.
+async function fetchOandaPricing(base, account, key, instruments) {
+  if (instruments.length === 0) return [];
+  try {
+    const r = await axios.get(
+      `${base}/v3/accounts/${account}/pricing?instruments=${instruments.join(',')}`,
+      { headers:{ Authorization:`Bearer ${key}` }, timeout:8000 }
+    );
+    return r.data?.prices || [];
+  } catch {
+    if (instruments.length === 1) return []; // lone unsupported/erroring instrument — drop it
+    const mid = Math.ceil(instruments.length / 2);
+    const [a, b] = await Promise.all([
+      fetchOandaPricing(base, account, key, instruments.slice(0, mid)),
+      fetchOandaPricing(base, account, key, instruments.slice(mid)),
+    ]);
+    return [...a, ...b];
+  }
+}
+
 async function pollPrices() {
   const keys = getApiKeys();
   if (keys.oanda_key && keys.oanda_account) {
+    const instruments = PAIRS.map(p => p.replace('/', '_'));
+    // Chunk to keep each request URL/response reasonable; chunks merge into one snapshot.
+    const chunks = [];
+    for (let i = 0; i < instruments.length; i += 25) chunks.push(instruments.slice(i, i + 25));
     const bases = ['https://api-fxpractice.oanda.com','https://api-fxtrade.oanda.com'];
     for (const base of bases) {
       try {
-        const r = await axios.get(
-          `${base}/v3/accounts/${keys.oanda_account}/pricing?instruments=${OANDA_INSTR}`,
-          { headers:{ Authorization:`Bearer ${keys.oanda_key}` }, timeout:8000 }
+        const results = await Promise.all(
+          chunks.map(c => fetchOandaPricing(base, keys.oanda_account, keys.oanda_key, c))
         );
-        if (r.data?.prices?.length > 0) {
+        const prices = results.flat();
+        if (prices.length > 0) {
           const m = {};
-          r.data.prices.forEach(p => {
+          prices.forEach(p => {
             const sym = p.instrument.replace('_','/');
             const bid = parseFloat(p.bids?.[0]?.price||0);
             const ask = parseFloat(p.asks?.[0]?.price||0);
@@ -4709,6 +4743,49 @@ app.post('/api/reports/daily', async (req, res) => {
     // Restore today's date so the scheduler doesn't fire again tonight
     setStorageValue('daily_report_sent', new Date().toISOString().slice(0, 10));
     res.json({ ok: true, msg: 'Daily report sent to Telegram' });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Day-by-day report history — aggregates every closed trade by calendar day so
+// the frontend can browse each trading day's P/L, win rate, pips and trade list.
+app.get('/api/reports/history', (req, res) => {
+  try {
+    const rows = db.prepare(`
+      SELECT pair, direction, realized_pl, actual_pips, confidence, exit_reason,
+             duration_mins, closed_at, date(closed_at) AS day
+      FROM signals
+      WHERE status='CLOSED' AND closed_at IS NOT NULL
+      ORDER BY closed_at ASC
+    `).all();
+
+    const byDay = {};
+    for (const t of rows) {
+      const d = t.day;
+      if (!d) continue;
+      if (!byDay[d]) byDay[d] = { date:d, trades:[], total_pl:0, total_pips:0, wins:0, losses:0 };
+      const pl = t.realized_pl || 0;
+      byDay[d].trades.push({
+        pair:t.pair, direction:t.direction, realized_pl:pl, actual_pips:t.actual_pips||0,
+        confidence:t.confidence, exit_reason:t.exit_reason, duration_mins:t.duration_mins, closed_at:t.closed_at,
+      });
+      byDay[d].total_pl   += pl;
+      byDay[d].total_pips += (t.actual_pips || 0);
+      if (pl > 0) byDay[d].wins++; else if (pl < 0) byDay[d].losses++;
+    }
+
+    const days = Object.values(byDay).map(d => ({
+      ...d,
+      trade_count: d.trades.length,
+      win_rate:    d.trades.length ? Math.round(d.wins / d.trades.length * 100) : 0,
+      total_pl:    +d.total_pl.toFixed(2),
+      total_pips:  +d.total_pips.toFixed(1),
+      best:        +d.trades.reduce((m,t) => Math.max(m, t.realized_pl||0), 0).toFixed(2),
+      worst:       +d.trades.reduce((m,t) => Math.min(m, t.realized_pl||0), 0).toFixed(2),
+    })).sort((a,b) => b.date.localeCompare(a.date));
+
+    res.json({ days });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }

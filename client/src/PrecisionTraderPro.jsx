@@ -1135,10 +1135,35 @@ function TradingViewWidget({ symbol, interval }) {
   return <div id={elId.current} ref={containerRef} style={{ width: "100%", height: "100%" }} />;
 }
 
-function Charts() {
+// Normalize an OANDA open trade into the shape TradeChart consumes.
+function normalizeOpenTrade(t, livePrice) {
+  const units = parseFloat(t.currentUnits ?? t.initialUnits ?? 0);
+  return {
+    id:          t.id,
+    pair:        PAIR_LABELS[t.instrument] || t.instrument,
+    instrument:  t.instrument,
+    direction:   units > 0 ? "BUY" : "SELL",
+    entryPrice:  parseFloat(t.price).toFixed(5),
+    closePrice:  null,
+    sl:          t.stopLossOrder?.price   || null,
+    tp:          t.takeProfitOrder?.price || null,
+    pl:          parseFloat(t.unrealizedPL || 0),
+    openTimeISO: t.openTime || null,
+    closeTimeISO:null,
+    isOpen:      true,
+    currentPrice: livePrice ?? parseFloat(t.price),
+    units:       Math.abs(units),
+  };
+}
+
+function Charts({ trades = [], prices = {} }) {
   const [pair, setPair] = useState("EUR_USD");
   const [tf, setTf]     = useState("H1");
   const tvSymbol = `OANDA:${pair.replace("_", "")}`;
+
+  // Open positions on the selected pair → native chart with entry/SL/TP lines.
+  const pairLabel = PAIR_LABELS[pair] || pair.replace("_", "/");
+  const openHere = trades.filter(t => t.instrument === pair);
 
   return (
     <div>
@@ -1153,6 +1178,28 @@ function Charts() {
         ))}
         <div style={{ marginLeft:"auto", fontSize:10, color:"#ffffff" }}>Live TradingView chart — {tvSymbol}</div>
       </div>
+
+      {/* Open position(s) on this pair — entry / SL / TP drawn as lines */}
+      {openHere.map(t => {
+        const n = normalizeOpenTrade(t, prices[pair]);
+        return (
+          <div key={t.id} style={{ ...S.card, marginBottom:12, padding:"11px 13px" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap", marginBottom:6 }}>
+              <span style={{ fontSize:11, color:"#00ccff", letterSpacing:2, textTransform:"uppercase", fontWeight:800 }}>Open Position — {pairLabel}</span>
+              <span style={{ ...S.badge, color:n.direction==="BUY"?"#00ff88":"#ff4466", background:n.direction==="BUY"?"#003322":"#330011", fontSize:9 }}>{n.direction}</span>
+              <span style={{ fontSize:10, color:"#ffffff" }}>Entry {n.entryPrice}</span>
+              {n.sl && <span style={{ fontSize:10, color:"#ff8888" }}>SL {n.sl}</span>}
+              {n.tp && <span style={{ fontSize:10, color:"#88ffbb" }}>TP {n.tp}</span>}
+              <span style={{ fontSize:10, color:"#ffffff" }}>{n.units.toLocaleString()} units</span>
+              <span style={{ marginLeft:"auto", fontFamily:"monospace", fontWeight:700, color:n.pl>=0?"#00ff88":"#ff4466" }}>
+                {n.pl>=0?"+":""}{n.pl.toFixed(2)} uPL
+              </span>
+            </div>
+            <TradeChart trade={n} />
+          </div>
+        );
+      })}
+
       <div style={{ ...S.card, padding:0, overflow:"hidden", height:560 }}>
         <TradingViewWidget symbol={tvSymbol} interval={TV_INTERVAL[tf]} />
       </div>
@@ -1197,8 +1244,10 @@ function TradeChart({ trade }) {
   const [candles, setCandles] = useState(null);
   const [err, setErr] = useState(null);
 
+  const isOpen  = !!trade.isOpen;
   const fromISO = trade.openTimeISO  || (trade.openTime  ? trade.openTime.replace(" ", "T") + ":00Z"  : null);
-  const toISO   = trade.closeTimeISO || (trade.closeTime ? trade.closeTime.replace(" ", "T") + ":00Z" : null);
+  const toISO   = trade.closeTimeISO || (trade.closeTime ? trade.closeTime.replace(" ", "T") + ":00Z" : null)
+                  || (isOpen ? new Date().toISOString() : null);
 
   useEffect(() => {
     let alive = true;
@@ -1216,7 +1265,8 @@ function TradeChart({ trade }) {
 
   const W = 560, H = 200, PADX = 8, PADTOP = 10, PADBOT = 16;
   const isLong = trade.direction === "BUY";
-  const entry = parseFloat(trade.entryPrice), exit = parseFloat(trade.closePrice);
+  const entry = parseFloat(trade.entryPrice);
+  const exit  = isOpen ? parseFloat(trade.currentPrice ?? entry) : parseFloat(trade.closePrice);
   const sl = trade.sl ? parseFloat(trade.sl) : null, tp = trade.tp ? parseFloat(trade.tp) : null;
 
   let max = Math.max(...candles.map(c => c.h), entry, exit);
@@ -1231,7 +1281,7 @@ function TradeChart({ trade }) {
 
   const tms = candles.map(c => Date.parse(c.t));
   const nearest = ms => { let bi = 0, bd = Infinity; tms.forEach((t, i) => { const d = Math.abs(t - ms); if (d < bd) { bd = d; bi = i; } }); return bi; };
-  const ei = nearest(Date.parse(fromISO)), xi = nearest(Date.parse(toISO));
+  const ei = nearest(Date.parse(fromISO)), xi = isOpen ? candles.length - 1 : nearest(Date.parse(toISO));
 
   const dp = (trade.pair.includes("JPY") || ["XAU/USD","XAG/USD"].includes(trade.pair)) ? 3 : 5;
   const Line = ({ v, color, label }) => v == null ? null : (
@@ -1253,16 +1303,21 @@ function TradeChart({ trade }) {
         );
       })}
       <Line v={entry} color="#00ccff" label="ENTRY" />
-      <Line v={exit}  color="#ffffff" label="EXIT" />
+      <Line v={exit}  color={isOpen ? "#ffcc00" : "#ffffff"} label={isOpen ? "MARK" : "EXIT"} />
       <Line v={sl}    color="#ff4466" label="SL" />
       <Line v={tp}    color="#00ff88" label="TP" />
       {/* Entry marker: ▲ for long, ▼ for short */}
       <text x={toX(ei)} y={toY(entry) + (isLong ? 15 : -7)} fill={isLong ? "#00ff88" : "#ff4466"} fontSize={15} textAnchor="middle" fontWeight="bold">{isLong ? "▲" : "▼"}</text>
-      {/* Exit marker: dot colored by P&L */}
+      {/* Exit / current marker: dot colored by P&L */}
       <circle cx={toX(xi)} cy={toY(exit)} r={3.5} fill={parseFloat(trade.pl) >= 0 ? "#00ff88" : "#ff4466"} stroke="#06061a" strokeWidth={0.8} />
-      {/* Direction badge */}
+      {/* Direction badge + live P&L for open positions */}
       <rect x={PADX} y={PADTOP} width={56} height={15} rx={3} fill={isLong ? "#003322" : "#330011"} />
       <text x={PADX + 6} y={PADTOP + 11} fill={isLong ? "#00ff88" : "#ff4466"} fontSize={9} fontWeight="bold">{isLong ? "▲ LONG" : "▼ SHORT"}</text>
+      {isOpen && trade.pl != null && (
+        <text x={PADX + 62} y={PADTOP + 11} fill={parseFloat(trade.pl) >= 0 ? "#00ff88" : "#ff4466"} fontSize={9} fontWeight="bold">
+          {parseFloat(trade.pl) >= 0 ? "+" : ""}{parseFloat(trade.pl).toFixed(2)} uPL
+        </text>
+      )}
     </svg>
   );
 }
@@ -2920,7 +2975,7 @@ export default function App() {
     dashboard:    <Dashboard account={account} trades={trades} prices={prices} prevPrices={prevPrices} oConn={oConn} tConn={tConn} aiReady={aiReady} priceAlerts={priceAlerts} onSetAlert={handleSetAlert} />,
     opportunities:<Opportunities prices={prices} keys={keys} addAlert={addAlert} />,
     trading:      <LiveTrading account={account} trades={trades} prices={prices} keys={keys} addAlert={addAlert} refresh={refresh} />,
-    charts:       <Charts />,
+    charts:       <Charts trades={trades} prices={prices} />,
     journal:      <Journal />,
     news:         <News />,
     alerts:       <Alerts alerts={sessionAlerts} keys={keys} priceAlerts={priceAlerts} setPriceAlerts={setPriceAlerts} />,

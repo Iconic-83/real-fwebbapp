@@ -1291,8 +1291,19 @@ function TradeChart({ trade }) {
     </g>
   );
 
+  // Risk/reward zones (TradingView position-tool style): reward = entry→TP
+  // (green), risk = entry→SL (red). Projected from the entry candle forward.
+  const zoneX = toX(ei), zoneW = Math.max(2, W - PADX - zoneX);
+  const Zone = ({ to, color }) => to == null ? null : (
+    <rect x={zoneX} y={Math.min(toY(entry), toY(to))} width={zoneW}
+      height={Math.max(1, Math.abs(toY(entry) - toY(to)))} fill={color} fillOpacity={0.13} />
+  );
+
   return (
     <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:200 }}>
+      {/* R:R zones behind the candles */}
+      <Zone to={tp} color="#00ff88" />
+      <Zone to={sl} color="#ff4466" />
       {candles.map((c, i) => {
         const up = c.c >= c.o, col = up ? "#00ff88" : "#ff4466", x = toX(i);
         return (

@@ -364,36 +364,135 @@ async function oandaRequest(path, method = 'GET', data = null, timeout = 12000) 
   throw new Error('OANDA unreachable');
 }
 
-// Fetch CLOSED trades resiliently. OANDA's /trades?state=CLOSED (and
-// /transactions) periodically returns 504 Gateway Timeout while pricing /
-// summary / openTrades stay healthy. We hit only the env-correct host with a
-// short timeout, cache the last good result, and fall back to that cache on
-// failure so the Journal/Analytics pages degrade gracefully instead of hanging.
+// Merge freshly fetched closed trades into the persistent cache (dedupe by id,
+// newest first). Because OANDA's history endpoints are flaky, each successful
+// (even partial) fetch ACCUMULATES into the cache, so the journal fills in
+// progressively across loads and survives outages.
+const CLOSED_CACHE_KEY = 'closed_trades_cache';
+function mergeClosedCache(newTrades) {
+  const cached = getStorageValue(CLOSED_CACHE_KEY);
+  const byId = {};
+  (cached?.trades || []).forEach(t => { byId[t.id] = t; });
+  (newTrades || []).forEach(t => { if (t && t.id) byId[t.id] = t; });
+  const merged = Object.values(byId)
+    .sort((a, b) => new Date(b.closeTime || 0) - new Date(a.closeTime || 0))
+    .slice(0, 500);
+  setStorageValue(CLOSED_CACHE_KEY, { at: Date.now(), trades: merged });
+  return merged;
+}
+
+// Reconstruct CLOSED trades from the transactions API. OANDA's
+// /trades?state=CLOSED and /trades?state=ALL routinely 504 (they scan the full
+// closed-trade set) while /transactions/idrange over a SMALL id window stays
+// responsive. We page backward from the last transaction id in small chunks,
+// pairing each ORDER_FILL's tradeOpened with its tradesClosed to rebuild the
+// same shape buildJournalData/history already consume. Partial results are fine
+// — mergeClosedCache accumulates them.
+function reduceFillsToClosedTrades(fills, count) {
+  const opens = {}, closes = {}, fullyClosed = new Set();
+  fills.forEach(tx => {
+    if (tx.type !== 'ORDER_FILL') return;
+    if (tx.tradeOpened) {
+      const o = tx.tradeOpened;
+      opens[o.tradeID] = { instrument: tx.instrument, price: o.price || tx.price, units: o.units, openTime: tx.time };
+    }
+    (tx.tradesClosed || []).forEach(c => fullyClosed.add(c.tradeID));
+    const arr = [...(tx.tradesClosed || [])];
+    if (tx.tradeReduced) arr.push(tx.tradeReduced);
+    arr.forEach(c => {
+      const cur = closes[c.tradeID] || { pl: 0, price: tx.price, closeTime: tx.time };
+      cur.pl += parseFloat(c.realizedPL || 0);
+      cur.price = c.price || tx.price;
+      cur.closeTime = tx.time;
+      closes[c.tradeID] = cur;
+    });
+  });
+  return Object.keys(closes)
+    .filter(id => opens[id] && fullyClosed.has(id))
+    .map(id => {
+      const o = opens[id], c = closes[id];
+      return {
+        id, instrument: o.instrument, price: o.price, averageClosePrice: c.price,
+        realizedPL: c.pl.toFixed(4), initialUnits: o.units, openTime: o.openTime, closeTime: c.closeTime,
+      };
+    })
+    .sort((a, b) => new Date(b.closeTime) - new Date(a.closeTime))
+    .slice(0, count);
+}
+
+async function reconstructClosedFromTransactions(count = 200, budgetMs = 14000) {
+  const keys = getApiKeys();
+  const base = oandaBases()[0];
+  const acct = keys.oanda_account;
+  const auth = { headers: { Authorization: `Bearer ${keys.oanda_key}` } };
+
+  let lastId = 0;
+  try {
+    const sum = await axios.get(`${base}/v3/accounts/${acct}/summary`, { ...auth, timeout: 6000 });
+    lastId = parseInt(sum.data?.account?.lastTransactionID || sum.data?.lastTransactionID || 0);
+  } catch { return []; }
+  if (!lastId) return [];
+
+  const CHUNK = 40; // small windows survive OANDA degradation (wide ranges 504)
+  const deadline = Date.now() + budgetMs;
+  const fills = [];
+  for (let to = lastId; to > 0 && Date.now() < deadline; to -= (CHUNK + 1)) {
+    const from = Math.max(1, to - CHUNK);
+    let got = false;
+    for (let attempt = 0; attempt < 2 && !got && Date.now() < deadline; attempt++) {
+      try {
+        const resp = await axios.get(
+          `${base}/v3/accounts/${acct}/transactions/idrange?from=${from}&to=${to}&type=ORDER_FILL`,
+          { ...auth, timeout: 5000 }
+        );
+        (resp.data?.transactions || []).forEach(t => fills.push(t));
+        got = true;
+      } catch { oandaFailCount++; /* retry once, then move on */ }
+    }
+  }
+  return reduceFillsToClosedTrades(fills, count);
+}
+
+// Fetch CLOSED trades resiliently: serve a fresh cache instantly, else try the
+// fast /trades endpoint, else reconstruct from transactions, else fall back to
+// any cached data — so Journal/Analytics never hang and history accumulates
+// even while OANDA's history endpoints are degraded.
 async function fetchClosedTrades(count = 200) {
   const keys = getApiKeys();
   if (!keys.oanda_key || !keys.oanda_account) {
     return { ok: false, trades: [], error: 'OANDA not configured', cachedAt: null };
   }
+  const cached = getStorageValue(CLOSED_CACHE_KEY);
+  // Fresh cache (<5 min) → instant.
+  if (cached?.trades?.length && (Date.now() - (cached.at || 0) < 5 * 60 * 1000)) {
+    return { ok: true, trades: cached.trades.slice(0, count), cachedAt: cached.at };
+  }
+
   const base = oandaBases()[0];
+  // 1) Fast path — the normal closed-trades endpoint (when OANDA is healthy).
   try {
     const resp = await axios.get(
       `${base}/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=${count}`,
-      { headers: { Authorization: `Bearer ${keys.oanda_key}` }, timeout: 7000 }
+      { headers: { Authorization: `Bearer ${keys.oanda_key}` }, timeout: 5000 }
     );
-    const trades = resp.data?.trades || [];
-    setStorageValue('closed_trades_cache', { at: Date.now(), trades });
-    return { ok: true, trades, cachedAt: null };
-  } catch (e) {
-    oandaFailCount++;
-    const status = e.response?.status;
-    const cached = getStorageValue('closed_trades_cache');
-    return {
-      ok: false,
-      trades: cached?.trades || [],
-      error: status ? `OANDA history unavailable (HTTP ${status})` : (e.code === 'ECONNABORTED' ? 'OANDA history timed out' : e.message),
-      cachedAt: cached?.at || null,
-    };
+    if (Array.isArray(resp.data?.trades) && resp.data.trades.length) {
+      return { ok: true, trades: mergeClosedCache(resp.data.trades).slice(0, count) };
+    }
+  } catch { oandaFailCount++; }
+
+  // 2) Fallback — reconstruct from the transactions API (works while /trades 504s).
+  try {
+    const recon = await reconstructClosedFromTransactions(count);
+    if (recon.length) {
+      return { ok: true, trades: mergeClosedCache(recon).slice(0, count), source: 'transactions' };
+    }
+  } catch { oandaFailCount++; }
+
+  // 3) Anything we have cached, even if stale.
+  if (cached?.trades?.length) {
+    return { ok: true, trades: cached.trades.slice(0, count), cachedAt: cached.at, stale: true };
   }
+  return { ok: false, trades: [], error: 'OANDA trade history is temporarily unavailable (OANDA servers are degraded). It will load automatically as their service recovers.', cachedAt: null };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

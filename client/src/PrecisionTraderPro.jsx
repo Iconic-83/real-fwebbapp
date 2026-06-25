@@ -1512,7 +1512,7 @@ function News() {
       <div style={{ display:"flex", flexDirection:"column", gap:9 }}>
         {events.map((e, i) => (
           <div key={i} style={{ ...S.card, borderLeft:`3px solid ${ic[e.impact]||"#e0e0ea"}`, display:"flex", alignItems:"flex-start", gap:14 }}>
-            <div style={{ fontFamily:"monospace", fontSize:12, color:"#888", minWidth:48, paddingTop:2 }}>{e.time || "—"}</div>
+            <div style={{ fontFamily:"monospace", fontSize:12, color:"#cfcfe0", minWidth:48, paddingTop:2 }}>{e.time || "—"}</div>
             <div style={{ minWidth:32, fontWeight:800, fontSize:12, color:"#ffffff", paddingTop:2 }}>{e.currency || "—"}</div>
             <span style={{ ...S.badge, color:ic[e.impact]||"#e0e0ea", background:`${ic[e.impact]||"#e0e0ea"}15`, border:`1px solid ${ic[e.impact]||"#e0e0ea"}33`, minWidth:60, textAlign:"center", flexShrink:0 }}>{e.impact || "—"}</span>
             <div style={{ flex:1 }}>
@@ -1674,7 +1674,7 @@ function AIInsights({ prices }) {
               {history.map((h, i) => (
                 <div key={i} onClick={() => { setResult(h.text); setIndicators(h.indicators); }}
                   style={{ cursor:"pointer", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
-                  <div style={{ color:"#888", fontWeight:700 }}>{h.pair}</div>
+                  <div style={{ color:"#cfcfe0", fontWeight:700 }}>{h.pair}</div>
                   <div style={{ color:"#ffffff", fontSize:10 }}>{h.time}</div>
                 </div>
               ))}
@@ -1726,17 +1726,17 @@ function AIInsights({ prices }) {
 
           <div style={S.card}>
             {!result && !loading && !error && (
-              <div style={{ height:220, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#888" }}>
+              <div style={{ height:220, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#cfcfe0" }}>
                 <div style={{ fontSize:44, marginBottom:12 }}>✦</div>
                 <div style={{ fontSize:12 }}>Analysis uses real 50-candle OANDA data</div>
-                <div style={{ fontSize:10, color:"#888", marginTop:6 }}>EMA, RSI, ATR, Support/Resistance all calculated live</div>
+                <div style={{ fontSize:10, color:"#cfcfe0", marginTop:6 }}>EMA, RSI, ATR, Support/Resistance all calculated live</div>
               </div>
             )}
             {loading && (
               <div style={{ height:220, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
                 <div style={{ color:"#00ccff", letterSpacing:3, fontSize:12, animation:"pulse 1s infinite" }}>FETCHING CANDLES + ANALYZING...</div>
                 <div style={{ color:"#ffffff", marginTop:10, fontSize:11 }}>50 H1 candles + 20 H4 candles from OANDA</div>
-                <div style={{ color:"#888", marginTop:4, fontSize:11 }}>{PAIR_LABELS[pair]}</div>
+                <div style={{ color:"#cfcfe0", marginTop:4, fontSize:11 }}>{PAIR_LABELS[pair]}</div>
               </div>
             )}
             {error && (
@@ -1813,7 +1813,7 @@ function Coach() {
               {history.map(h => (
                 <div key={h.id} onClick={() => setResult({ report: h.report, stats: { winRate: h.win_rate }, summary: h.summary })}
                   style={{ cursor:"pointer", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
-                  <div style={{ color:"#888" }}>{new Date(h.created_at).toLocaleString()}</div>
+                  <div style={{ color:"#cfcfe0" }}>{new Date(h.created_at).toLocaleString()}</div>
                   <div style={{ color:"#ffffff", fontSize:10 }}>{h.trade_count} trades · {h.win_rate}% WR</div>
                 </div>
               ))}
@@ -1824,10 +1824,10 @@ function Coach() {
         <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
           <div style={S.card}>
             {!result && !loading && !error && (
-              <div style={{ height:260, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#888" }}>
+              <div style={{ height:260, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#cfcfe0" }}>
                 <div style={{ fontSize:44, marginBottom:12 }}>✦</div>
                 <div style={{ fontSize:12 }}>Reviews your closed trades + psychology notes</div>
-                <div style={{ fontSize:10, color:"#888", marginTop:6 }}>GPT-4o reasons only over your real stats — never invents numbers</div>
+                <div style={{ fontSize:10, color:"#cfcfe0", marginTop:6 }}>GPT-4o reasons only over your real stats — never invents numbers</div>
               </div>
             )}
             {loading && (
@@ -1915,18 +1915,18 @@ function DailyReports() {
               <div style={{ ...S.title, marginBottom:0 }}>Trading Days</div>
               <span onClick={load} title="Refresh" style={{ cursor:"pointer", color:"#00ccff", fontSize:13 }}>⟳</span>
             </div>
-            {loading && <div style={{ color:"#2a2a4a", fontSize:11 }}>Loading…</div>}
-            {!loading && days.length === 0 && <div style={{ color:"#2a2a4a", fontSize:11, lineHeight:1.6 }}>No closed trades yet. Days appear here once trades close.</div>}
+            {loading && <div style={{ color:"#ffffff", fontSize:11 }}>Loading…</div>}
+            {!loading && days.length === 0 && <div style={{ color:"#ffffff", fontSize:11, lineHeight:1.6 }}>No closed trades yet. Days appear here once trades close.</div>}
             {days.map(d => (
               <div key={d.date} onClick={() => setSel(d.date)}
                 style={{ cursor:"pointer", padding:"9px 8px", borderRadius:6, marginBottom:3,
                   background: d.date===sel ? "#0d0d2a" : "transparent",
                   borderLeft: d.date===sel ? "2px solid #00ccff" : "2px solid transparent" }}>
                 <div style={{ display:"flex", justifyContent:"space-between", fontSize:11 }}>
-                  <span style={{ color:"#bbb" }}>{d.date}</span>
+                  <span style={{ color:"#ffffff" }}>{d.date}</span>
                   <span style={{ color:plColor(d.total_pl), fontFamily:"monospace" }}>{d.total_pl>=0?"+":""}${d.total_pl}</span>
                 </div>
-                <div style={{ color:"#2a2a4a", fontSize:10, marginTop:2 }}>{d.trade_count} trades · {d.win_rate}% WR</div>
+                <div style={{ color:"#ffffff", fontSize:10, marginTop:2 }}>{d.trade_count} trades · {d.win_rate}% WR</div>
               </div>
             ))}
           </div>
@@ -1936,7 +1936,7 @@ function DailyReports() {
         <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
           {error && <div style={{ padding:16, color:"#ff4466", background:"#1a0808", borderRadius:8, fontSize:12 }}>⚠ {error}</div>}
           {!current && !loading && !error && (
-            <div style={S.card}><div style={{ color:"#1a1a30", fontSize:12, padding:30, textAlign:"center" }}>Select a day to view its report.</div></div>
+            <div style={S.card}><div style={{ color:"#cfcfe0", fontSize:12, padding:30, textAlign:"center" }}>Select a day to view its report.</div></div>
           )}
           {current && (
             <>
@@ -1945,17 +1945,17 @@ function DailyReports() {
                 <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
                   {[
                     ["Net P/L",  `${current.total_pl>=0?"+":""}$${current.total_pl}`, plColor(current.total_pl)],
-                    ["Trades",   current.trade_count, "#ccc"],
+                    ["Trades",   current.trade_count, "#ffffff"],
                     ["Win Rate", `${current.win_rate}%`, current.win_rate>=50?"#00ff88":"#ffcc00"],
                     ["Pips",     `${current.total_pips>=0?"+":""}${current.total_pips}`, plColor(current.total_pips)],
                   ].map(([l,v,c]) => (
                     <div key={l} style={{ background:"#0a0a1e", borderRadius:7, padding:"10px 8px" }}>
-                      <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1 }}>{l.toUpperCase()}</div>
+                      <div style={{ fontSize:9, color:"#ffffff", letterSpacing:1 }}>{l.toUpperCase()}</div>
                       <div style={{ fontSize:16, color:c, fontFamily:"monospace", marginTop:4 }}>{v}</div>
                     </div>
                   ))}
                 </div>
-                <div style={{ display:"flex", gap:18, marginTop:13, fontSize:11, color:"#888", flexWrap:"wrap" }}>
+                <div style={{ display:"flex", gap:18, marginTop:13, fontSize:11, color:"#cfcfe0", flexWrap:"wrap" }}>
                   <span>✅ {current.wins} wins</span>
                   <span>❌ {current.losses} losses</span>
                   <span>Best: <span style={{ color:"#00ff88" }}>+${current.best.toFixed(2)}</span></span>
@@ -1968,12 +1968,12 @@ function DailyReports() {
                 {current.trades.slice().reverse().map((t,i) => (
                   <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
                     <div style={{ display:"flex", gap:8, alignItems:"center" }}>
-                      <span style={{ color:"#ccc", fontWeight:700 }}>{t.pair}</span>
+                      <span style={{ color:"#ffffff", fontWeight:700 }}>{t.pair}</span>
                       <span style={{ color: t.direction==="BUY" ? "#00ff88" : "#ff4466" }}>{t.direction}</span>
-                      {t.exit_reason && <span style={{ color:"#2a2a4a", fontSize:10 }}>{t.exit_reason}</span>}
+                      {t.exit_reason && <span style={{ color:"#ffffff", fontSize:10 }}>{t.exit_reason}</span>}
                     </div>
                     <div style={{ display:"flex", gap:12, fontFamily:"monospace" }}>
-                      <span style={{ color:"#555" }}>{(t.actual_pips||0)>=0?"+":""}{t.actual_pips||0}p</span>
+                      <span style={{ color:"#e0e0ea" }}>{(t.actual_pips||0)>=0?"+":""}{t.actual_pips||0}p</span>
                       <span style={{ color:plColor(t.realized_pl), minWidth:66, textAlign:"right" }}>{(t.realized_pl||0)>=0?"+":""}${(t.realized_pl||0).toFixed(2)}</span>
                     </div>
                   </div>
@@ -2114,7 +2114,7 @@ function Analytics({ account, trades: openTrades }) {
                       return (
                         <div key={l} style={{ marginBottom:10 }}>
                           <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
-                            <span style={{ color:"#888" }}>{l}</span>
+                            <span style={{ color:"#cfcfe0" }}>{l}</span>
                             <span style={{ color:c, fontFamily:"monospace" }}>{v||0} ({pct}%)</span>
                           </div>
                           <div style={{ height:4, background:"#0d0d1e", borderRadius:2 }}>
@@ -2224,7 +2224,7 @@ function Analytics({ account, trades: openTrades }) {
                   <div style={S.title}>Slippage by Pair</div>
                   {Object.entries(slippage.by_pair || {}).map(([pair, ps]) => (
                     <div key={pair} style={{ display:"flex", justifyContent:"space-between", padding:"6px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
-                      <span style={{ color:"#888", fontWeight:700 }}>{pair}</span>
+                      <span style={{ color:"#cfcfe0", fontWeight:700 }}>{pair}</span>
                       <div style={{ display:"flex", gap:12, fontFamily:"monospace" }}>
                         <span style={{ color:"#e0e0ea" }}>{ps.count} fills</span>
                         <span style={{ color:parseFloat(ps.avgSlip)>2?"#ff4466":parseFloat(ps.avgSlip)>1?"#ffcc00":"#00ff88" }}>
@@ -2246,8 +2246,8 @@ function Analytics({ account, trades: openTrades }) {
                   <div key={i} style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr", gap:6, fontSize:11, padding:"5px 0", borderBottom:"1px solid #0a0a18" }}>
                     <span style={{ color:"#ffffff", fontWeight:700 }}>{f.pair}</span>
                     <span style={{ color:"#e0e0ea" }}>{f.session}</span>
-                    <span style={{ fontFamily:"monospace", color:"#888" }}>{parseFloat(f.expected_px||0).toFixed(5)}</span>
-                    <span style={{ fontFamily:"monospace", color:"#888" }}>{parseFloat(f.actual_px||0).toFixed(5)}</span>
+                    <span style={{ fontFamily:"monospace", color:"#cfcfe0" }}>{parseFloat(f.expected_px||0).toFixed(5)}</span>
+                    <span style={{ fontFamily:"monospace", color:"#cfcfe0" }}>{parseFloat(f.actual_px||0).toFixed(5)}</span>
                     <span style={{ fontFamily:"monospace", color:parseFloat(f.slippage_pips)>2?"#ff4466":"#888" }}>
                       {parseFloat(f.slippage_pips||0).toFixed(1)}p
                     </span>
@@ -2875,7 +2875,7 @@ export default function App() {
             );
           })}
         </div>
-        <div onClick={() => setCol(!col)} style={{ padding:"11px 13px", borderTop:"1px solid #13132b", cursor:"pointer", color:"#888", fontSize:12, display:"flex", alignItems:"center", gap:7 }}>
+        <div onClick={() => setCol(!col)} style={{ padding:"11px 13px", borderTop:"1px solid #13132b", cursor:"pointer", color:"#cfcfe0", fontSize:12, display:"flex", alignItems:"center", gap:7 }}>
           <span>{col ? "▶" : "◀"}</span>{!col && <span style={{ fontSize:10 }}>Collapse</span>}
         </div>
       </div>
@@ -2884,15 +2884,15 @@ export default function App() {
       <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
         {/* Top bar */}
         <div style={{ height:46, borderBottom:"1px solid #13132b", display:"flex", alignItems:"center", padding:"0 16px", gap:12, background:"#05051a", flexShrink:0 }}>
-          <div style={{ fontSize:10, color:"#888", letterSpacing:3, textTransform:"uppercase", flex:1 }}>{NAV.find(n => n.id === page)?.label}</div>
+          <div style={{ fontSize:10, color:"#cfcfe0", letterSpacing:3, textTransform:"uppercase", flex:1 }}>{NAV.find(n => n.id === page)?.label}</div>
           <div style={{ display:"flex", gap:12, alignItems:"center" }}>
             {Object.entries(prices).slice(0, 3).map(([p, v]) => (
               <div key={p} style={{ fontSize:10, fontFamily:"monospace", display:"flex", gap:4 }}>
-                <span style={{ color:"#888" }}>{PAIR_LABELS[p]}</span>
+                <span style={{ color:"#cfcfe0" }}>{PAIR_LABELS[p]}</span>
                 <span style={{ color:"#00ccff" }}>{v.toFixed?.(4)}</span>
               </div>
             ))}
-            <div style={{ fontSize:10, color:"#888", fontFamily:"monospace" }}>{time.toUTCString().slice(17, 25)} UTC</div>
+            <div style={{ fontSize:10, color:"#cfcfe0", fontFamily:"monospace" }}>{time.toUTCString().slice(17, 25)} UTC</div>
             <div style={{ display:"flex", alignItems:"center", gap:5 }}>
               <div style={{ width:6, height:6, borderRadius:"50%", background:(oConn||tConn)?"#00ff88":"#ff4466", animation:(oConn||tConn)?"pulse 2s infinite":"none" }} />
               <span style={{ fontSize:10, color:(oConn||tConn)?"#00ff88":"#ff4466" }}>{(oConn||tConn) ? "LIVE" : "OFFLINE"}</span>

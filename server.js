@@ -396,24 +396,39 @@ function reduceFillsToClosedTrades(fills, count) {
       const o = tx.tradeOpened;
       opens[o.tradeID] = { instrument: tx.instrument, price: o.price || tx.price, units: o.units, openTime: tx.time };
     }
-    (tx.tradesClosed || []).forEach(c => fullyClosed.add(c.tradeID));
-    const arr = [...(tx.tradesClosed || [])];
-    if (tx.tradeReduced) arr.push(tx.tradeReduced);
-    arr.forEach(c => {
-      const cur = closes[c.tradeID] || { pl: 0, price: tx.price, closeTime: tx.time };
+    // Only tradesClosed (NOT tradeReduced) mark a trade as fully closed; a reduce
+    // leaves the trade open, so it must not appear in closed-trade history.
+    (tx.tradesClosed || []).forEach(c => {
+      fullyClosed.add(c.tradeID);
+      const cur = closes[c.tradeID] || { pl: 0, price: tx.price, closeTime: tx.time, instrument: tx.instrument, units: 0 };
       cur.pl += parseFloat(c.realizedPL || 0);
-      cur.price = c.price || tx.price;
+      cur.price = c.price || tx.price;     // close price
       cur.closeTime = tx.time;
+      cur.instrument = tx.instrument;
+      cur.units += parseFloat(c.units || 0); // signed units of the closing order(s)
       closes[c.tradeID] = cur;
     });
   });
+  // Emit EVERY fully-closed trade from its closing fill — the closing fill alone
+  // carries realizedPL, instrument, close price/time and units, which is all the
+  // journal/analytics need. Enrich with the opening fill when it happens to be in
+  // the scanned window; otherwise derive direction from the close-side units sign
+  // (open units = −close units) and fall back the entry price to the close price.
+  // (OANDA's /trades endpoint 504s, so the opening fill is often unreachable — we
+  // must NOT require it, or all closed trades would be dropped.)
   return Object.keys(closes)
-    .filter(id => opens[id] && fullyClosed.has(id))
+    .filter(id => fullyClosed.has(id))
     .map(id => {
-      const o = opens[id], c = closes[id];
+      const c = closes[id], o = opens[id] || null;
       return {
-        id, instrument: o.instrument, price: o.price, averageClosePrice: c.price,
-        realizedPL: c.pl.toFixed(4), initialUnits: o.units, openTime: o.openTime, closeTime: c.closeTime,
+        id,
+        instrument: o ? o.instrument : c.instrument,
+        price: o ? o.price : c.price,            // entry: open price if known, else close price
+        averageClosePrice: c.price,
+        realizedPL: c.pl.toFixed(4),
+        initialUnits: o ? o.units : (-c.units).toString(), // signed → BUY/SELL direction
+        openTime: o ? o.openTime : null,
+        closeTime: c.closeTime,
       };
     })
     .sort((a, b) => new Date(b.closeTime) - new Date(a.closeTime))
@@ -433,22 +448,23 @@ async function reconstructClosedFromTransactions(count = 200, budgetMs = 14000) 
   } catch { return []; }
   if (!lastId) return [];
 
-  const CHUNK = 40; // small windows survive OANDA degradation (wide ranges 504)
+  const CHUNK = 60; // small windows survive OANDA degradation (wide ranges 504)
   const deadline = Date.now() + budgetMs;
   const fills = [];
+  // Page backward from the newest transaction. OANDA intermittently has "poison"
+  // id-ranges that hang for the full timeout while neighbouring windows return in
+  // <1s. Use a SHORT timeout and NO retry so a slow window is abandoned quickly
+  // and the budget is spent scanning more good windows (history accumulates into
+  // the cache across loads regardless).
   for (let to = lastId; to > 0 && Date.now() < deadline; to -= (CHUNK + 1)) {
     const from = Math.max(1, to - CHUNK);
-    let got = false;
-    for (let attempt = 0; attempt < 2 && !got && Date.now() < deadline; attempt++) {
-      try {
-        const resp = await axios.get(
-          `${base}/v3/accounts/${acct}/transactions/idrange?from=${from}&to=${to}&type=ORDER_FILL`,
-          { ...auth, timeout: 5000 }
-        );
-        (resp.data?.transactions || []).forEach(t => fills.push(t));
-        got = true;
-      } catch { oandaFailCount++; /* retry once, then move on */ }
-    }
+    try {
+      const resp = await axios.get(
+        `${base}/v3/accounts/${acct}/transactions/idrange?from=${from}&to=${to}&type=ORDER_FILL`,
+        { ...auth, timeout: 2500 }
+      );
+      (resp.data?.transactions || []).forEach(t => fills.push(t));
+    } catch { oandaFailCount++; /* slow/poison window — skip fast, keep scanning */ }
   }
   return reduceFillsToClosedTrades(fills, count);
 }
@@ -2370,9 +2386,13 @@ async function reconcileTrades() {
         if (oTrade.stopLossOrder?.state   === 'FILLED') exitReason = 'SL_HIT';
         if (oTrade.takeProfitOrder?.state === 'FILLED') exitReason = 'TP_HIT';
 
-        const openMs  = new Date(oTrade.openTime).getTime();
+        // openTime falls back to the signal's own creation time when OANDA's
+        // opening fill is unreachable (reconstructed-from-close trades), so the
+        // duration stays a real number instead of NaN.
+        const openMs  = new Date(oTrade.openTime || sig.created_at).getTime();
         const closeMs = new Date(oTrade.closeTime).getTime();
-        const durMins = Math.round((closeMs - openMs) / 60000);
+        const durMins = Number.isFinite(openMs) && Number.isFinite(closeMs)
+          ? Math.round((closeMs - openMs) / 60000) : null;
 
         db.prepare(`
           UPDATE signals SET

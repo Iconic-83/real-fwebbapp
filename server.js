@@ -328,10 +328,20 @@ function getOandaAvgLatency() {
   return oandaLatencyLog.reduce((s, v) => s + v, 0) / oandaLatencyLog.length;
 }
 
-async function oandaRequest(path, method = 'GET', data = null) {
+// Order OANDA hosts by the configured environment so we hit the correct one
+// FIRST (and avoid burning a full timeout on the wrong host). Defaults to
+// practice. The other host stays as a fallback for misconfiguration.
+function oandaBases() {
+  const env = (process.env.OANDA_ENV || '').toLowerCase();
+  const practice = 'https://api-fxpractice.oanda.com';
+  const live     = 'https://api-fxtrade.oanda.com';
+  return (env === 'live' || env === 'trade') ? [live, practice] : [practice, live];
+}
+
+async function oandaRequest(path, method = 'GET', data = null, timeout = 12000) {
   const keys = getApiKeys();
   if (!keys.oanda_key) throw new Error('OANDA key not configured');
-  const bases = ['https://api-fxpractice.oanda.com', 'https://api-fxtrade.oanda.com'];
+  const bases = oandaBases();
   for (const base of bases) {
     const t0 = Date.now();
     try {
@@ -339,7 +349,7 @@ async function oandaRequest(path, method = 'GET', data = null) {
         method, url: base + path,
         data: data || undefined,
         headers: { Authorization: `Bearer ${keys.oanda_key}`, 'Content-Type': 'application/json' },
-        timeout: 12000,
+        timeout,
       });
       const ms = Date.now() - t0;
       oandaLatencyLog.push(ms);
@@ -352,6 +362,38 @@ async function oandaRequest(path, method = 'GET', data = null) {
   }
   oandaFailCount++;
   throw new Error('OANDA unreachable');
+}
+
+// Fetch CLOSED trades resiliently. OANDA's /trades?state=CLOSED (and
+// /transactions) periodically returns 504 Gateway Timeout while pricing /
+// summary / openTrades stay healthy. We hit only the env-correct host with a
+// short timeout, cache the last good result, and fall back to that cache on
+// failure so the Journal/Analytics pages degrade gracefully instead of hanging.
+async function fetchClosedTrades(count = 200) {
+  const keys = getApiKeys();
+  if (!keys.oanda_key || !keys.oanda_account) {
+    return { ok: false, trades: [], error: 'OANDA not configured', cachedAt: null };
+  }
+  const base = oandaBases()[0];
+  try {
+    const resp = await axios.get(
+      `${base}/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=${count}`,
+      { headers: { Authorization: `Bearer ${keys.oanda_key}` }, timeout: 7000 }
+    );
+    const trades = resp.data?.trades || [];
+    setStorageValue('closed_trades_cache', { at: Date.now(), trades });
+    return { ok: true, trades, cachedAt: null };
+  } catch (e) {
+    oandaFailCount++;
+    const status = e.response?.status;
+    const cached = getStorageValue('closed_trades_cache');
+    return {
+      ok: false,
+      trades: cached?.trades || [],
+      error: status ? `OANDA history unavailable (HTTP ${status})` : (e.code === 'ECONNABORTED' ? 'OANDA history timed out' : e.message),
+      cachedAt: cached?.at || null,
+    };
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2210,8 +2252,7 @@ async function reconcileTrades() {
     // ── Part 1: Close reconciliation (existing logic, enhanced) ─────────────
     const pending = _stmtPendingReconcile.all();
     if (pending.length) {
-      const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=50`);
-      const closed = r?.trades || [];
+      const closed = (await fetchClosedTrades(50)).trades;
 
       for (const sig of pending) {
         const oTrade = closed.find(t => t.id === sig.trade_id);
@@ -2600,7 +2641,7 @@ async function pollPrices() {
     // Chunk to keep each request URL/response reasonable; chunks merge into one snapshot.
     const chunks = [];
     for (let i = 0; i < instruments.length; i += 25) chunks.push(instruments.slice(i, i + 25));
-    const bases = ['https://api-fxpractice.oanda.com','https://api-fxtrade.oanda.com'];
+    const bases = oandaBases();
     for (const base of bases) {
       try {
         const results = await Promise.all(
@@ -2666,7 +2707,7 @@ app.all('/api/oanda/*', async (req, res) => {
   const keys = getApiKeys();
   if (!keys.oanda_key) return res.status(400).json({ error:'OANDA key not configured' });
   const oandaPath = req.path.replace('/api/oanda','');
-  const bases = ['https://api-fxpractice.oanda.com','https://api-fxtrade.oanda.com'];
+  const bases = oandaBases();
   for (const base of bases) {
     try {
       const r = await axios({
@@ -5025,8 +5066,8 @@ app.get('/api/history', async (req, res) => {
   if (!keys.oanda_key || !keys.oanda_account) return res.status(400).json({ error:'OANDA not configured' });
   try {
     const count = parseInt(req.query.count || 50);
-    const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=${count}`);
-    const trades = (r?.trades || []).map(t => ({
+    const closedRes = await fetchClosedTrades(count);
+    const trades = (closedRes.trades || []).map(t => ({
       id:          t.id,
       pair:        (PAIR_LABELS[t.instrument] || t.instrument),
       direction:   parseFloat(t.initialUnits) > 0 ? 'BUY' : 'SELL',
@@ -5058,7 +5099,9 @@ app.get('/api/history', async (req, res) => {
     const avgLoss = lost.length ? lost.reduce((s,t) => s + t.pl, 0) / lost.length : 0;
     const rr      = avgLoss < 0 ? Math.abs(avgWin / avgLoss).toFixed(2) : '—';
 
-    res.json({ trades, stats: { total:trades.length, won:won.length, lost:lost.length, be:be.length,
+    res.json({ trades, historyError: closedRes.ok ? null : closedRes.error,
+      stale: !closedRes.ok && trades.length > 0,
+      stats: { total:trades.length, won:won.length, lost:lost.length, be:be.length,
       total_pl:totalPL.toFixed(2), win_rate:winRate, avg_win:avgWin.toFixed(2),
       avg_loss:avgLoss.toFixed(2), rr } });
   } catch(e) {
@@ -5261,8 +5304,8 @@ async function buildJournalData(count = 200) {
   const keys = getApiKeys();
   if (!keys.oanda_key || !keys.oanda_account) return null;
 
-  const r = await oandaRequest(`/v3/accounts/${keys.oanda_account}/trades?state=CLOSED&count=${count}`);
-  const rawTrades = r?.trades || [];
+  const closedRes = await fetchClosedTrades(count);
+  const rawTrades = closedRes.trades;
 
   // Pull our signals for this account (to merge confidence, score)
   const ourSignals = db.prepare(`SELECT * FROM signals WHERE status='EXECUTED' ORDER BY created_at DESC`).all();
@@ -5379,6 +5422,8 @@ async function buildJournalData(count = 200) {
       trades,
       equityCurve,
       monthlyPL,
+      historyError: closedRes.ok ? null : closedRes.error,
+      stale:        !closedRes.ok && trades.length > 0,
       stats: {
         total:      trades.length,
         won:        won.length,

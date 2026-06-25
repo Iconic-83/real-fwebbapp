@@ -229,12 +229,12 @@ function useTwelve(keys) {
 // ─── UI ATOMS ────────────────────────────────────────────────────────────────
 const S = {
   card:  { background:"#0b0b1f", border:"1px solid #13132b", borderRadius:12, padding:"15px 17px" },
-  title: { fontSize:10, color:"#2a2a4a", letterSpacing:3, textTransform:"uppercase", marginBottom:12, fontWeight:800 },
-  ph:    { fontSize:17, fontWeight:800, color:"#ccc", letterSpacing:3, marginBottom:18, textTransform:"uppercase" },
+  title: { fontSize:10, color:"#ffffff", letterSpacing:3, textTransform:"uppercase", marginBottom:12, fontWeight:800 },
+  ph:    { fontSize:17, fontWeight:800, color:"#ffffff", letterSpacing:3, marginBottom:18, textTransform:"uppercase" },
   badge: { display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:10, fontWeight:800, letterSpacing:1 },
   btn:   { padding:"8px 18px", borderRadius:8, cursor:"pointer", fontSize:12, fontWeight:700, letterSpacing:1, border:"none" },
-  lbl:   { display:"block", fontSize:10, color:"#333", textTransform:"uppercase", letterSpacing:2, marginBottom:4, fontWeight:700 },
-  inp:   { display:"block", width:"100%", background:"#07071a", border:"1px solid #13132b", borderRadius:8, padding:"9px 12px", color:"#bbb", fontSize:13, fontFamily:"monospace", outline:"none", boxSizing:"border-box" },
+  lbl:   { display:"block", fontSize:10, color:"#ffffff", textTransform:"uppercase", letterSpacing:2, marginBottom:4, fontWeight:700 },
+  inp:   { display:"block", width:"100%", background:"#07071a", border:"1px solid #13132b", borderRadius:8, padding:"9px 12px", color:"#ffffff", fontSize:13, fontFamily:"monospace", outline:"none", boxSizing:"border-box" },
 };
 
 function Pill({ ok, label }) {
@@ -266,7 +266,7 @@ function PriceRow({ pair, prices, prevPrices = {}, alertPrices = [], onSetAlert 
   const hasAlert = alertPrices.some(a => a.pair === pair && a.active);
   return (
     <div style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 0", borderBottom:"1px solid #0d0d1e" }}>
-      <div style={{ minWidth:58, fontSize:12, fontWeight:800, color:"#bbb" }}>{PAIR_LABELS[pair]}</div>
+      <div style={{ minWidth:58, fontSize:12, fontWeight:800, color:"#ffffff" }}>{PAIR_LABELS[pair]}</div>
       <Sparkline data={hist} color={up ? "#00ff88" : "#ff4466"} />
       <div style={{ fontFamily:"monospace", fontSize:12, color:up?"#00ff88":"#ff4466", minWidth:82, textAlign:"right" }}>
         {p ? p.toFixed(dp) : "—"}
@@ -338,7 +338,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
         <Pill ok={oConn}   label="OANDA" />
         <Pill ok={tConn}   label="LIVE PRICES" />
         <Pill ok={aiReady} label="GPT-4o AI" />
-        {account && <span style={{ marginLeft:"auto", fontSize:11, color:"#2a2a4a", fontFamily:"monospace" }}>ID: {account.id?.slice(-8)}</span>}
+        {account && <span style={{ marginLeft:"auto", fontSize:11, color:"#ffffff", fontFamily:"monospace" }}>ID: {account.id?.slice(-8)}</span>}
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:13 }}>
         {[
@@ -372,7 +372,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
               ["Status",risk.daily_loss.breached?"⛔ BLOCKED":"✅ CLEAR", risk.daily_loss.breached?"#ff4466":"#00ff88"],
             ].map(([l,v,c]) => (
               <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:11, padding:"4px 0", borderBottom:"1px solid #0d0d1e" }}>
-                <span style={{ color:"#444" }}>{l}</span>
+                <span style={{ color:"#e0e0ea" }}>{l}</span>
                 <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
               </div>
             ))}
@@ -381,24 +381,24 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
 
         {/* Weekly loss + circuit breaker */}
         {risk && (
-          <div style={{ ...S.card, borderLeft:`3px solid ${risk.weekly_loss.breached||risk.consecutive_losses.breached?"#ff4466":"#333"}` }}>
+          <div style={{ ...S.card, borderLeft:`3px solid ${risk.weekly_loss.breached||risk.consecutive_losses.breached?"#ff4466":"#ffffff"}` }}>
             <div style={S.title}>Weekly + Circuit Breaker</div>
             <div style={{ height:5, background:"#0d0d1e", borderRadius:3, margin:"8px 0" }}>
               <div style={{ height:"100%", width:`${Math.min(100, parseFloat(risk.weekly_loss.used_pct))}%`,
-                background:risk.weekly_loss.breached?"#ff4466":parseFloat(risk.weekly_loss.used_pct)>60?"#ffcc00":"#333",
+                background:risk.weekly_loss.breached?"#ff4466":parseFloat(risk.weekly_loss.used_pct)>60?"#ffcc00":"#ffffff",
                 borderRadius:3, transition:"width 0.5s" }} />
             </div>
             {[
               ["Weekly P&L",  risk.weekly_loss.realized, parseFloat(risk.weekly_loss.realized)>=0?"#00ff88":"#ff4466"],
               ["Weekly Limit",risk.weekly_loss.limit,    "#ff446699"],
-              ["Week from",   risk.weekly_loss.week_start,"#666"],
+              ["Week from",   risk.weekly_loss.week_start,"#e0e0ea"],
               ["Consec. Losses", `${risk.consecutive_losses.count} / 3`,
                 risk.consecutive_losses.count>=3?"#ff4466":risk.consecutive_losses.count>=2?"#ffcc00":"#00ff88"],
               ["Circuit Break", risk.consecutive_losses.breached?"⛔ ACTIVE":"✅ OFF",
                 risk.consecutive_losses.breached?"#ff4466":"#00ff88"],
             ].map(([l,v,c]) => (
               <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:11, padding:"4px 0", borderBottom:"1px solid #0d0d1e" }}>
-                <span style={{ color:"#444" }}>{l}</span>
+                <span style={{ color:"#e0e0ea" }}>{l}</span>
                 <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
               </div>
             ))}
@@ -407,32 +407,32 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
 
         {/* Infrastructure */}
         {infra && (
-          <div style={{ ...S.card, borderLeft:`3px solid ${infra.oanda_avg_latency_ms>3000?"#ffcc00":infra.stale_pairs?.length>0?"#ff4466":"#333"}` }}>
+          <div style={{ ...S.card, borderLeft:`3px solid ${infra.oanda_avg_latency_ms>3000?"#ffcc00":infra.stale_pairs?.length>0?"#ff4466":"#ffffff"}` }}>
             <div style={S.title}>Infrastructure</div>
             <div style={{ marginTop:8 }}>
               {[
                 ["OANDA Latency", `${infra.oanda_avg_latency_ms}ms`,
                   infra.oanda_avg_latency_ms>5000?"#ff4466":infra.oanda_avg_latency_ms>3000?"#ffcc00":"#00ff88"],
-                ["API Failures",  infra.oanda_fail_count, infra.oanda_fail_count>10?"#ffcc00":"#666"],
+                ["API Failures",  infra.oanda_fail_count, infra.oanda_fail_count>10?"#ffcc00":"#e0e0ea"],
                 ["Stale Feeds",   infra.stale_pairs?.length>0?infra.stale_pairs.join(", "):"None",
                   infra.stale_pairs?.length>0?"#ff4466":"#00ff88"],
                 ["Size Factor",   `${(infra.friday_size_factor*100).toFixed(0)}%`,
                   infra.friday_size_factor<1?"#ffcc00":"#00ff88"],
               ].map(([l,v,c]) => (
                 <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:11, padding:"4px 0", borderBottom:"1px solid #0d0d1e" }}>
-                  <span style={{ color:"#444" }}>{l}</span>
+                  <span style={{ color:"#e0e0ea" }}>{l}</span>
                   <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
                 </div>
               ))}
               {risk && (
                 <div style={{ marginTop:10 }}>
-                  <div style={{ fontSize:10, color:"#444", marginBottom:6 }}>Correlation Exposure</div>
+                  <div style={{ fontSize:10, color:"#e0e0ea", marginBottom:6 }}>Correlation Exposure</div>
                   {[
                     ["USD Long", `${risk.correlation.usd_long_open} / 2`, risk.correlation.long_breached?"#ff4466":"#00ff88"],
                     ["USD Short",`${risk.correlation.usd_short_open} / 2`, risk.correlation.short_breached?"#ff4466":"#00ff88"],
                   ].map(([l,v,c]) => (
                     <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:11, padding:"3px 0" }}>
-                      <span style={{ color:"#444" }}>{l}</span>
+                      <span style={{ color:"#e0e0ea" }}>{l}</span>
                       <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
                     </div>
                   ))}
@@ -452,7 +452,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
           }}>
             {flattening ? "CLOSING..." : "⛔ EMERGENCY\nFLATTEN ALL"}
           </button>
-          <div style={{ fontSize:10, color:"#333", textAlign:"center", lineHeight:1.4 }}>
+          <div style={{ fontSize:10, color:"#ffffff", textAlign:"center", lineHeight:1.4 }}>
             Closes all positions<br/>+ disables scanner
           </div>
         </div>
@@ -462,7 +462,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
         <div style={S.card}>
           <div style={S.title}>Live Prices</div>
           {PAIRS.map(p => <PriceRow key={p} pair={p} prices={prices} prevPrices={prevPrices} priceAlerts={priceAlerts} onSetAlert={onSetAlert} />)}
-          {!tConn && <div style={{ color:"#2a2a4a", fontSize:12, marginTop:12, textAlign:"center" }}>Add OANDA or Twelve Data key in Settings</div>}
+          {!tConn && <div style={{ color:"#ffffff", fontSize:12, marginTop:12, textAlign:"center" }}>Add OANDA or Twelve Data key in Settings</div>}
         </div>
         <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
           {plHistory.length > 1 && (
@@ -474,7 +474,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
           <div style={S.card}>
             <div style={S.title}>Open Positions ({trades.length})</div>
             {trades.length === 0 && (
-              <div style={{ color:"#2a2a4a", fontSize:12, marginTop:20, textAlign:"center" }}>
+              <div style={{ color:"#ffffff", fontSize:12, marginTop:20, textAlign:"center" }}>
                 {oConn ? "No open trades" : "Add OANDA key in Settings"}
               </div>
             )}
@@ -484,12 +484,12 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
                 <div key={t.id} style={{ padding:"10px", background:"#08081a", borderRadius:8, marginBottom:8, border:"1px solid #0d0d1e" }}>
                   <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                     <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-                      <span style={{ fontWeight:800, color:"#ccc", fontSize:13 }}>{PAIR_LABELS[t.instrument] || t.instrument}</span>
+                      <span style={{ fontWeight:800, color:"#ffffff", fontSize:13 }}>{PAIR_LABELS[t.instrument] || t.instrument}</span>
                       <span style={{ ...S.badge, color:u>0?"#00ff88":"#ff4466", background:u>0?"#003322":"#330011" }}>{u > 0 ? "BUY" : "SELL"}</span>
                     </div>
                     <span style={{ fontFamily:"monospace", color:tpl>=0?"#00ff88":"#ff4466", fontWeight:700 }}>{tpl >= 0 ? "+" : ""}{tpl.toFixed(2)}</span>
                   </div>
-                  <div style={{ fontSize:11, color:"#333", marginTop:5 }}>
+                  <div style={{ fontSize:11, color:"#ffffff", marginTop:5 }}>
                     {Math.abs(u).toLocaleString()} units · Entry {parseFloat(t.price).toFixed(5)}
                     {t.stopLossOrder && <span style={{ color:"#ff446666" }}> · SL {t.stopLossOrder.price}</span>}
                     {t.takeProfitOrder && <span style={{ color:"#00ff8866" }}> · TP {t.takeProfitOrder.price}</span>}
@@ -562,7 +562,7 @@ function AutoTradePanel() {
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
           <div>
             <div style={S.title}>⚡ AI SIGNAL SCANNER</div>
-            <div style={{ fontSize:10, color:"#333", marginTop:2 }}>
+            <div style={{ fontSize:10, color:"#ffffff", marginTop:2 }}>
               Scans all pairs every 5 min → sends Telegram alert → you approve or reject
             </div>
           </div>
@@ -585,14 +585,14 @@ function AutoTradePanel() {
             <input type="number" value={at.min_score} min="7" max="12"
               onChange={e=>setAt(p=>({...p,min_score:parseInt(e.target.value)}))}
               style={{ ...S.inp, color:"#ff88ff" }} />
-            <div style={{ fontSize:9, color:"#333", marginTop:2 }}>12-check filter</div>
+            <div style={{ fontSize:9, color:"#ffffff", marginTop:2 }}>12-check filter</div>
           </div>
           <div>
             <label style={S.lbl}>Min AI Conf %</label>
             <input type="number" value={at.threshold} min="50" max="99"
               onChange={e=>setAt(p=>({...p,threshold:parseInt(e.target.value)}))}
               style={{ ...S.inp, color:"#00ccff" }} />
-            <div style={{ fontSize:9, color:"#333", marginTop:2 }}>GPT-4o threshold</div>
+            <div style={{ fontSize:9, color:"#ffffff", marginTop:2 }}>GPT-4o threshold</div>
           </div>
           <div>
             <label style={S.lbl}>Risk / Trade %</label>
@@ -624,12 +624,12 @@ function AutoTradePanel() {
           <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6, marginTop:12 }}>
             {[
               ["Pending",       atSt.pending_signals,  "#ffcc00"],
-              ["Today Signals", atSt.today_signals+"/"+atSt.max_per_day, "#bbb"],
+              ["Today Signals", atSt.today_signals+"/"+atSt.max_per_day, "#ffffff"],
               ["Total Signals", atSt.total_signals,    "#00ccff"],
-              ["Scanner",       atSt.scanning?"ACTIVE":"IDLE", atSt.scanning?"#ffcc00":"#333"],
+              ["Scanner",       atSt.scanning?"ACTIVE":"IDLE", atSt.scanning?"#ffcc00":"#ffffff"],
             ].map(([l,v,c])=>(
               <div key={l} style={{ background:"#08081a", borderRadius:6, padding:"8px 6px", textAlign:"center" }}>
-                <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1, marginBottom:3 }}>{l}</div>
+                <div style={{ fontSize:9, color:"#ffffff", letterSpacing:1, marginBottom:3 }}>{l}</div>
                 <div style={{ fontSize:15, fontFamily:"monospace", color:c, fontWeight:800 }}>{v}</div>
               </div>
             ))}
@@ -644,7 +644,7 @@ function AutoTradePanel() {
             <div style={S.title}>⏳ PENDING SIGNALS ({pending.length})</div>
             <span style={{ fontSize:10, color:"#ffcc00", animation:"pulse 1s infinite" }}>● AWAITING YOUR DECISION</span>
           </div>
-          <div style={{ fontSize:11, color:"#555", marginBottom:12 }}>
+          <div style={{ fontSize:11, color:"#e0e0ea", marginBottom:12 }}>
             Approve via Telegram or click the buttons below. Signal expires when market moves significantly.
           </div>
           {pending.map(sig => (
@@ -661,13 +661,13 @@ function AutoTradePanel() {
                     {sig.confidence}% AI
                   </span>
                 </div>
-                <span style={{ fontSize:10, color:"#333" }}>#{sig.id} · {sig.created_at?.slice(11,16)}</span>
+                <span style={{ fontSize:10, color:"#ffffff" }}>#{sig.id} · {sig.created_at?.slice(11,16)}</span>
               </div>
 
               {/* Trade details grid */}
               <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:8, marginBottom:10 }}>
                 {[
-                  ["Entry",    sig.entry_price?.toFixed(5), "#bbb"],
+                  ["Entry",    sig.entry_price?.toFixed(5), "#ffffff"],
                   ["Stop Loss",sig.stop_loss?.toFixed(5)+" (-"+sig.sl_pips+" pip)", "#ff4466"],
                   ["Take Profit",sig.take_profit?.toFixed(5)+" (+"+sig.tp_pips+" pip)", "#00ff88"],
                   ["Size",     sig.lots+" lots", "#ffcc00"],
@@ -675,7 +675,7 @@ function AutoTradePanel() {
                   ["EMA",      sig.ema_align||"—", "#00ccff"],
                 ].map(([l,v,c])=>(
                   <div key={l} style={{ background:"#08081a", borderRadius:6, padding:"7px 9px" }}>
-                    <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1, marginBottom:3 }}>{l}</div>
+                    <div style={{ fontSize:9, color:"#ffffff", letterSpacing:1, marginBottom:3 }}>{l}</div>
                     <div style={{ fontSize:11, color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</div>
                   </div>
                 ))}
@@ -683,8 +683,8 @@ function AutoTradePanel() {
 
               {/* RSI + H4 inline */}
               <div style={{ display:"flex", gap:10, marginBottom:12, fontSize:11 }}>
-                <span style={{ color:"#555" }}>RSI: <span style={{ color:sig.rsi>70?"#ff4466":sig.rsi<30?"#00ff88":"#bbb", fontFamily:"monospace" }}>{sig.rsi}</span></span>
-                <span style={{ color:"#555" }}>H4: <span style={{ color:"#00ccff" }}>{sig.h4_trend}</span></span>
+                <span style={{ color:"#e0e0ea" }}>RSI: <span style={{ color:sig.rsi>70?"#ff4466":sig.rsi<30?"#00ff88":"#ffffff", fontFamily:"monospace" }}>{sig.rsi}</span></span>
+                <span style={{ color:"#e0e0ea" }}>H4: <span style={{ color:"#00ccff" }}>{sig.h4_trend}</span></span>
               </div>
 
               {/* APPROVE / REJECT buttons */}
@@ -709,7 +709,7 @@ function AutoTradePanel() {
       <div style={S.card}>
         <div style={S.title}>Signal History ({history.length})</div>
         {history.length === 0 && (
-          <div style={{ color:"#2a2a4a", fontSize:12, textAlign:"center", padding:"24px 0" }}>
+          <div style={{ color:"#ffffff", fontSize:12, textAlign:"center", padding:"24px 0" }}>
             {at.enabled
               ? `Scanner active — signals appear here when AI finds ≥${at.threshold}% confidence setups`
               : "Enable the scanner above to start receiving trade signals"}
@@ -718,18 +718,18 @@ function AutoTradePanel() {
         {history.slice(0,30).map((sig,i) => (
           <div key={sig.id} style={{ padding:"10px 12px", background:i%2===0?"#07071a":"#08081a",
             borderRadius:7, marginBottom:4, border:"1px solid #0d0d1e",
-            borderLeft:`3px solid ${statusColor[sig.status]||"#333"}` }}>
+            borderLeft:`3px solid ${statusColor[sig.status]||"#ffffff"}` }}>
             <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:5 }}>
-              <span style={{ fontWeight:800, color:"#bbb", fontSize:12, minWidth:52 }}>{sig.pair}</span>
+              <span style={{ fontWeight:800, color:"#ffffff", fontSize:12, minWidth:52 }}>{sig.pair}</span>
               <span style={{ ...S.badge, fontSize:9, color:sig.direction==="BUY"?"#00ff88":"#ff4466",
                 background:sig.direction==="BUY"?"#003322":"#330011" }}>{sig.direction}</span>
               <span style={{ ...S.badge, background:"#001a2e", color:"#00ccff", fontSize:9 }}>{sig.confidence}%</span>
               <span style={{ marginLeft:"auto", fontSize:10, fontWeight:700,
-                color:statusColor[sig.status]||"#555" }}>{sig.status}</span>
-              <span style={{ fontSize:9, color:"#2a2a4a", fontFamily:"monospace" }}>#{sig.id}</span>
+                color:statusColor[sig.status]||"#e0e0ea" }}>{sig.status}</span>
+              <span style={{ fontSize:9, color:"#ffffff", fontFamily:"monospace" }}>#{sig.id}</span>
             </div>
-            <div style={{ display:"flex", gap:12, fontSize:10, color:"#333" }}>
-              <span>Entry: <span style={{ color:"#555" }}>{sig.entry_price?.toFixed(5)}</span></span>
+            <div style={{ display:"flex", gap:12, fontSize:10, color:"#ffffff" }}>
+              <span>Entry: <span style={{ color:"#e0e0ea" }}>{sig.entry_price?.toFixed(5)}</span></span>
               <span>SL: <span style={{ color:"#ff446688" }}>{sig.stop_loss?.toFixed(5)}</span></span>
               <span>TP: <span style={{ color:"#00ff8888" }}>{sig.take_profit?.toFixed(5)}</span></span>
               {sig.filled_price && <span>Filled: <span style={{ color:"#00ccff88" }}>{sig.filled_price?.toFixed(5)}</span></span>}
@@ -837,7 +837,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
         {[["manual","📋 Manual Trade"],["auto","⚡ Auto-Trade Engine"]].map(([id,label]) => (
           <button key={id} onClick={() => setTab(id)}
             style={{ padding:"8px 18px", borderRadius:8, border:`1px solid ${tab===id?"#00ccff44":"#13132b"}`,
-              background:tab===id?"#001a2e":"transparent", color:tab===id?"#00ccff":"#333",
+              background:tab===id?"#001a2e":"transparent", color:tab===id?"#00ccff":"#ffffff",
               cursor:"pointer", fontWeight:800, fontSize:11, letterSpacing:2 }}>
             {label}
           </button>
@@ -856,7 +856,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
           </select>
           <div style={{ display:"flex", gap:7, marginBottom:11 }}>
             {["BUY","SELL"].map(d => (
-              <button key={d} onClick={() => setDir(d)} style={{ flex:1, padding:"10px 0", borderRadius:8, border:`1px solid ${dir===d?(d==="BUY"?"#00ff88":"#ff4466"):"#13132b"}`, background:dir===d?(d==="BUY"?"#003322":"#330011"):"transparent", color:dir===d?(d==="BUY"?"#00ff88":"#ff4466"):"#333", cursor:"pointer", fontWeight:800, letterSpacing:2, fontFamily:"monospace" }}>
+              <button key={d} onClick={() => setDir(d)} style={{ flex:1, padding:"10px 0", borderRadius:8, border:`1px solid ${dir===d?(d==="BUY"?"#00ff88":"#ff4466"):"#13132b"}`, background:dir===d?(d==="BUY"?"#003322":"#330011"):"transparent", color:dir===d?(d==="BUY"?"#00ff88":"#ff4466"):"#ffffff", cursor:"pointer", fontWeight:800, letterSpacing:2, fontFamily:"monospace" }}>
                 {d}
               </button>
             ))}
@@ -867,7 +867,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
             <div><label style={S.lbl}>Stop Loss</label><input value={sl} onChange={e => setSl(e.target.value)} style={S.inp} placeholder="price" /></div>
             <div><label style={S.lbl}>Take Profit</label><input value={tp} onChange={e => setTp(e.target.value)} style={S.inp} placeholder="price" /></div>
           </div>
-          <button onClick={autofill} style={{ ...S.btn, width:"100%", marginBottom:6, padding:"6px 0", fontSize:10, color:"#555", background:"transparent", border:"1px solid #13132b", letterSpacing:2 }}>
+          <button onClick={autofill} style={{ ...S.btn, width:"100%", marginBottom:6, padding:"6px 0", fontSize:10, color:"#e0e0ea", background:"transparent", border:"1px solid #13132b", letterSpacing:2 }}>
             AUTO-FILL SL/TP (20/40 pip)
           </button>
           {/* Position Sizer — Risk % → Auto Units */}
@@ -884,18 +884,18 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
             <div style={{ padding:"8px 10px", background:"#0d0d00", borderRadius:8, marginBottom:11, border:"1px solid #ffcc0022" }}>
               <div style={{ fontSize:10, color:"#ffcc00", letterSpacing:2, marginBottom:5 }}>POSITION SIZE</div>
               <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
-                <span style={{ color:"#555" }}>Units</span>
+                <span style={{ color:"#e0e0ea" }}>Units</span>
                 <span style={{ color:"#ffcc00", fontFamily:"monospace", fontWeight:800 }}>{sizeResult.recommendedUnits?.toLocaleString()}</span>
               </div>
               <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
-                <span style={{ color:"#555" }}>SL Pips</span>
-                <span style={{ color:"#bbb", fontFamily:"monospace" }}>{sizeResult.slPips}</span>
+                <span style={{ color:"#e0e0ea" }}>SL Pips</span>
+                <span style={{ color:"#ffffff", fontFamily:"monospace" }}>{sizeResult.slPips}</span>
               </div>
               <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
-                <span style={{ color:"#555" }}>Risk $</span>
+                <span style={{ color:"#e0e0ea" }}>Risk $</span>
                 <span style={{ color:"#ff8844", fontFamily:"monospace" }}>{sizeResult.currency}{sizeResult.riskAmount}</span>
               </div>
-              <div style={{ fontSize:10, color:"#2a2a4a", marginTop:4 }}>{sizeResult.note}</div>
+              <div style={{ fontSize:10, color:"#ffffff", marginTop:4 }}>{sizeResult.note}</div>
             </div>
           )}
           {sizeResult?.error && (
@@ -905,7 +905,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
           )}
           {livePrice && (
             <div style={{ padding:"7px 11px", background:"#07071a", borderRadius:8, marginBottom:11, fontSize:12, display:"flex", justifyContent:"space-between" }}>
-              <span style={{ color:"#333" }}>Live Price</span>
+              <span style={{ color:"#ffffff" }}>Live Price</span>
               <span style={{ color:"#00ccff", fontFamily:"monospace" }}>{livePrice?.toFixed(dp)}</span>
             </div>
           )}
@@ -929,7 +929,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
             )}
             <div style={{ marginBottom:8 }}>
               <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
-                <span style={{ color:"#555" }}>Used</span>
+                <span style={{ color:"#e0e0ea" }}>Used</span>
                 <span style={{ color:daily.limit_hit?"#ff4466":parseFloat(daily.used_percent)>60?"#ffcc00":"#00ff88", fontFamily:"monospace" }}>
                   {daily.used_percent}%
                 </span>
@@ -941,11 +941,11 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
             {[
               ["Today P&L",   `${parseFloat(daily.realized_pl)>=0?"+":""}${daily.realized_pl}`, parseFloat(daily.realized_pl)>=0?"#00ff88":"#ff4466"],
               ["Max Loss",    daily.max_daily_loss, "#ff4466"],
-              ["Trades Today", daily.trade_count,   "#bbb"],
+              ["Trades Today", daily.trade_count,   "#ffffff"],
               ["Status",      daily.safe_to_trade?"✓ SAFE TO TRADE":"⛔ STOP", daily.safe_to_trade?"#00ff88":"#ff4466"],
             ].map(([l,v,c]) => (
               <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
-                <span style={{ color:"#444" }}>{l}</span>
+                <span style={{ color:"#e0e0ea" }}>{l}</span>
                 <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
               </div>
             ))}
@@ -962,7 +962,7 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
               ["Open P&L",   `${parseFloat(account.unrealizedPL)>=0?"+":""}$${parseFloat(account.unrealizedPL).toFixed(2)}`, parseFloat(account.unrealizedPL)>=0?"#00ff88":"#ff4466"],
             ].map(([l,v,c]) => (
               <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"7px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
-                <span style={{ color:"#333" }}>{l}</span><span style={{ color:c, fontFamily:"monospace" }}>{v}</span>
+                <span style={{ color:"#ffffff" }}>{l}</span><span style={{ color:c, fontFamily:"monospace" }}>{v}</span>
               </div>
             ))}
           </div>
@@ -970,16 +970,16 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
       </div>
       <div style={S.card}>
         <div style={S.title}>Open Positions ({trades.length})</div>
-        {trades.length === 0 && <div style={{ color:"#2a2a4a", fontSize:12, marginTop:30, textAlign:"center" }}>No open trades</div>}
+        {trades.length === 0 && <div style={{ color:"#ffffff", fontSize:12, marginTop:30, textAlign:"center" }}>No open trades</div>}
         {trades.map(t => {
           const tpl = parseFloat(t.unrealizedPL), u = parseFloat(t.currentUnits);
           return (
             <div key={t.id} style={{ padding:"12px", background:"#08081a", borderRadius:10, marginBottom:9, border:"1px solid #0d0d1e" }}>
               <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:7 }}>
                 <div style={{ display:"flex", alignItems:"center", gap:9 }}>
-                  <span style={{ fontWeight:800, color:"#ccc" }}>{PAIR_LABELS[t.instrument] || t.instrument}</span>
+                  <span style={{ fontWeight:800, color:"#ffffff" }}>{PAIR_LABELS[t.instrument] || t.instrument}</span>
                   <span style={{ ...S.badge, color:u>0?"#00ff88":"#ff4466", background:u>0?"#003322":"#330011" }}>{u > 0 ? "BUY" : "SELL"}</span>
-                  <span style={{ fontSize:11, color:"#2a2a4a" }}>{Math.abs(u).toLocaleString()} units</span>
+                  <span style={{ fontSize:11, color:"#ffffff" }}>{Math.abs(u).toLocaleString()} units</span>
                 </div>
                 <div style={{ display:"flex", alignItems:"center", gap:10 }}>
                   <span style={{ fontFamily:"monospace", color:tpl>=0?"#00ff88":"#ff4466", fontWeight:700, fontSize:14 }}>{tpl >= 0 ? "+" : ""}{tpl.toFixed(2)}</span>
@@ -988,8 +988,8 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
                   </button>
                 </div>
               </div>
-              <div style={{ fontSize:11, color:"#2a2a4a", display:"flex", gap:16 }}>
-                <span>Entry: <span style={{ color:"#555" }}>{parseFloat(t.price).toFixed(5)}</span></span>
+              <div style={{ fontSize:11, color:"#ffffff", display:"flex", gap:16 }}>
+                <span>Entry: <span style={{ color:"#e0e0ea" }}>{parseFloat(t.price).toFixed(5)}</span></span>
                 {t.stopLossOrder   && <span>SL: <span style={{ color:"#ff446688" }}>{t.stopLossOrder.price}</span></span>}
                 {t.takeProfitOrder && <span>TP: <span style={{ color:"#00ff8888" }}>{t.takeProfitOrder.price}</span></span>}
               </div>
@@ -1054,11 +1054,11 @@ function Opportunities({ prices, keys, addAlert }) {
       {scanning && (
         <div style={{ ...S.card, textAlign:"center", padding:60 }}>
           <div style={{ color:"#00ccff", fontSize:13, letterSpacing:3, animation:"pulse 1s infinite" }}>GPT-4o ANALYZING MARKETS...</div>
-          <div style={{ color:"#2a2a4a", marginTop:8, fontSize:11 }}>Analyzing up to 4 pairs simultaneously</div>
+          <div style={{ color:"#ffffff", marginTop:8, fontSize:11 }}>Analyzing up to 4 pairs simultaneously</div>
         </div>
       )}
       {!scanning && signals.length === 0 && (
-        <div style={{ ...S.card, textAlign:"center", padding:60, color:"#2a2a4a" }}>
+        <div style={{ ...S.card, textAlign:"center", padding:60, color:"#ffffff" }}>
           <div style={{ fontSize:36, marginBottom:12 }}>◈</div>
           Click AI SCAN to analyze live market conditions with GPT-4o
         </div>
@@ -1068,13 +1068,13 @@ function Opportunities({ prices, keys, addAlert }) {
           <div key={s.pair} style={{ ...S.card, borderLeft:`3px solid ${bColor[s.bias]}` }}>
             <div style={{ display:"flex", gap:16, alignItems:"flex-start" }}>
               <div style={{ minWidth:88 }}>
-                <div style={{ fontWeight:800, fontSize:15, color:"#ccc" }}>{s.label}</div>
+                <div style={{ fontWeight:800, fontSize:15, color:"#ffffff" }}>{s.label}</div>
                 <span style={{ ...S.badge, marginTop:6, display:"block", color:bColor[s.bias], background:bBg[s.bias], border:`1px solid ${bColor[s.bias]}33` }}>{s.bias}</span>
-                <div style={{ fontSize:11, color:"#2a2a4a", marginTop:5, fontFamily:"monospace" }}>{s.price?.toFixed?.(5)}</div>
+                <div style={{ fontSize:11, color:"#ffffff", marginTop:5, fontFamily:"monospace" }}>{s.price?.toFixed?.(5)}</div>
               </div>
-              <div style={{ flex:1, fontSize:12, color:"#666", lineHeight:1.8, whiteSpace:"pre-wrap" }}>{s.analysis.slice(0, 550)}</div>
+              <div style={{ flex:1, fontSize:12, color:"#e0e0ea", lineHeight:1.8, whiteSpace:"pre-wrap" }}>{s.analysis.slice(0, 550)}</div>
               <div style={{ textAlign:"center", minWidth:64 }}>
-                <div style={{ fontSize:10, color:"#333", marginBottom:4 }}>Confidence</div>
+                <div style={{ fontSize:10, color:"#ffffff", marginBottom:4 }}>Confidence</div>
                 <div style={{ fontSize:28, fontWeight:800, fontFamily:"monospace", color:s.conf>=80?"#00ff88":s.conf>=65?"#ffcc00":"#ff8844" }}>{s.conf}%</div>
                 <div style={{ marginTop:8, width:48, height:3, borderRadius:2, background:"#0d0d1e", overflow:"hidden", margin:"8px auto 0" }}>
                   <div style={{ width:`${s.conf}%`, height:"100%", background:s.conf>=80?"#00ff88":s.conf>=65?"#ffcc00":"#ff8844" }} />
@@ -1147,11 +1147,11 @@ function Charts() {
           {PAIRS.map(p => <option key={p} value={p}>{PAIR_LABELS[p]}</option>)}
         </select>
         {["M5","M15","H1","H4","D"].map(t => (
-          <button key={t} onClick={() => setTf(t)} style={{ padding:"6px 14px", borderRadius:7, border:`1px solid ${tf===t?"#00ccff":"#13132b"}`, background:tf===t?"#001a2e":"transparent", color:tf===t?"#00ccff":"#333", cursor:"pointer", fontSize:12, fontWeight:700 }}>
+          <button key={t} onClick={() => setTf(t)} style={{ padding:"6px 14px", borderRadius:7, border:`1px solid ${tf===t?"#00ccff":"#13132b"}`, background:tf===t?"#001a2e":"transparent", color:tf===t?"#00ccff":"#ffffff", cursor:"pointer", fontSize:12, fontWeight:700 }}>
             {t}
           </button>
         ))}
-        <div style={{ marginLeft:"auto", fontSize:10, color:"#2a2a4a" }}>Live TradingView chart — {tvSymbol}</div>
+        <div style={{ marginLeft:"auto", fontSize:10, color:"#ffffff" }}>Live TradingView chart — {tvSymbol}</div>
       </div>
       <div style={{ ...S.card, padding:0, overflow:"hidden", height:560 }}>
         <TradingViewWidget symbol={tvSymbol} interval={TV_INTERVAL[tf]} />
@@ -1164,7 +1164,7 @@ function Charts() {
 // ─── SVG CHARTS ───────────────────────────────────────────────────────────────
 function EquityCurve({ data }) {
   if (!data || data.length < 2) return (
-    <div style={{ height:140, display:"flex", alignItems:"center", justifyContent:"center", color:"#2a2a4a", fontSize:12 }}>
+    <div style={{ height:140, display:"flex", alignItems:"center", justifyContent:"center", color:"#ffffff", fontSize:12 }}>
       Not enough data for equity curve
     </div>
   );
@@ -1185,8 +1185,8 @@ function EquityCurve({ data }) {
       <polygon points={fillPts} fill={color} fillOpacity={0.08} />
       <polyline points={pts} fill="none" stroke={color} strokeWidth={1.5} />
       <circle cx={toX(data.length-1)} cy={toY(last)} r={3} fill={color} />
-      <text x={PAD} y={10} fill="#2a2a4a" fontSize={9}>${max.toFixed(0)}</text>
-      <text x={PAD} y={H-2} fill="#2a2a4a" fontSize={9}>${min.toFixed(0)}</text>
+      <text x={PAD} y={10} fill="#ffffff" fontSize={9}>${max.toFixed(0)}</text>
+      <text x={PAD} y={H-2} fill="#ffffff" fontSize={9}>${min.toFixed(0)}</text>
     </svg>
   );
 }
@@ -1208,7 +1208,7 @@ function MonthlyBars({ data }) {
         return (
           <g key={d.month}>
             <rect x={x} y={isPos ? zero - barH : zero} width={barW} height={barH} fill={isPos ? "#00ff88" : "#ff4466"} fillOpacity={0.7} rx={1} />
-            <text x={x + barW / 2} y={H - 1} fill="#2a2a4a" fontSize={7} textAnchor="middle">{d.month?.slice(5)}</text>
+            <text x={x + barW / 2} y={H - 1} fill="#ffffff" fontSize={7} textAnchor="middle">{d.month?.slice(5)}</text>
           </g>
         );
       })}
@@ -1269,14 +1269,14 @@ function Journal() {
 
   const StatCard = ({ label, value, sub, color }) => (
     <div style={{ ...S.card, flex:1, minWidth:110, textAlign:"center", padding:"13px 10px" }}>
-      <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:2, marginBottom:5, textTransform:"uppercase" }}>{label}</div>
-      <div style={{ fontSize:22, fontWeight:900, color: color || "#ccc", fontFamily:"monospace" }}>{value}</div>
-      {sub && <div style={{ fontSize:10, color:"#333", marginTop:3 }}>{sub}</div>}
+      <div style={{ fontSize:9, color:"#ffffff", letterSpacing:2, marginBottom:5, textTransform:"uppercase" }}>{label}</div>
+      <div style={{ fontSize:22, fontWeight:900, color: color || "#ffffff", fontFamily:"monospace" }}>{value}</div>
+      {sub && <div style={{ fontSize:10, color:"#ffffff", marginTop:3 }}>{sub}</div>}
     </div>
   );
 
   const streakStr = stats.streak > 0 ? `+${stats.streak}W` : stats.streak < 0 ? `${stats.streak}L` : "—";
-  const streakColor = stats.streak > 0 ? "#00ff88" : stats.streak < 0 ? "#ff4466" : "#555";
+  const streakColor = stats.streak > 0 ? "#00ff88" : stats.streak < 0 ? "#ff4466" : "#e0e0ea";
 
   return (
     <div style={{ padding:"0 2px" }}>
@@ -1288,6 +1288,16 @@ function Journal() {
         </button>
       </div>
 
+      {/* OANDA history outage banner — trade history endpoint can 504 while
+          live prices / trading stay healthy */}
+      {data?.historyError && (
+        <div style={{ ...S.card, border:"1px solid #ff446644", background:"#1a0808", color:"#ff9a9a", fontSize:12, marginBottom:12, padding:"11px 14px" }}>
+          ⚠ {data.historyError}{data.stale
+            ? " — showing last saved history."
+            : " — OANDA's trade-history service is temporarily unavailable. Live prices and trading are unaffected. Try Refresh shortly."}
+        </div>
+      )}
+
       {/* Stats cards */}
       {stats.total > 0 && (
         <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
@@ -1298,7 +1308,7 @@ function Journal() {
           <StatCard label="Worst"     value={`-$${Math.abs(stats.worstTrade).toFixed(2)}`} sub="single trade" color="#ff4466" />
           <StatCard label="Max DD"    value={`-$${stats.maxDD}`}   sub="drawdown"                         color="#ff8844" />
           <StatCard label="Streak"    value={streakStr}            sub="current"                          color={streakColor} />
-          <StatCard label="Trades"    value={stats.total}          sub={`${stats.be} breakeven`}          color="#ccc" />
+          <StatCard label="Trades"    value={stats.total}          sub={`${stats.be} breakeven`}          color="#ffffff" />
         </div>
       )}
 
@@ -1306,19 +1316,19 @@ function Journal() {
       {equity.length > 1 && (
         <div style={{ display:"flex", gap:10, marginBottom:14 }}>
           <div style={{ ...S.card, flex:2, padding:"12px 14px" }}>
-            <div style={{ fontSize:10, color:"#2a2a4a", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Equity Curve</div>
+            <div style={{ fontSize:10, color:"#ffffff", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Equity Curve</div>
             <EquityCurve data={equity} />
           </div>
           {monthly.length > 0 && (
             <div style={{ ...S.card, flex:1, padding:"12px 14px" }}>
-              <div style={{ fontSize:10, color:"#2a2a4a", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Monthly P&L</div>
+              <div style={{ fontSize:10, color:"#ffffff", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Monthly P&L</div>
               <MonthlyBars data={monthly} />
               <div style={{ display:"flex", flexDirection:"column", gap:3, marginTop:8 }}>
                 {monthly.slice(-4).map(m => (
                   <div key={m.month} style={{ display:"flex", justifyContent:"space-between", fontSize:10 }}>
-                    <span style={{ color:"#333" }}>{m.month}</span>
+                    <span style={{ color:"#ffffff" }}>{m.month}</span>
                     <span style={{ color:plColor(m.pl), fontFamily:"monospace" }}>{m.pl >= 0 ? "+" : ""}${m.pl.toFixed(0)}</span>
-                    <span style={{ color:"#2a2a4a" }}>{m.won}/{m.trades}</span>
+                    <span style={{ color:"#ffffff" }}>{m.won}/{m.trades}</span>
                   </div>
                 ))}
               </div>
@@ -1330,16 +1340,16 @@ function Journal() {
       {/* Filter bar */}
       <div style={{ display:"flex", gap:6, marginBottom:10 }}>
         {["ALL","WIN","LOSS","BUY","SELL"].map(f => (
-          <button key={f} onClick={() => setFilter(f)} style={{ padding:"5px 12px", borderRadius:6, border:`1px solid ${filter===f?"#00ccff44":"#13132b"}`, background:filter===f?"#001a2e":"transparent", color:filter===f?"#00ccff":"#333", cursor:"pointer", fontSize:10, fontWeight:700 }}>
-            {f} {f !== "ALL" ? `(${f==="WIN"?stats.won:f==="LOSS"?stats.lost:f==="BUY"?trades.filter(t=>t.direction==="BUY").length:trades.filter(t=>t.direction==="SELL").length})` : `(${trades.length})`}
+          <button key={f} onClick={() => setFilter(f)} style={{ padding:"5px 12px", borderRadius:6, border:`1px solid ${filter===f?"#00ccff44":"#13132b"}`, background:filter===f?"#001a2e":"transparent", color:filter===f?"#00ccff":"#ffffff", cursor:"pointer", fontSize:10, fontWeight:700 }}>
+            {f} {f !== "ALL" ? `(${f==="WIN"?(stats.won||0):f==="LOSS"?(stats.lost||0):f==="BUY"?trades.filter(t=>t.direction==="BUY").length:trades.filter(t=>t.direction==="SELL").length})` : `(${trades.length})`}
           </button>
         ))}
       </div>
 
       {/* Trade table */}
-      {loading && <div style={{ ...S.card, textAlign:"center", padding:40, color:"#2a2a4a" }}>Loading journal...</div>}
+      {loading && <div style={{ ...S.card, textAlign:"center", padding:40, color:"#ffffff" }}>Loading journal...</div>}
       {!loading && filtered.length === 0 && (
-        <div style={{ ...S.card, textAlign:"center", padding:60, color:"#2a2a4a" }}>
+        <div style={{ ...S.card, textAlign:"center", padding:60, color:"#ffffff" }}>
           {trades.length === 0 ? "Execute trades on OANDA to build your journal" : "No trades match this filter"}
         </div>
       )}
@@ -1350,25 +1360,25 @@ function Journal() {
             <div key={t.id} style={{ ...S.card, borderLeft:`3px solid ${resColor(t.result)}`, padding:"11px 14px" }}>
               {/* Main row */}
               <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
-                <span style={{ fontWeight:800, color:"#ccc", minWidth:62, fontSize:12 }}>{t.pair}</span>
+                <span style={{ fontWeight:800, color:"#ffffff", minWidth:62, fontSize:12 }}>{t.pair}</span>
                 <span style={{ ...S.badge, color:t.direction==="BUY"?"#00ff88":"#ff4466", background:t.direction==="BUY"?"#003322":"#330011", fontSize:9 }}>{t.direction}</span>
                 <span style={{ ...S.badge, color:resColor(t.result), background:"#07071a", fontSize:9 }}>{t.result}</span>
                 {t.confidence && <span style={{ ...S.badge, color:"#00ccff", background:"#001a2e", fontSize:9 }}>{t.confidence}%</span>}
                 <span style={{ fontFamily:"monospace", color:plColor(t.pl), fontWeight:700, minWidth:72, fontSize:12 }}>
                   {t.pl >= 0 ? "+" : ""}${t.pl.toFixed(2)}
                 </span>
-                <span style={{ fontFamily:"monospace", fontSize:10, color:"#333", minWidth:48 }}>{t.pips > 0 ? "+" : ""}{t.pips}p</span>
-                {t.rr && <span style={{ fontSize:10, color:"#555" }}>RR {t.rr}</span>}
-                <span style={{ fontSize:10, color:"#2a2a4a", flex:1 }}>
+                <span style={{ fontFamily:"monospace", fontSize:10, color:"#ffffff", minWidth:48 }}>{t.pips > 0 ? "+" : ""}{t.pips}p</span>
+                {t.rr && <span style={{ fontSize:10, color:"#e0e0ea" }}>RR {t.rr}</span>}
+                <span style={{ fontSize:10, color:"#ffffff", flex:1 }}>
                   {t.openTime?.slice(5)} → {t.closeTime?.slice(5)}
                 </span>
                 <button onClick={() => { setEditId(isEdit ? null : t.id); setEditText(t.note); setEditPsych(t.psych || EMPTY_PSYCH); }}
-                  style={{ ...S.btn, padding:"3px 9px", background:"transparent", border:"1px solid #13132b", color:"#333", fontSize:9 }}>
+                  style={{ ...S.btn, padding:"3px 9px", background:"transparent", border:"1px solid #13132b", color:"#ffffff", fontSize:9 }}>
                   {t.note ? "Edit" : "+ Note"}
                 </button>
               </div>
               {/* Price row */}
-              <div style={{ display:"flex", gap:16, marginTop:6, fontSize:10, color:"#2a2a4a" }}>
+              <div style={{ display:"flex", gap:16, marginTop:6, fontSize:10, color:"#ffffff" }}>
                 <span>Entry {t.entryPrice}</span>
                 <span>Exit {t.closePrice}</span>
                 {t.sl && <span>SL {t.sl}</span>}
@@ -1377,7 +1387,7 @@ function Journal() {
               </div>
               {/* Note display */}
               {t.note && !isEdit && (
-                <div style={{ marginTop:8, padding:"7px 10px", background:"#07071a", borderRadius:6, fontSize:11, color:"#555", fontStyle:"italic", lineHeight:1.6 }}>
+                <div style={{ marginTop:8, padding:"7px 10px", background:"#07071a", borderRadius:6, fontSize:11, color:"#e0e0ea", fontStyle:"italic", lineHeight:1.6 }}>
                   {t.note}
                 </div>
               )}
@@ -1408,7 +1418,7 @@ function Journal() {
                         {saving ? "..." : "Save"}
                       </button>
                       <button onClick={() => setEditId(null)}
-                        style={{ ...S.btn, padding:"6px 13px", color:"#555", border:"1px solid #13132b", background:"transparent", fontSize:10 }}>
+                        style={{ ...S.btn, padding:"6px 13px", color:"#e0e0ea", border:"1px solid #13132b", background:"transparent", fontSize:10 }}>
                         Cancel
                       </button>
                     </div>
@@ -1416,10 +1426,10 @@ function Journal() {
 
                   {/* Psychology tracking */}
                   <div style={{ padding:"9px 10px", background:"#07071a", borderRadius:6, display:"flex", flexDirection:"column", gap:7 }}>
-                    <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1, textTransform:"uppercase" }}>How were you feeling on this trade?</div>
+                    <div style={{ fontSize:9, color:"#ffffff", letterSpacing:1, textTransform:"uppercase" }}>How were you feeling on this trade?</div>
                     {[["Stress","stress","#ff8844"],["Confidence","confidence","#00ccff"],["Fear","fear","#ff4466"],["Greed","greed","#ffcc00"]].map(([label, key, color]) => (
                       <div key={key} style={{ display:"flex", alignItems:"center", gap:8, fontSize:10 }}>
-                        <span style={{ color:"#555", minWidth:66 }}>{label}</span>
+                        <span style={{ color:"#e0e0ea", minWidth:66 }}>{label}</span>
                         <input type="range" min={1} max={5} value={editPsych[key] ?? 3}
                           onChange={e => setEditPsych(p => ({ ...p, [key]: parseInt(e.target.value) }))}
                           style={{ flex:1 }} />
@@ -1434,7 +1444,7 @@ function Journal() {
                             style={{ ...S.btn, padding:"4px 10px", fontSize:9,
                               border:`1px solid ${active ? (val ? "#00ff8855" : "#ff446655") : "#13132b"}`,
                               background:active ? (val ? "#003322" : "#330011") : "transparent",
-                              color:active ? (val ? "#00ff88" : "#ff4466") : "#333" }}>
+                              color:active ? (val ? "#00ff88" : "#ff4466") : "#ffffff" }}>
                             {lbl}
                           </button>
                         );
@@ -1451,7 +1461,7 @@ function Journal() {
                             style={{ ...S.btn, padding:"3px 8px", fontSize:8,
                               border:`1px solid ${active ? "#ffcc0055" : "#13132b"}`,
                               background:active ? "#332200" : "transparent",
-                              color:active ? "#ffcc00" : "#333" }}>
+                              color:active ? "#ffcc00" : "#ffffff" }}>
                             {tag.replace(/_/g," ")}
                           </button>
                         );
@@ -1493,25 +1503,25 @@ function News() {
           {loading ? "Fetching..." : "↻ Refresh"}
         </button>
       </div>
-      <div style={{ marginBottom:12, padding:"7px 11px", background:"#07071a", borderRadius:8, fontSize:11, color:"#555" }}>
+      <div style={{ marginBottom:12, padding:"7px 11px", background:"#07071a", borderRadius:8, fontSize:11, color:"#e0e0ea" }}>
         ◉ Real-time data from Forex Factory Calendar
       </div>
       {events.length === 0 && !loading && (
-        <div style={{ ...S.card, textAlign:"center", padding:40, color:"#2a2a4a" }}>No events found for this week</div>
+        <div style={{ ...S.card, textAlign:"center", padding:40, color:"#ffffff" }}>No events found for this week</div>
       )}
       <div style={{ display:"flex", flexDirection:"column", gap:9 }}>
         {events.map((e, i) => (
-          <div key={i} style={{ ...S.card, borderLeft:`3px solid ${ic[e.impact]||"#444"}`, display:"flex", alignItems:"flex-start", gap:14 }}>
+          <div key={i} style={{ ...S.card, borderLeft:`3px solid ${ic[e.impact]||"#e0e0ea"}`, display:"flex", alignItems:"flex-start", gap:14 }}>
             <div style={{ fontFamily:"monospace", fontSize:12, color:"#888", minWidth:48, paddingTop:2 }}>{e.time || "—"}</div>
-            <div style={{ minWidth:32, fontWeight:800, fontSize:12, color:"#ccc", paddingTop:2 }}>{e.currency || "—"}</div>
-            <span style={{ ...S.badge, color:ic[e.impact]||"#444", background:`${ic[e.impact]||"#444"}15`, border:`1px solid ${ic[e.impact]||"#444"}33`, minWidth:60, textAlign:"center", flexShrink:0 }}>{e.impact || "—"}</span>
+            <div style={{ minWidth:32, fontWeight:800, fontSize:12, color:"#ffffff", paddingTop:2 }}>{e.currency || "—"}</div>
+            <span style={{ ...S.badge, color:ic[e.impact]||"#e0e0ea", background:`${ic[e.impact]||"#e0e0ea"}15`, border:`1px solid ${ic[e.impact]||"#e0e0ea"}33`, minWidth:60, textAlign:"center", flexShrink:0 }}>{e.impact || "—"}</span>
             <div style={{ flex:1 }}>
-              <div style={{ fontSize:13, color:"#aaa" }}>{e.event}</div>
-              {e.notes && <div style={{ fontSize:11, color:"#2a2a4a", marginTop:3, lineHeight:1.5 }}>{e.notes}</div>}
+              <div style={{ fontSize:13, color:"#ffffff" }}>{e.event}</div>
+              {e.notes && <div style={{ fontSize:11, color:"#ffffff", marginTop:3, lineHeight:1.5 }}>{e.notes}</div>}
             </div>
             <div style={{ fontSize:11, textAlign:"right", flexShrink:0 }}>
-              <div style={{ color:"#2a2a4a" }}>FC <span style={{ color:"#00ccff" }}>{e.forecast || "—"}</span></div>
-              <div style={{ color:"#2a2a4a" }}>Prev <span style={{ color:"#555" }}>{e.previous || "—"}</span></div>
+              <div style={{ color:"#ffffff" }}>FC <span style={{ color:"#00ccff" }}>{e.forecast || "—"}</span></div>
+              <div style={{ color:"#ffffff" }}>Prev <span style={{ color:"#e0e0ea" }}>{e.previous || "—"}</span></div>
             </div>
           </div>
         ))}
@@ -1579,29 +1589,29 @@ function Alerts({ alerts, keys, priceAlerts, setPriceAlerts }) {
         </div>
         {priceAlerts.length > 0 && (
           <div style={{ marginTop:14 }}>
-            <div style={{ fontSize:10, color:"#2a2a4a", letterSpacing:2, marginBottom:8 }}>ACTIVE PRICE ALERTS</div>
+            <div style={{ fontSize:10, color:"#ffffff", letterSpacing:2, marginBottom:8 }}>ACTIVE PRICE ALERTS</div>
             {priceAlerts.map(a => (
               <div key={a.id} style={{ display:"flex", alignItems:"center", gap:10, padding:"7px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
                 <span style={{ color:"#ffcc00", minWidth:60 }}>{PAIR_LABELS[a.pair]}</span>
-                <span style={{ color:"#555" }}>{a.dir}</span>
-                <span style={{ color:"#ccc", fontFamily:"monospace" }}>{a.price.toFixed(a.pair === "XAU_USD" ? 2 : 5)}</span>
-                <span style={{ color:"#2a2a4a", fontSize:10, flex:1 }}>set {a.created}</span>
+                <span style={{ color:"#e0e0ea" }}>{a.dir}</span>
+                <span style={{ color:"#ffffff", fontFamily:"monospace" }}>{a.price.toFixed(a.pair === "XAU_USD" ? 2 : 5)}</span>
+                <span style={{ color:"#ffffff", fontSize:10, flex:1 }}>set {a.created}</span>
                 <button onClick={() => removeAlert(a.id)} style={{ ...S.btn, padding:"3px 9px", color:"#ff4466", border:"1px solid #ff446633", background:"transparent", fontSize:10 }}>Remove</button>
               </div>
             ))}
           </div>
         )}
       </div>
-      {alerts.length === 0 && <div style={{ ...S.card, textAlign:"center", padding:40, color:"#2a2a4a" }}>Alerts appear when trades execute or AI scans complete</div>}
+      {alerts.length === 0 && <div style={{ ...S.card, textAlign:"center", padding:40, color:"#ffffff" }}>Alerts appear when trades execute or AI scans complete</div>}
       <div style={{ display:"flex", flexDirection:"column", gap:9 }}>
         {[...alerts].reverse().map((a, i) => (
           <div key={i} style={{ ...S.card, borderLeft:`3px solid ${a.color}`, display:"flex", alignItems:"center", gap:13 }}>
             <div style={{ fontSize:20 }}>{a.icon}</div>
             <div style={{ flex:1 }}>
-              <div style={{ fontWeight:700, fontSize:13, color:"#ccc" }}>{a.title}</div>
-              <div style={{ fontSize:12, color:"#555", marginTop:2 }}>{a.detail}</div>
+              <div style={{ fontWeight:700, fontSize:13, color:"#ffffff" }}>{a.title}</div>
+              <div style={{ fontSize:12, color:"#e0e0ea", marginTop:2 }}>{a.detail}</div>
             </div>
-            <div style={{ fontSize:10, color:"#2a2a4a" }}>{a.time}</div>
+            <div style={{ fontSize:10, color:"#ffffff" }}>{a.time}</div>
           </div>
         ))}
       </div>
@@ -1653,7 +1663,7 @@ function AIInsights({ prices }) {
             <select value={pair} onChange={e => setPair(e.target.value)} style={{ ...S.inp, marginBottom:12 }}>
               {PAIRS.map(p => <option key={p} value={p}>{PAIR_LABELS[p]}</option>)}
             </select>
-            {prices[pair] && <div style={{ fontSize:12, color:"#2a2a4a", marginBottom:12, fontFamily:"monospace" }}>Price: <span style={{ color:"#00ccff" }}>{prices[pair].toFixed(5)}</span></div>}
+            {prices[pair] && <div style={{ fontSize:12, color:"#ffffff", marginBottom:12, fontFamily:"monospace" }}>Price: <span style={{ color:"#00ccff" }}>{prices[pair].toFixed(5)}</span></div>}
             <button onClick={analyze} disabled={loading} style={{ ...S.btn, width:"100%", padding:"11px 0", fontWeight:800, letterSpacing:2, background:"#001a2e", color:"#00ccff", border:"1px solid #00ccff55" }}>
               {loading ? "ANALYZING..." : "✦ RUN ANALYSIS"}
             </button>
@@ -1665,7 +1675,7 @@ function AIInsights({ prices }) {
                 <div key={i} onClick={() => { setResult(h.text); setIndicators(h.indicators); }}
                   style={{ cursor:"pointer", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
                   <div style={{ color:"#888", fontWeight:700 }}>{h.pair}</div>
-                  <div style={{ color:"#2a2a4a", fontSize:10 }}>{h.time}</div>
+                  <div style={{ color:"#ffffff", fontSize:10 }}>{h.time}</div>
                 </div>
               ))}
             </div>
@@ -1682,23 +1692,23 @@ function AIInsights({ prices }) {
                   ["EMA 9",    indicators.ema9?.toFixed?.(5)   || indicators.ema9,  "#ffcc00"],
                   ["EMA 21",   indicators.ema21?.toFixed?.(5)  || indicators.ema21, "#ffcc00"],
                   ["EMA 50",   indicators.ema50?.toFixed?.(5)  || indicators.ema50, "#ffcc00"],
-                  ["RSI(14)",  indicators.rsi14, indicators.rsi14>70?"#ff4466":indicators.rsi14<30?"#00ff88":"#bbb"],
-                  ["ATR(14)",  indicators.atr14?.toFixed?.(5)  || indicators.atr14, "#bbb"],
+                  ["RSI(14)",  indicators.rsi14, indicators.rsi14>70?"#ff4466":indicators.rsi14<30?"#00ff88":"#ffffff"],
+                  ["ATR(14)",  indicators.atr14?.toFixed?.(5)  || indicators.atr14, "#ffffff"],
                   ["MACD",     indicators.macd,  indicators.macd>0?"#00ff88":"#ff4466"],
                   ["Support",  indicators.support?.toFixed?.(5)||indicators.support,"#00ff88"],
                   ["Resist.",  indicators.resistance?.toFixed?.(5)||indicators.resistance,"#ff4466"],
                 ].map(([label, val, color]) => (
                   <div key={label} style={{ display:"flex", justifyContent:"space-between", padding:"4px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
-                    <span style={{ color:"#444" }}>{label}</span>
+                    <span style={{ color:"#e0e0ea" }}>{label}</span>
                     <span style={{ color, fontFamily:"monospace", fontWeight:700 }}>{val}</span>
                   </div>
                 ))}
               </div>
               <div style={{ marginTop:8, fontSize:10, padding:"5px 8px", background:"#07071a", borderRadius:6 }}>
-                <span style={{ color:"#00ccff" }}>H1: </span><span style={{ color:"#555" }}>{indicators.trend}</span>
-                <span style={{ color:"#00ccff", marginLeft:8 }}>H4: </span><span style={{ color:"#555" }}>{indicators.h4Trend}</span>
+                <span style={{ color:"#00ccff" }}>H1: </span><span style={{ color:"#e0e0ea" }}>{indicators.trend}</span>
+                <span style={{ color:"#00ccff", marginLeft:8 }}>H4: </span><span style={{ color:"#e0e0ea" }}>{indicators.h4Trend}</span>
               </div>
-              <div style={{ marginTop:4, fontSize:10, padding:"5px 8px", background:"#07071a", borderRadius:6, color:"#555" }}>
+              <div style={{ marginTop:4, fontSize:10, padding:"5px 8px", background:"#07071a", borderRadius:6, color:"#e0e0ea" }}>
                 EMA: {indicators.emaAlignment}
               </div>
               {indicators.rsi14 > 70 && (
@@ -1716,17 +1726,17 @@ function AIInsights({ prices }) {
 
           <div style={S.card}>
             {!result && !loading && !error && (
-              <div style={{ height:220, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#1a1a30" }}>
+              <div style={{ height:220, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#888" }}>
                 <div style={{ fontSize:44, marginBottom:12 }}>✦</div>
                 <div style={{ fontSize:12 }}>Analysis uses real 50-candle OANDA data</div>
-                <div style={{ fontSize:10, color:"#1a1a30", marginTop:6 }}>EMA, RSI, ATR, Support/Resistance all calculated live</div>
+                <div style={{ fontSize:10, color:"#888", marginTop:6 }}>EMA, RSI, ATR, Support/Resistance all calculated live</div>
               </div>
             )}
             {loading && (
               <div style={{ height:220, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
                 <div style={{ color:"#00ccff", letterSpacing:3, fontSize:12, animation:"pulse 1s infinite" }}>FETCHING CANDLES + ANALYZING...</div>
-                <div style={{ color:"#2a2a4a", marginTop:10, fontSize:11 }}>50 H1 candles + 20 H4 candles from OANDA</div>
-                <div style={{ color:"#1a1a30", marginTop:4, fontSize:11 }}>{PAIR_LABELS[pair]}</div>
+                <div style={{ color:"#ffffff", marginTop:10, fontSize:11 }}>50 H1 candles + 20 H4 candles from OANDA</div>
+                <div style={{ color:"#888", marginTop:4, fontSize:11 }}>{PAIR_LABELS[pair]}</div>
               </div>
             )}
             {error && (
@@ -1738,11 +1748,11 @@ function AIInsights({ prices }) {
               <div>
                 <div style={{ display:"flex", gap:10, alignItems:"center", marginBottom:14, flexWrap:"wrap" }}>
                   <div style={{ fontSize:10, color:"#00ccff", letterSpacing:2 }}>✦ GPT-4o + Real Candles — {PAIR_LABELS[pair]}</div>
-                  {bias && <span style={{ ...S.badge, color:bColor[bias.toUpperCase()]||"#aaa", background:`${bColor[bias.toUpperCase()]||"#aaa"}20`, border:`1px solid ${bColor[bias.toUpperCase()]||"#aaa"}33` }}>{bias.toUpperCase()}</span>}
+                  {bias && <span style={{ ...S.badge, color:bColor[bias.toUpperCase()]||"#ffffff", background:`${bColor[bias.toUpperCase()]||"#ffffff"}20`, border:`1px solid ${bColor[bias.toUpperCase()]||"#ffffff"}33` }}>{bias.toUpperCase()}</span>}
                   {conf && <span style={{ fontSize:11, fontFamily:"monospace", color:"#ffcc00" }}>{conf}</span>}
-                  <span style={{ fontSize:9, color:"#2a2a4a", marginLeft:"auto" }}>based on real OANDA candles</span>
+                  <span style={{ fontSize:9, color:"#ffffff", marginLeft:"auto" }}>based on real OANDA candles</span>
                 </div>
-                <div style={{ fontSize:12, color:"#bbb", lineHeight:2, whiteSpace:"pre-wrap", fontFamily:"monospace" }}>{result}</div>
+                <div style={{ fontSize:12, color:"#ffffff", lineHeight:2, whiteSpace:"pre-wrap", fontFamily:"monospace" }}>{result}</div>
               </div>
             )}
           </div>
@@ -1776,7 +1786,7 @@ function Coach() {
   };
 
   const Stat = ({ label, value, color }) => (
-    <div>{label}: <span style={{ color: color || "#ccc", fontFamily:"monospace" }}>{value}</span></div>
+    <div>{label}: <span style={{ color: color || "#ffffff", fontFamily:"monospace" }}>{value}</span></div>
   );
 
   return (
@@ -1793,7 +1803,7 @@ function Coach() {
             <button onClick={generate} disabled={loading} style={{ ...S.btn, width:"100%", padding:"11px 0", fontWeight:800, letterSpacing:2, background:"#001a2e", color:"#00ccff", border:"1px solid #00ccff55" }}>
               {loading ? "ANALYZING..." : "✦ RUN COACHING REVIEW"}
             </button>
-            <div style={{ fontSize:10, color:"#2a2a4a", marginTop:10, lineHeight:1.6 }}>
+            <div style={{ fontSize:10, color:"#ffffff", marginTop:10, lineHeight:1.6 }}>
               Log mood (stress / confidence / fear / greed) and mistake tags per trade in the Journal tab — the more trades you tag, the sharper this report gets. Needs 5+ closed trades.
             </div>
           </div>
@@ -1804,7 +1814,7 @@ function Coach() {
                 <div key={h.id} onClick={() => setResult({ report: h.report, stats: { winRate: h.win_rate }, summary: h.summary })}
                   style={{ cursor:"pointer", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
                   <div style={{ color:"#888" }}>{new Date(h.created_at).toLocaleString()}</div>
-                  <div style={{ color:"#2a2a4a", fontSize:10 }}>{h.trade_count} trades · {h.win_rate}% WR</div>
+                  <div style={{ color:"#ffffff", fontSize:10 }}>{h.trade_count} trades · {h.win_rate}% WR</div>
                 </div>
               ))}
             </div>
@@ -1814,10 +1824,10 @@ function Coach() {
         <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
           <div style={S.card}>
             {!result && !loading && !error && (
-              <div style={{ height:260, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#1a1a30" }}>
+              <div style={{ height:260, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#888" }}>
                 <div style={{ fontSize:44, marginBottom:12 }}>✦</div>
                 <div style={{ fontSize:12 }}>Reviews your closed trades + psychology notes</div>
-                <div style={{ fontSize:10, color:"#1a1a30", marginTop:6 }}>GPT-4o reasons only over your real stats — never invents numbers</div>
+                <div style={{ fontSize:10, color:"#888", marginTop:6 }}>GPT-4o reasons only over your real stats — never invents numbers</div>
               </div>
             )}
             {loading && (
@@ -1834,7 +1844,7 @@ function Coach() {
                   <div style={{ fontSize:10, color:"#00ccff", letterSpacing:2 }}>✦ GPT-4o Coaching Report</div>
                   {result.stats?.winRate != null && <span style={{ ...S.badge, color:"#ffcc00" }}>{result.stats.winRate}% WR</span>}
                 </div>
-                <div style={{ fontSize:12, color:"#bbb", lineHeight:2, whiteSpace:"pre-wrap", fontFamily:"monospace" }}>{result.report}</div>
+                <div style={{ fontSize:12, color:"#ffffff", lineHeight:2, whiteSpace:"pre-wrap", fontFamily:"monospace" }}>{result.report}</div>
               </div>
             )}
           </div>
@@ -1853,10 +1863,10 @@ function Coach() {
               </div>
               {Object.keys(result.summary.tagStats || {}).length > 0 && (
                 <div style={{ marginTop:10, display:"flex", flexDirection:"column", gap:4 }}>
-                  <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:1, textTransform:"uppercase" }}>Mistake Tag Win Rates</div>
+                  <div style={{ fontSize:9, color:"#ffffff", letterSpacing:1, textTransform:"uppercase" }}>Mistake Tag Win Rates</div>
                   {Object.entries(result.summary.tagStats).map(([tag, s]) => (
                     <div key={tag} style={{ display:"flex", justifyContent:"space-between", fontSize:11 }}>
-                      <span style={{ color:"#555" }}>{tag.replace(/_/g," ")}</span>
+                      <span style={{ color:"#e0e0ea" }}>{tag.replace(/_/g," ")}</span>
                       <span style={{ fontFamily:"monospace", color: s.wins/s.count >= 0.5 ? "#00ff88" : "#ff4466" }}>
                         {Math.round(s.wins / s.count * 100)}% ({s.count}) · {s.pl >= 0 ? "+" : ""}${s.pl.toFixed(2)}
                       </span>
@@ -2037,7 +2047,7 @@ function Analytics({ account, trades: openTrades }) {
         ].map(t => (
           <div key={t.id} onClick={() => setAtab(t.id)} style={{
             padding:"8px 18px", fontSize:11, fontWeight:atab===t.id?700:400, cursor:"pointer",
-            color:atab===t.id?"#00ccff":"#333", borderBottom:atab===t.id?"2px solid #00ccff":"2px solid transparent",
+            color:atab===t.id?"#00ccff":"#ffffff", borderBottom:atab===t.id?"2px solid #00ccff":"2px solid transparent",
             letterSpacing:1, textTransform:"uppercase",
           }}>{t.label}</div>
         ))}
@@ -2049,8 +2059,8 @@ function Analytics({ account, trades: openTrades }) {
           {(!outcomes || outcomes.stats?.total === 0) && (
             <div style={{ ...S.card, textAlign:"center", padding:"40px 20px" }}>
               <div style={{ fontSize:28, marginBottom:12 }}>📊</div>
-              <div style={{ color:"#bbb", fontSize:13, marginBottom:8 }}>No reconciled trade outcomes yet</div>
-              <div style={{ color:"#444", fontSize:11 }}>Trades execute → OANDA closes them → reconciliation auto-syncs every 2 min</div>
+              <div style={{ color:"#ffffff", fontSize:13, marginBottom:8 }}>No reconciled trade outcomes yet</div>
+              <div style={{ color:"#e0e0ea", fontSize:11 }}>Trades execute → OANDA closes them → reconciliation auto-syncs every 2 min</div>
             </div>
           )}
           {outcomes && outcomes.stats?.total > 0 && (() => {
@@ -2081,7 +2091,7 @@ function Analytics({ account, trades: openTrades }) {
                     { l:"Wins",          v: s.wins,    c:"#00ff88" },
                     { l:"Losses",        v: s.losses,  c:"#ff4466" },
                     { l:"Max Drawdown",  v: `$${s.max_drawdown}`, c:"#ffcc00" },
-                    { l:"Avg Duration",  v: s.avg_duration_mins ? `${s.avg_duration_mins}m` : "—", c:"#bbb" },
+                    { l:"Avg Duration",  v: s.avg_duration_mins ? `${s.avg_duration_mins}m` : "—", c:"#ffffff" },
                   ].map(k => (
                     <div key={k.l} style={S.card}>
                       <div style={S.title}>{k.l}</div>
@@ -2125,7 +2135,7 @@ function Analytics({ account, trades: openTrades }) {
                         <div key={t.id} style={{ padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
                           <div style={{ display:"flex", justifyContent:"space-between" }}>
                             <div style={{ display:"flex", gap:8, alignItems:"center" }}>
-                              <span style={{ fontWeight:800, color:"#ccc" }}>{t.pair}</span>
+                              <span style={{ fontWeight:800, color:"#ffffff" }}>{t.pair}</span>
                               <span style={{ ...S.badge, color:t.direction==="BUY"?"#00ff88":"#ff4466",
                                 background:t.direction==="BUY"?"#003322":"#330011" }}>{t.direction}</span>
                               <span style={{ ...S.badge, color:win?"#00ff88":"#ff4466",
@@ -2135,7 +2145,7 @@ function Analytics({ account, trades: openTrades }) {
                               {(t.realized_pl||0)>=0?"+":""}${parseFloat(t.realized_pl||0).toFixed(2)}
                             </span>
                           </div>
-                          <div style={{ color:"#333", marginTop:3 }}>
+                          <div style={{ color:"#ffffff", marginTop:3 }}>
                             {t.actual_pips ? `${parseFloat(t.actual_pips)>=0?"+":""}${t.actual_pips} pips` : ""}
                             {t.duration_mins ? ` · ${t.duration_mins}m` : ""}
                             {t.confidence ? ` · ${t.confidence}% conf` : ""}
@@ -2157,15 +2167,15 @@ function Analytics({ account, trades: openTrades }) {
           {(!slippage || slippage.total_fills === 0) && (
             <div style={{ ...S.card, textAlign:"center", padding:"40px 20px" }}>
               <div style={{ fontSize:28, marginBottom:12 }}>⚡</div>
-              <div style={{ color:"#bbb", fontSize:13, marginBottom:8 }}>No execution data yet</div>
-              <div style={{ color:"#444", fontSize:11 }}>Fill quality metrics appear after first executed trade</div>
+              <div style={{ color:"#ffffff", fontSize:13, marginBottom:8 }}>No execution data yet</div>
+              <div style={{ color:"#e0e0ea", fontSize:11 }}>Fill quality metrics appear after first executed trade</div>
             </div>
           )}
           {slippage && slippage.total_fills > 0 && (
             <>
               <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:11 }}>
                 {[
-                  { l:"Total Fills",      v: slippage.total_fills,  c:"#ccc" },
+                  { l:"Total Fills",      v: slippage.total_fills,  c:"#ffffff" },
                   { l:"Avg Slippage",     v: `${slippage.avg_slippage_pips} pips`,
                     c: parseFloat(slippage.avg_slippage_pips)>2?"#ff4466":parseFloat(slippage.avg_slippage_pips)>1?"#ffcc00":"#00ff88" },
                   { l:"Max Slippage",     v: `${slippage.max_slippage_pips} pips`,
@@ -2193,7 +2203,7 @@ function Analytics({ account, trades: openTrades }) {
                       return (
                         <div key={l} style={{ marginBottom:14 }}>
                           <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:5 }}>
-                            <span style={{ color:"#666" }}>{l}</span>
+                            <span style={{ color:"#e0e0ea" }}>{l}</span>
                             <span style={{ color:c, fontFamily:"monospace" }}>{v} ({pct}%)</span>
                           </div>
                           <div style={{ height:6, background:"#0d0d1e", borderRadius:3 }}>
@@ -2202,7 +2212,7 @@ function Analytics({ account, trades: openTrades }) {
                         </div>
                       );
                     })}
-                    <div style={{ fontSize:11, color:"#444", marginTop:8, padding:"8px 0", borderTop:"1px solid #0d0d1e" }}>
+                    <div style={{ fontSize:11, color:"#e0e0ea", marginTop:8, padding:"8px 0", borderTop:"1px solid #0d0d1e" }}>
                       Positive = filled better than market price (rare)<br/>
                       Negative = filled worse than expected (normal)
                     </div>
@@ -2216,7 +2226,7 @@ function Analytics({ account, trades: openTrades }) {
                     <div key={pair} style={{ display:"flex", justifyContent:"space-between", padding:"6px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
                       <span style={{ color:"#888", fontWeight:700 }}>{pair}</span>
                       <div style={{ display:"flex", gap:12, fontFamily:"monospace" }}>
-                        <span style={{ color:"#444" }}>{ps.count} fills</span>
+                        <span style={{ color:"#e0e0ea" }}>{ps.count} fills</span>
                         <span style={{ color:parseFloat(ps.avgSlip)>2?"#ff4466":parseFloat(ps.avgSlip)>1?"#ffcc00":"#00ff88" }}>
                           avg {ps.avgSlip} pips
                         </span>
@@ -2229,13 +2239,13 @@ function Analytics({ account, trades: openTrades }) {
               {/* Recent fills */}
               <div style={S.card}>
                 <div style={S.title}>Recent Fills</div>
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr", gap:6, fontSize:10, color:"#333", padding:"6px 0", borderBottom:"1px solid #0d0d1e", marginBottom:4 }}>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr", gap:6, fontSize:10, color:"#ffffff", padding:"6px 0", borderBottom:"1px solid #0d0d1e", marginBottom:4 }}>
                   {["Pair","Session","Expected","Actual","Slippage","Direction"].map(h => <div key={h}>{h}</div>)}
                 </div>
                 {(slippage.recent || []).map((f, i) => (
                   <div key={i} style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr", gap:6, fontSize:11, padding:"5px 0", borderBottom:"1px solid #0a0a18" }}>
-                    <span style={{ color:"#bbb", fontWeight:700 }}>{f.pair}</span>
-                    <span style={{ color:"#555" }}>{f.session}</span>
+                    <span style={{ color:"#ffffff", fontWeight:700 }}>{f.pair}</span>
+                    <span style={{ color:"#e0e0ea" }}>{f.session}</span>
                     <span style={{ fontFamily:"monospace", color:"#888" }}>{parseFloat(f.expected_px||0).toFixed(5)}</span>
                     <span style={{ fontFamily:"monospace", color:"#888" }}>{parseFloat(f.actual_px||0).toFixed(5)}</span>
                     <span style={{ fontFamily:"monospace", color:parseFloat(f.slippage_pips)>2?"#ff4466":"#888" }}>
@@ -2254,10 +2264,17 @@ function Analytics({ account, trades: openTrades }) {
       {atab === "performance" && (
       <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
 
+      {/* OANDA history outage banner */}
+      {history?.historyError && (
+        <div style={{ ...S.card, border:"1px solid #ff446644", background:"#1a0808", color:"#ff9a9a", fontSize:12, padding:"11px 14px" }}>
+          ⚠ {history.historyError} — OANDA's trade-history service is temporarily unavailable. Live prices and trading are unaffected. Try Refresh shortly.
+        </div>
+      )}
+
       {/* Top KPI row */}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:11 }}>
         {[
-          { l:"Total Trades",  v: st.total || 0,                          c:"#ccc" },
+          { l:"Total Trades",  v: st.total || 0,                          c:"#ffffff" },
           { l:"Won ✅",         v: st.won   || 0,                          c:"#00ff88" },
           { l:"Lost ❌",        v: st.lost  || 0,                          c:"#ff4466" },
           { l:"Win Rate",      v: `${wr}%`,                                c: wr>=50?"#00ff88":"#ff4466" },
@@ -2290,8 +2307,8 @@ function Analytics({ account, trades: openTrades }) {
       <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr", gap:13 }}>
         <div style={S.card}>
           <div style={S.title}>P&L per Trade (last 20 closed)</div>
-          {plData.length === 0 && loading && <div style={{ color:"#2a2a4a", fontSize:12, padding:"20px 0", textAlign:"center" }}>Loading...</div>}
-          {plData.length === 0 && !loading && <div style={{ color:"#2a2a4a", fontSize:12, padding:"20px 0", textAlign:"center" }}>No closed trades yet</div>}
+          {plData.length === 0 && loading && <div style={{ color:"#ffffff", fontSize:12, padding:"20px 0", textAlign:"center" }}>Loading...</div>}
+          {plData.length === 0 && !loading && <div style={{ color:"#ffffff", fontSize:12, padding:"20px 0", textAlign:"center" }}>No closed trades yet</div>}
           <div style={{ display:"flex", alignItems:"flex-end", gap:4, height:80, marginTop:10 }}>
             {plData.map((pl, i) => {
               const h = Math.max(4, Math.abs(pl / maxAbs) * 76);
@@ -2319,11 +2336,11 @@ function Analytics({ account, trades: openTrades }) {
               ["Used",   `${daily.used_percent}%`, daily.limit_hit?"#ff4466":parseFloat(daily.used_percent)>60?"#ffcc00":"#00ff88"],
               ["P&L",   `${parseFloat(daily.realized_pl)>=0?"+":""}$${daily.realized_pl}`, parseFloat(daily.realized_pl)>=0?"#00ff88":"#ff4466"],
               ["Limit", `$${daily.max_daily_loss}`, "#ff4466"],
-              ["Trades", daily.trade_count, "#bbb"],
+              ["Trades", daily.trade_count, "#ffffff"],
               ["Safe",  daily.safe_to_trade?"YES":"STOP", daily.safe_to_trade?"#00ff88":"#ff4466"],
             ].map(([l,v,c]) => (
               <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
-                <span style={{ color:"#444" }}>{l}</span>
+                <span style={{ color:"#e0e0ea" }}>{l}</span>
                 <span style={{ color:c, fontFamily:"monospace", fontWeight:700 }}>{v}</span>
               </div>
             ))}
@@ -2340,17 +2357,17 @@ function Analytics({ account, trades: openTrades }) {
               const pWr = Math.round(ps.won / ps.total * 100);
               return (
                 <div key={pair} style={{ background:"#08081a", borderRadius:8, padding:"10px 12px", border:"1px solid #0d0d1e" }}>
-                  <div style={{ fontWeight:800, color:"#ccc", fontSize:12, marginBottom:7 }}>{pair}</div>
+                  <div style={{ fontWeight:800, color:"#ffffff", fontSize:12, marginBottom:7 }}>{pair}</div>
                   <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
-                    <span style={{ color:"#444" }}>Trades</span>
-                    <span style={{ color:"#bbb", fontFamily:"monospace" }}>{ps.total}</span>
+                    <span style={{ color:"#e0e0ea" }}>Trades</span>
+                    <span style={{ color:"#ffffff", fontFamily:"monospace" }}>{ps.total}</span>
                   </div>
                   <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
-                    <span style={{ color:"#444" }}>Win Rate</span>
+                    <span style={{ color:"#e0e0ea" }}>Win Rate</span>
                     <span style={{ color:pWr>=50?"#00ff88":"#ff4466", fontFamily:"monospace" }}>{pWr}%</span>
                   </div>
                   <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:6 }}>
-                    <span style={{ color:"#444" }}>P&L</span>
+                    <span style={{ color:"#e0e0ea" }}>P&L</span>
                     <span style={{ color:ps.pl>=0?"#00ff88":"#ff4466", fontFamily:"monospace", fontWeight:700 }}>
                       {ps.pl>=0?"+":""}${ps.pl.toFixed(2)}
                     </span>
@@ -2375,9 +2392,9 @@ function Analytics({ account, trades: openTrades }) {
             </span>
           )}
         </div>
-        {loading && <div style={{ color:"#2a2a4a", fontSize:12, padding:"20px", textAlign:"center" }}>Loading trade history...</div>}
+        {loading && <div style={{ color:"#ffffff", fontSize:12, padding:"20px", textAlign:"center" }}>Loading trade history...</div>}
         {!loading && (!history?.trades || history.trades.length === 0) && (
-          <div style={{ color:"#2a2a4a", fontSize:12, padding:"20px", textAlign:"center" }}>
+          <div style={{ color:"#ffffff", fontSize:12, padding:"20px", textAlign:"center" }}>
             No closed trades found in your OANDA account
           </div>
         )}
@@ -2386,25 +2403,25 @@ function Analytics({ account, trades: openTrades }) {
           return (
             <div key={t.id || i} style={{ padding:"10px 12px", background:i%2===0?"#07071a":"#08081a",
               borderRadius:7, marginBottom:4, border:"1px solid #0d0d1e",
-              borderLeft:`3px solid ${t.pl>0?"#00ff88":t.pl<0?"#ff4466":"#333"}` }}>
+              borderLeft:`3px solid ${t.pl>0?"#00ff88":t.pl<0?"#ff4466":"#ffffff"}` }}>
               <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4 }}>
-                <span style={{ fontWeight:800, color:"#ccc", fontSize:12, minWidth:50 }}>{t.pair}</span>
+                <span style={{ fontWeight:800, color:"#ffffff", fontSize:12, minWidth:50 }}>{t.pair}</span>
                 <span style={{ ...S.badge, color:t.direction==="BUY"?"#00ff88":"#ff4466",
                   background:t.direction==="BUY"?"#003322":"#330011", fontSize:9 }}>{t.direction}</span>
                 {isAuto && <span style={{ ...S.badge, background:"#001a2e", color:"#00ccff", fontSize:9 }}>⚡AUTO</span>}
                 <span style={{ flex:1 }} />
                 <span style={{ fontFamily:"monospace", fontSize:13, fontWeight:800,
-                  color:t.pl>0?"#00ff88":t.pl<0?"#ff4466":"#555" }}>
+                  color:t.pl>0?"#00ff88":t.pl<0?"#ff4466":"#e0e0ea" }}>
                   {t.pl>0?"+":""}${t.pl.toFixed(2)}
                 </span>
-                <span style={{ fontSize:10, color:t.pl>0?"#00ff8866":t.pl<0?"#ff446666":"#333", fontFamily:"monospace" }}>
+                <span style={{ fontSize:10, color:t.pl>0?"#00ff8866":t.pl<0?"#ff446666":"#ffffff", fontFamily:"monospace" }}>
                   ({t.pips>0?"+":""}{t.pips} pips)
                 </span>
               </div>
-              <div style={{ display:"flex", gap:14, fontSize:10, color:"#333" }}>
-                <span>Entry: <span style={{ color:"#555" }}>{t.entryPrice}</span></span>
-                <span>Close: <span style={{ color:"#555" }}>{t.closePrice}</span></span>
-                <span>Units: <span style={{ color:"#555" }}>{t.units?.toLocaleString()}</span></span>
+              <div style={{ display:"flex", gap:14, fontSize:10, color:"#ffffff" }}>
+                <span>Entry: <span style={{ color:"#e0e0ea" }}>{t.entryPrice}</span></span>
+                <span>Close: <span style={{ color:"#e0e0ea" }}>{t.closePrice}</span></span>
+                <span>Units: <span style={{ color:"#e0e0ea" }}>{t.units?.toLocaleString()}</span></span>
                 {t.sl && <span>SL: <span style={{ color:"#ff446688" }}>{t.sl}</span></span>}
                 {t.tp && <span>TP: <span style={{ color:"#00ff8888" }}>{t.tp}</span></span>}
                 <span style={{ marginLeft:"auto" }}>{t.closeTime}</span>
@@ -2441,8 +2458,8 @@ function BtEquityCurve({ data }) {
       <polygon points={fill} fill={col} fillOpacity={0.07} />
       <polyline points={pts} fill="none" stroke={col} strokeWidth={1.5} />
       <circle cx={toX(data.length-1)} cy={toY(last)} r={3} fill={col} />
-      <text x={PAD} y={12} fill="#2a2a4a" fontSize={9}>{max.toFixed(0)}p</text>
-      <text x={PAD} y={H-3} fill="#2a2a4a" fontSize={9}>{min.toFixed(0)}p</text>
+      <text x={PAD} y={12} fill="#ffffff" fontSize={9}>{max.toFixed(0)}p</text>
+      <text x={PAD} y={H-3} fill="#ffffff" fontSize={9}>{min.toFixed(0)}p</text>
     </svg>
   );
 }
@@ -2485,13 +2502,13 @@ function Backtest() {
   const plColor  = v => parseFloat(v) >= 0 ? '#00ff88' : '#ff4466';
 
   const inp = { ...S.inp, padding:"7px 10px", fontSize:11 };
-  const lbl = { fontSize:10, color:"#2a2a4a", marginBottom:4, letterSpacing:1, textTransform:"uppercase" };
+  const lbl = { fontSize:10, color:"#ffffff", marginBottom:4, letterSpacing:1, textTransform:"uppercase" };
 
   return (
     <div style={{ padding:"0 2px" }}>
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
         <div style={S.ph}>Backtest Engine</div>
-        <div style={{ fontSize:11, color:"#2a2a4a" }}>Walk-forward · M30 scan · SL/TP simulation</div>
+        <div style={{ fontSize:11, color:"#ffffff" }}>Walk-forward · M30 scan · SL/TP simulation</div>
       </div>
 
       {/* Config panel */}
@@ -2533,7 +2550,7 @@ function Backtest() {
           </button>
         </div>
         {loading && (
-          <div style={{ marginTop:12, fontSize:11, color:"#2a2a4a" }}>
+          <div style={{ marginTop:12, fontSize:11, color:"#ffffff" }}>
             Fetching candles from OANDA and replaying signals... this takes 5-15 seconds.
           </div>
         )}
@@ -2546,17 +2563,17 @@ function Backtest() {
           {/* Stats row */}
           <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
             {[
-              { label:"Signals",   value:s.total,           color:"#ccc" },
+              { label:"Signals",   value:s.total,           color:"#ffffff" },
               { label:"Win Rate",  value:`${s.winRate}%`,   color:s.winRate >= 50 ? "#00ff88" : "#ff4466" },
               { label:"Total Pips",value:`${s.totalPips > 0 ? "+" : ""}${s.totalPips}p`, color:plColor(s.totalPips) },
               { label:"Avg Win",   value:`+${s.avgWin}p`,   color:"#00ff88" },
               { label:"Avg Loss",  value:`${s.avgLoss}p`,   color:"#ff4466" },
               { label:"Avg R:R",   value:s.avgRR,           color:"#00ccff" },
               { label:"Max DD",    value:`-${s.maxDD}p`,    color:"#ff8844" },
-              { label:"Won/Lost",  value:`${s.won}/${s.lost}`, color:"#ccc" },
+              { label:"Won/Lost",  value:`${s.won}/${s.lost}`, color:"#ffffff" },
             ].map(({ label, value, color }) => (
               <div key={label} style={{ ...S.card, flex:1, minWidth:80, textAlign:"center", padding:"11px 8px" }}>
-                <div style={{ fontSize:9, color:"#2a2a4a", letterSpacing:2, marginBottom:4, textTransform:"uppercase" }}>{label}</div>
+                <div style={{ fontSize:9, color:"#ffffff", letterSpacing:2, marginBottom:4, textTransform:"uppercase" }}>{label}</div>
                 <div style={{ fontSize:18, fontWeight:900, color, fontFamily:"monospace" }}>{value}</div>
               </div>
             ))}
@@ -2565,14 +2582,14 @@ function Backtest() {
           {/* Equity curve */}
           {curve.length > 1 && (
             <div style={{ ...S.card, marginBottom:14, padding:"14px 16px" }}>
-              <div style={{ fontSize:10, color:"#2a2a4a", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Equity Curve (pips)</div>
+              <div style={{ fontSize:10, color:"#ffffff", letterSpacing:2, marginBottom:8, textTransform:"uppercase" }}>Equity Curve (pips)</div>
               <BtEquityCurve data={curve} />
             </div>
           )}
 
           {/* Signal list */}
           {sigs.length === 0 && (
-            <div style={{ ...S.card, textAlign:"center", padding:40, color:"#2a2a4a" }}>
+            <div style={{ ...S.card, textAlign:"center", padding:40, color:"#ffffff" }}>
               No signals met the criteria — try lowering minScore or minConf
             </div>
           )}
@@ -2582,26 +2599,26 @@ function Backtest() {
               return (
                 <div key={idx} style={{ ...S.card, borderLeft:`3px solid ${resColor(s.result)}`, padding:"10px 14px" }}>
                   <div style={{ display:"flex", alignItems:"center", gap:9, cursor:"pointer" }} onClick={() => setExpand(isOpen ? null : idx)}>
-                    <span style={{ fontSize:10, color:"#2a2a4a", minWidth:115, fontFamily:"monospace" }}>{s.time}</span>
-                    <span style={{ fontWeight:800, color:"#ccc", minWidth:60, fontSize:11 }}>{s.pair}</span>
+                    <span style={{ fontSize:10, color:"#ffffff", minWidth:115, fontFamily:"monospace" }}>{s.time}</span>
+                    <span style={{ fontWeight:800, color:"#ffffff", minWidth:60, fontSize:11 }}>{s.pair}</span>
                     <span style={{ ...S.badge, color:s.direction==="BUY"?"#00ff88":"#ff4466", background:s.direction==="BUY"?"#003322":"#330011", fontSize:9 }}>{s.direction}</span>
                     <span style={{ ...S.badge, color:resColor(s.result), background:"#07071a", fontSize:9 }}>{s.result}</span>
                     <span style={{ ...S.badge, color:"#00ccff", background:"#001a2e", fontSize:9 }}>{s.score}/{s.maxScore}</span>
-                    <span style={{ ...S.badge, color:"#aaa", background:"#0a0a1e", fontSize:9 }}>{s.confidence}%</span>
+                    <span style={{ ...S.badge, color:"#ffffff", background:"#0a0a1e", fontSize:9 }}>{s.confidence}%</span>
                     <span style={{ fontFamily:"monospace", color:plColor(s.pips), fontWeight:700, minWidth:60, fontSize:11 }}>
                       {s.pips > 0 ? "+" : ""}{s.pips}p
                     </span>
-                    <span style={{ fontSize:10, color:"#333" }}>RR {s.rr}</span>
-                    <span style={{ fontSize:10, color:"#2a2a4a", flex:1 }}>{s.session}</span>
-                    <span style={{ fontSize:10, color:"#2a2a4a" }}>{isOpen ? "▲" : "▼"}</span>
+                    <span style={{ fontSize:10, color:"#ffffff" }}>RR {s.rr}</span>
+                    <span style={{ fontSize:10, color:"#ffffff", flex:1 }}>{s.session}</span>
+                    <span style={{ fontSize:10, color:"#ffffff" }}>{isOpen ? "▲" : "▼"}</span>
                   </div>
                   {isOpen && (
                     <div style={{ marginTop:10, display:"flex", gap:16, flexWrap:"wrap", fontSize:10 }}>
-                      <div style={{ color:"#2a2a4a" }}>Entry <span style={{ color:"#ccc" }}>{s.entry}</span></div>
-                      <div style={{ color:"#2a2a4a" }}>Exit <span style={{ color:"#ccc" }}>{s.exitPrice}</span></div>
-                      <div style={{ color:"#2a2a4a" }}>SL <span style={{ color:"#ff4466" }}>{s.sl}</span></div>
-                      <div style={{ color:"#2a2a4a" }}>TP <span style={{ color:"#00ff88" }}>{s.tp}</span></div>
-                      <div style={{ color:"#2a2a4a" }}>Bars to exit <span style={{ color:"#ccc" }}>{s.exitBars}</span></div>
+                      <div style={{ color:"#ffffff" }}>Entry <span style={{ color:"#ffffff" }}>{s.entry}</span></div>
+                      <div style={{ color:"#ffffff" }}>Exit <span style={{ color:"#ffffff" }}>{s.exitPrice}</span></div>
+                      <div style={{ color:"#ffffff" }}>SL <span style={{ color:"#ff4466" }}>{s.sl}</span></div>
+                      <div style={{ color:"#ffffff" }}>TP <span style={{ color:"#00ff88" }}>{s.tp}</span></div>
+                      <div style={{ color:"#ffffff" }}>Bars to exit <span style={{ color:"#ffffff" }}>{s.exitBars}</span></div>
                       {s.failedChecks.length > 0 && (
                         <div style={{ color:"#ff446699" }}>Failed: {s.failedChecks.join(", ")}</div>
                       )}
@@ -2644,13 +2661,13 @@ function Settings({ keys, setKeys, aiReady }) {
   return (
     <div>
       <div style={S.ph}>Settings & API Keys</div>
-      <div style={{ ...S.card, marginBottom:13, padding:"10px 15px", fontSize:12, color:"#555", borderLeft:"3px solid #ffcc00" }}>
+      <div style={{ ...S.card, marginBottom:13, padding:"10px 15px", fontSize:12, color:"#e0e0ea", borderLeft:"3px solid #ffcc00" }}>
         ⚠ Keys are stored in the server database — never exposed to browser. Set APP_SECRET in server .env to enable password protection.
       </div>
       {/* FIX 5: App password for authenticated access */}
       <div style={{ ...S.card, marginBottom:13, borderLeft:"3px solid #00ccff" }}>
         <div style={S.title}>App Password (Auth Token)</div>
-        <div style={{ fontSize:11, color:"#444", marginBottom:8 }}>
+        <div style={{ fontSize:11, color:"#e0e0ea", marginBottom:8 }}>
           If APP_SECRET is set in server .env, enter it here to authenticate all API requests.
           Stored in browser localStorage only — never sent to server as a key.
         </div>
@@ -2662,14 +2679,14 @@ function Settings({ keys, setKeys, aiReady }) {
           style={{ ...S.inp, marginBottom:4 }}
           placeholder="Leave empty if no APP_SECRET configured"
         />
-        <div style={{ fontSize:10, color: keys.auth_enabled ? "#00ff88" : "#333" }}>
+        <div style={{ fontSize:10, color: keys.auth_enabled ? "#00ff88" : "#ffffff" }}>
           {keys.auth_enabled ? "✓ Server auth is enabled" : "○ Server auth not configured"}
         </div>
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
         <div style={{ ...S.card, gridColumn:"1/-1", borderLeft:"3px solid #00ff88", background:"#001a0e" }}>
           <div style={{ ...S.title, color:"#00ff88" }}>🧠 Dual AI Engine — Calc + GPT-4o</div>
-          <div style={{ fontSize:12, color:"#aaa", lineHeight:1.7 }}>
+          <div style={{ fontSize:12, color:"#ffffff", lineHeight:1.7 }}>
             Two-layer signal validation for maximum precision:<br/>
             <span style={{ color:"#00ccff" }}>① Rule Engine</span> — 12-check score (H4→H2→M30→M5), instant, no API. Blocks bad setups before spending credits.<br/>
             <span style={{ color:"#ffcc00" }}>② GPT-4o</span> — only called if Rule Engine passes. Validates direction, refines SL/TP at real S/R levels, sets final confidence.<br/>
@@ -2681,7 +2698,7 @@ function Settings({ keys, setKeys, aiReady }) {
           <div style={S.title}>OpenAI — GPT-4o Validator</div>
           <label style={S.lbl}>API Key</label>
           <input {...field("openai_key")} />
-          <div style={{ fontSize:10, color:"#2a2a4a", marginTop:5, lineHeight:1.6 }}>
+          <div style={{ fontSize:10, color:"#ffffff", marginTop:5, lineHeight:1.6 }}>
             Used as the 2nd validation layer. Get at platform.openai.com
           </div>
         </div>
@@ -2691,13 +2708,13 @@ function Settings({ keys, setKeys, aiReady }) {
           <input {...field("oanda_key")} />
           <label style={S.lbl}>Account ID</label>
           <input {...field("oanda_account", "text", "101-004-XXXXXXX-XXX")} />
-          <div style={{ fontSize:10, color:"#2a2a4a", marginTop:5, lineHeight:1.6 }}>Supports practice and live accounts.</div>
+          <div style={{ fontSize:10, color:"#ffffff", marginTop:5, lineHeight:1.6 }}>Supports practice and live accounts.</div>
         </div>
         <div style={S.card}>
           <div style={S.title}>Twelve Data</div>
           <label style={S.lbl}>API Key</label>
           <input {...field("twelve_key")} />
-          <div style={{ fontSize:10, color:"#2a2a4a", marginTop:5, lineHeight:1.6 }}>Free tier: 800 API calls/day. Used for live price feeds.</div>
+          <div style={{ fontSize:10, color:"#ffffff", marginTop:5, lineHeight:1.6 }}>Free tier: 800 API calls/day. Used for live price feeds.</div>
         </div>
         <div style={S.card}>
           <div style={S.title}>Telegram Alerts</div>
@@ -2705,7 +2722,7 @@ function Settings({ keys, setKeys, aiReady }) {
           <input {...field("tg_token")} />
           <label style={S.lbl}>Chat ID</label>
           <input {...field("tg_chat", "text", "-100XXXXXXXXX")} />
-          <div style={{ fontSize:10, color:"#2a2a4a", marginTop:5, lineHeight:1.6 }}>Optional. Get token from @BotFather.</div>
+          <div style={{ fontSize:10, color:"#ffffff", marginTop:5, lineHeight:1.6 }}>Optional. Get token from @BotFather.</div>
         </div>
         <div style={S.card}>
           <div style={S.title}>Connection Status</div>
@@ -2718,7 +2735,7 @@ function Settings({ keys, setKeys, aiReady }) {
             ["Telegram Chat ID", !!local.tg_chat],
           ].map(([l, ok]) => (
             <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:12 }}>
-              <span style={{ color:"#444" }}>{l}</span>
+              <span style={{ color:"#e0e0ea" }}>{l}</span>
               <Pill ok={ok} label={ok ? "SET" : "MISSING"} />
             </div>
           ))}
@@ -2804,7 +2821,7 @@ export default function App() {
           <div style={{ width:10, height:10, borderRadius:"50%", background:"#00ccff", animation:"pulse 1.2s infinite" }} />
           <span style={{ fontSize:13, color:"#00ccff", letterSpacing:2 }}>Connecting to server...</span>
         </div>
-        <div style={{ fontSize:11, color:"#444", marginTop:4 }}>Loading your keys and settings</div>
+        <div style={{ fontSize:11, color:"#e0e0ea", marginTop:4 }}>Loading your keys and settings</div>
       </div>
     );
   }
@@ -2828,7 +2845,7 @@ export default function App() {
   };
 
   return (
-    <div style={{ display:"flex", height:"100vh", background:"#06061a", color:"#ccc", fontFamily:"'Courier New',monospace", overflow:"hidden" }}>
+    <div style={{ display:"flex", height:"100vh", background:"#06061a", color:"#ffffff", fontFamily:"'Courier New',monospace", overflow:"hidden" }}>
       <style>{`
         *{box-sizing:border-box;margin:0;padding:0;}
         ::-webkit-scrollbar{width:3px;}
@@ -2843,14 +2860,14 @@ export default function App() {
       <div style={{ width:col?50:192, background:"#05051a", borderRight:"1px solid #13132b", display:"flex", flexDirection:"column", transition:"width 0.2s", overflow:"hidden", flexShrink:0 }}>
         <div style={{ padding:"14px 11px", borderBottom:"1px solid #13132b", display:"flex", alignItems:"center", gap:9 }}>
           <div style={{ width:26, height:26, borderRadius:6, background:"linear-gradient(135deg,#00ff88,#00ccff)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:12, color:"#000", fontWeight:900, flexShrink:0 }}>P</div>
-          {!col && <div style={{ fontSize:9, fontWeight:800, color:"#bbb", letterSpacing:1, whiteSpace:"nowrap", lineHeight:1.5 }}>PRECISION<br /><span style={{ color:"#00ccff" }}>TRADER PRO</span></div>}
+          {!col && <div style={{ fontSize:9, fontWeight:800, color:"#ffffff", letterSpacing:1, whiteSpace:"nowrap", lineHeight:1.5 }}>PRECISION<br /><span style={{ color:"#00ccff" }}>TRADER PRO</span></div>}
         </div>
         <div style={{ flex:1, overflowY:"auto", padding:"7px 4px" }}>
           {NAV.map(item => {
             const active = page === item.id;
             const badge  = item.id === "alerts" && unread > 0 ? unread : null;
             return (
-              <div key={item.id} onClick={() => setPage(item.id)} style={{ display:"flex", alignItems:"center", gap:8, padding:"9px 9px", borderRadius:7, cursor:"pointer", marginBottom:1, background:active?"#0d0d2a":"transparent", borderLeft:active?"2px solid #00ccff":"2px solid transparent", color:active?"#00ccff":"#2a2a4a", transition:"all 0.12s", whiteSpace:"nowrap" }}>
+              <div key={item.id} onClick={() => setPage(item.id)} style={{ display:"flex", alignItems:"center", gap:8, padding:"9px 9px", borderRadius:7, cursor:"pointer", marginBottom:1, background:active?"#0d0d2a":"transparent", borderLeft:active?"2px solid #00ccff":"2px solid transparent", color:active?"#00ccff":"#ffffff", transition:"all 0.12s", whiteSpace:"nowrap" }}>
                 <span style={{ fontSize:14, flexShrink:0 }}>{item.icon}</span>
                 {!col && <span style={{ fontSize:11, fontWeight:active?700:400, flex:1 }}>{item.label}</span>}
                 {badge && !col && <span style={{ fontSize:9, padding:"2px 5px", borderRadius:10, background:"#ffcc00", color:"#000", fontWeight:800 }}>{badge}</span>}
@@ -2858,7 +2875,7 @@ export default function App() {
             );
           })}
         </div>
-        <div onClick={() => setCol(!col)} style={{ padding:"11px 13px", borderTop:"1px solid #13132b", cursor:"pointer", color:"#1a1a30", fontSize:12, display:"flex", alignItems:"center", gap:7 }}>
+        <div onClick={() => setCol(!col)} style={{ padding:"11px 13px", borderTop:"1px solid #13132b", cursor:"pointer", color:"#888", fontSize:12, display:"flex", alignItems:"center", gap:7 }}>
           <span>{col ? "▶" : "◀"}</span>{!col && <span style={{ fontSize:10 }}>Collapse</span>}
         </div>
       </div>
@@ -2867,15 +2884,15 @@ export default function App() {
       <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
         {/* Top bar */}
         <div style={{ height:46, borderBottom:"1px solid #13132b", display:"flex", alignItems:"center", padding:"0 16px", gap:12, background:"#05051a", flexShrink:0 }}>
-          <div style={{ fontSize:10, color:"#1a1a30", letterSpacing:3, textTransform:"uppercase", flex:1 }}>{NAV.find(n => n.id === page)?.label}</div>
+          <div style={{ fontSize:10, color:"#888", letterSpacing:3, textTransform:"uppercase", flex:1 }}>{NAV.find(n => n.id === page)?.label}</div>
           <div style={{ display:"flex", gap:12, alignItems:"center" }}>
             {Object.entries(prices).slice(0, 3).map(([p, v]) => (
               <div key={p} style={{ fontSize:10, fontFamily:"monospace", display:"flex", gap:4 }}>
-                <span style={{ color:"#1a1a30" }}>{PAIR_LABELS[p]}</span>
+                <span style={{ color:"#888" }}>{PAIR_LABELS[p]}</span>
                 <span style={{ color:"#00ccff" }}>{v.toFixed?.(4)}</span>
               </div>
             ))}
-            <div style={{ fontSize:10, color:"#1a1a30", fontFamily:"monospace" }}>{time.toUTCString().slice(17, 25)} UTC</div>
+            <div style={{ fontSize:10, color:"#888", fontFamily:"monospace" }}>{time.toUTCString().slice(17, 25)} UTC</div>
             <div style={{ display:"flex", alignItems:"center", gap:5 }}>
               <div style={{ width:6, height:6, borderRadius:"50%", background:(oConn||tConn)?"#00ff88":"#ff4466", animation:(oConn||tConn)?"pulse 2s infinite":"none" }} />
               <span style={{ fontSize:10, color:(oConn||tConn)?"#00ff88":"#ff4466" }}>{(oConn||tConn) ? "LIVE" : "OFFLINE"}</span>

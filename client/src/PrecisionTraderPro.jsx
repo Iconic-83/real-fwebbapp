@@ -1191,6 +1191,82 @@ function EquityCurve({ data }) {
   );
 }
 
+// Per-trade candlestick chart: OANDA candles around the trade window with
+// entry/exit/SL/TP lines and a LONG/SHORT marker. Lazily fetches on mount.
+function TradeChart({ trade }) {
+  const [candles, setCandles] = useState(null);
+  const [err, setErr] = useState(null);
+
+  const fromISO = trade.openTimeISO  || (trade.openTime  ? trade.openTime.replace(" ", "T") + ":00Z"  : null);
+  const toISO   = trade.closeTimeISO || (trade.closeTime ? trade.closeTime.replace(" ", "T") + ":00Z" : null);
+
+  useEffect(() => {
+    let alive = true;
+    setCandles(null); setErr(null);
+    if (!fromISO || !toISO) { setErr("No timestamps for this trade"); return; }
+    fetch(`/api/trade/candles?pair=${encodeURIComponent(trade.pair)}&from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}`)
+      .then(r => r.json())
+      .then(d => { if (!alive) return; (d.error || !d.candles?.length) ? setErr(d.error || "No candle data") : setCandles(d.candles); })
+      .catch(() => { if (alive) setErr("Failed to load chart"); });
+    return () => { alive = false; };
+  }, [trade.id]);
+
+  if (err)      return <div style={{ height:180, display:"flex", alignItems:"center", justifyContent:"center", color:"#ff9a9a", fontSize:11 }}>⚠ {err}</div>;
+  if (!candles) return <div style={{ height:180, display:"flex", alignItems:"center", justifyContent:"center", color:"#e0e0ea", fontSize:11 }}>Loading chart…</div>;
+
+  const W = 560, H = 200, PADX = 8, PADTOP = 10, PADBOT = 16;
+  const isLong = trade.direction === "BUY";
+  const entry = parseFloat(trade.entryPrice), exit = parseFloat(trade.closePrice);
+  const sl = trade.sl ? parseFloat(trade.sl) : null, tp = trade.tp ? parseFloat(trade.tp) : null;
+
+  let max = Math.max(...candles.map(c => c.h), entry, exit);
+  let min = Math.min(...candles.map(c => c.l), entry, exit);
+  [sl, tp].forEach(v => { if (v != null) { max = Math.max(max, v); min = Math.min(min, v); } });
+  const padV = ((max - min) || 0.0001) * 0.08; max += padV; min -= padV;
+  const rng = (max - min) || 0.0001;
+  const toY = v => PADTOP + (1 - (v - min) / rng) * (H - PADTOP - PADBOT);
+  const n = candles.length, cw = (W - PADX * 2) / n;
+  const bodyW = Math.max(1.5, Math.min(cw * 0.6, 9));
+  const toX = i => PADX + cw * (i + 0.5);
+
+  const tms = candles.map(c => Date.parse(c.t));
+  const nearest = ms => { let bi = 0, bd = Infinity; tms.forEach((t, i) => { const d = Math.abs(t - ms); if (d < bd) { bd = d; bi = i; } }); return bi; };
+  const ei = nearest(Date.parse(fromISO)), xi = nearest(Date.parse(toISO));
+
+  const dp = (trade.pair.includes("JPY") || ["XAU/USD","XAG/USD"].includes(trade.pair)) ? 3 : 5;
+  const Line = ({ v, color, label }) => v == null ? null : (
+    <g>
+      <line x1={PADX} y1={toY(v)} x2={W - PADX} y2={toY(v)} stroke={color} strokeWidth={1} strokeDasharray="4 3" opacity={0.85} />
+      <text x={W - PADX} y={toY(v) - 2} fill={color} fontSize={8} textAnchor="end">{label} {v.toFixed(dp)}</text>
+    </g>
+  );
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:200 }}>
+      {candles.map((c, i) => {
+        const up = c.c >= c.o, col = up ? "#00ff88" : "#ff4466", x = toX(i);
+        return (
+          <g key={i}>
+            <line x1={x} y1={toY(c.h)} x2={x} y2={toY(c.l)} stroke={col} strokeWidth={1} />
+            <rect x={x - bodyW / 2} y={toY(Math.max(c.o, c.c))} width={bodyW} height={Math.max(1, Math.abs(toY(c.o) - toY(c.c)))} fill={col} />
+          </g>
+        );
+      })}
+      <Line v={entry} color="#00ccff" label="ENTRY" />
+      <Line v={exit}  color="#ffffff" label="EXIT" />
+      <Line v={sl}    color="#ff4466" label="SL" />
+      <Line v={tp}    color="#00ff88" label="TP" />
+      {/* Entry marker: ▲ for long, ▼ for short */}
+      <text x={toX(ei)} y={toY(entry) + (isLong ? 15 : -7)} fill={isLong ? "#00ff88" : "#ff4466"} fontSize={15} textAnchor="middle" fontWeight="bold">{isLong ? "▲" : "▼"}</text>
+      {/* Exit marker: dot colored by P&L */}
+      <circle cx={toX(xi)} cy={toY(exit)} r={3.5} fill={parseFloat(trade.pl) >= 0 ? "#00ff88" : "#ff4466"} stroke="#06061a" strokeWidth={0.8} />
+      {/* Direction badge */}
+      <rect x={PADX} y={PADTOP} width={56} height={15} rx={3} fill={isLong ? "#003322" : "#330011"} />
+      <text x={PADX + 6} y={PADTOP + 11} fill={isLong ? "#00ff88" : "#ff4466"} fontSize={9} fontWeight="bold">{isLong ? "▲ LONG" : "▼ SHORT"}</text>
+    </svg>
+  );
+}
+
 function MonthlyBars({ data }) {
   if (!data || data.length === 0) return null;
   const W = 560, H = 80, PAD = 12;
@@ -1224,6 +1300,7 @@ function Journal() {
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState("ALL");
   const [editId, setEditId] = useState(null);
+  const [chartId, setChartId] = useState(null);
   const [editText, setEditText] = useState("");
   const [editPsych, setEditPsych] = useState(EMPTY_PSYCH);
   const [saving, setSaving] = useState(false);
@@ -1372,11 +1449,22 @@ function Journal() {
                 <span style={{ fontSize:10, color:"#ffffff", flex:1 }}>
                   {t.openTime?.slice(5)} → {t.closeTime?.slice(5)}
                 </span>
+                <button onClick={() => setChartId(chartId === t.id ? null : t.id)}
+                  style={{ ...S.btn, padding:"3px 9px", background: chartId === t.id ? "#001a2e" : "transparent", border:`1px solid ${chartId === t.id ? "#00ccff44" : "#13132b"}`, color: chartId === t.id ? "#00ccff" : "#ffffff", fontSize:9 }}>
+                  {chartId === t.id ? "Hide chart" : "📈 Chart"}
+                </button>
                 <button onClick={() => { setEditId(isEdit ? null : t.id); setEditText(t.note); setEditPsych(t.psych || EMPTY_PSYCH); }}
                   style={{ ...S.btn, padding:"3px 9px", background:"transparent", border:"1px solid #13132b", color:"#ffffff", fontSize:9 }}>
                   {t.note ? "Edit" : "+ Note"}
                 </button>
               </div>
+
+              {/* Per-trade chart with entry/exit + long/short markers */}
+              {chartId === t.id && (
+                <div style={{ marginTop:9, padding:"8px 8px 4px", background:"#07071a", borderRadius:8, border:"1px solid #0d0d1e" }}>
+                  <TradeChart trade={t} />
+                </div>
+              )}
               {/* Price row */}
               <div style={{ display:"flex", gap:16, marginTop:6, fontSize:10, color:"#ffffff" }}>
                 <span>Entry {t.entryPrice}</span>

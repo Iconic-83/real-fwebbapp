@@ -5441,6 +5441,8 @@ async function buildJournalData(count = 200) {
         direction:    isBuy ? 'BUY' : 'SELL',
         openTime:     t.openTime?.slice(0, 16).replace('T', ' '),
         closeTime:    t.closeTime?.slice(0, 16).replace('T', ' '),
+        openTimeISO:  t.openTime  || null,
+        closeTimeISO: t.closeTime || null,
         entryPrice:   entry.toFixed(5),
         closePrice:   close.toFixed(5),
         pl:           pl,
@@ -5570,6 +5572,50 @@ app.post('/api/journal/note', (req, res) => {
     mistakeTags && mistakeTags.length ? JSON.stringify(mistakeTags) : null
   );
   res.json({ ok: true });
+});
+
+// GET /api/trade/candles — OANDA candles around a trade's window, for the
+// per-trade chart with entry/exit markers. Uses the instrument candles
+// endpoint (market data — healthy even when account trade endpoints 504).
+app.get('/api/trade/candles', async (req, res) => {
+  const keys = getApiKeys();
+  if (!keys.oanda_key) return res.status(400).json({ error: 'OANDA not configured' });
+
+  const pairLabel = req.query.pair || '';
+  const instr  = LABEL_TO_OANDA[pairLabel] || pairLabel.replace('/', '_');
+  const fromMs = Date.parse(req.query.from);
+  const toMs   = Date.parse(req.query.to);
+  if (!instr || isNaN(fromMs) || isNaN(toMs)) {
+    return res.status(400).json({ error: 'pair, from, to required' });
+  }
+
+  // Pad the window ~30% each side (min 30 min) so entry/exit sit in context.
+  const span = Math.max(toMs - fromMs, 60 * 1000);
+  const pad  = Math.max(span * 0.3, 30 * 60 * 1000);
+  let lo = fromMs - pad;
+  let hi = Math.min(toMs + pad, Date.now());
+
+  // Pick the finest granularity that keeps the window under ~120 candles.
+  const totalMin = (hi - lo) / 60000;
+  const grans = [['M1',1],['M5',5],['M15',15],['M30',30],['H1',60],['H4',240],['D',1440]];
+  let gran = 'D';
+  for (const [g, m] of grans) { if (totalMin / m <= 120) { gran = g; break; } }
+
+  const base = oandaBases()[0];
+  try {
+    const r = await axios.get(`${base}/v3/instruments/${instr}/candles`, {
+      headers: { Authorization: `Bearer ${keys.oanda_key}` },
+      params: { from: new Date(lo).toISOString(), to: new Date(hi).toISOString(), granularity: gran, price: 'M' },
+      timeout: 7000,
+    });
+    const candles = (r.data?.candles || []).map(c => ({
+      t: c.time, o: +c.mid.o, h: +c.mid.h, l: +c.mid.l, c: +c.mid.c,
+    }));
+    res.json({ instrument: instr, granularity: gran, candles });
+  } catch (e) {
+    const status = e.response?.status;
+    res.status(502).json({ error: status ? `OANDA candles unavailable (HTTP ${status})` : (e.code === 'ECONNABORTED' ? 'OANDA candles timed out' : e.message) });
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

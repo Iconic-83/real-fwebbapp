@@ -101,6 +101,17 @@ function getApiKeys() {
     twelve_key:    process.env.TWELVE_DATA_KEY    || stored.twelve_key    || '',
     tg_token:      process.env.TELEGRAM_TOKEN     || stored.tg_token      || '',
     tg_chat:       process.env.TELEGRAM_CHAT_ID   || stored.tg_chat       || '',
+    // MT5 via MetaApi (metaapi.cloud) — read-only mirror of a demo/live MT5 account.
+    // Uses the REST/RPC API (plain HTTPS, no streaming SDK) so it adds no persistent
+    // connection or memory load. Inert until both token + account id are set.
+    metaapi_token:   process.env.METAAPI_TOKEN || process.env.META_API_TOKEN
+                       || stored.metaapi_token   || '',
+    metaapi_account: process.env.METAAPI_ACCOUNT_ID || process.env.META_API_ACCOUNT_ID
+                       || stored.metaapi_account || '',
+    // Region left blank by default — the server auto-discovers it from MetaApi's
+    // provisioning API (see mt5ResolveRegion). Set the env var only to force one.
+    metaapi_region:  process.env.METAAPI_REGION || process.env.META_API_REGION
+                       || stored.metaapi_region  || '',
   };
   _keysCacheAt = Date.now();
   return _keysCache;
@@ -5797,15 +5808,175 @@ app.get('/api/keys/status', (req, res) => {
     openai:   !!k.openai_key,
     telegram: !!k.tg_token,
     twelve:   !!k.twelve_key,
+    mt5:      !!(k.metaapi_token && k.metaapi_account),
     masked: {
-      oanda_account: k.oanda_account || null,
-      openai_key:    k.openai_key  ? mask(k.openai_key,  7) : null,
-      oanda_key:     k.oanda_key   ? mask(k.oanda_key,   5) : null,
-      tg_token:      k.tg_token    ? mask(k.tg_token,    5) : null,
-      twelve_key:    k.twelve_key  ? mask(k.twelve_key,  5) : null,
+      oanda_account:   k.oanda_account || null,
+      openai_key:      k.openai_key   ? mask(k.openai_key,  7) : null,
+      oanda_key:       k.oanda_key    ? mask(k.oanda_key,   5) : null,
+      tg_token:        k.tg_token     ? mask(k.tg_token,    5) : null,
+      twelve_key:      k.twelve_key   ? mask(k.twelve_key,  5) : null,
+      metaapi_account: k.metaapi_account || null,
+      metaapi_token:   k.metaapi_token ? mask(k.metaapi_token, 5) : null,
+      metaapi_region:  k.metaapi_region || null,
     },
     auth_enabled: !!APP_SECRET,
   });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MT5 (MetaApi) — read-only mirror of a demo/live MT5 account.
+//
+// MetaTrader 5 has no native REST API, so we bridge through MetaApi's cloud
+// (metaapi.cloud), which connects to the broker account from login/password/server
+// and exposes a REST "RPC" API. We deliberately use the RPC endpoints over plain
+// HTTPS — NOT the streaming SDK — so this adds no persistent WebSocket or memory
+// load (important on the constrained free instance). Phase 1 is read-only; trade
+// execution can be layered on the same client later (POST /trade endpoints).
+//
+// Setup (done once by the user, see notes):
+//   1. Create a MetaApi account + provision the MT5 demo account → get an accountId
+//   2. Generate an API token
+//   3. Set env vars METAAPI_TOKEN, METAAPI_ACCOUNT_ID (and METAAPI_REGION if not new-york)
+// ═════════════════════════════════════════════════════════════════════════════
+const MT5_PROVISIONING = 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai';
+function mt5Configured() {
+  const k = getApiKeys();
+  return !!(k.metaapi_token && k.metaapi_account);
+}
+
+// Region auto-discovery — MetaApi pins each account to a region (new-york, london,
+// singapore…) and the RPC host is region-specific. Rather than make the user read it
+// off the dashboard, we ask the provisioning API for the account's config and cache
+// it. An explicit METAAPI_REGION env var overrides. Also surfaces deploy/connection
+// state so /api/mt5/status can show whether the account is live.
+let _mt5Meta = null, _mt5MetaAt = 0;
+const MT5_META_TTL = 5 * 60 * 1000;
+async function mt5AccountMeta(force = false) {
+  const k = getApiKeys();
+  if (!k.metaapi_token || !k.metaapi_account) throw new Error('MT5 not configured');
+  if (!force && _mt5Meta && (Date.now() - _mt5MetaAt) < MT5_META_TTL) return _mt5Meta;
+  const r = await axios.get(
+    `${MT5_PROVISIONING}/users/current/accounts/${k.metaapi_account}`,
+    { headers: { 'auth-token': k.metaapi_token }, timeout: 12000 }
+  );
+  const d = r.data || {};
+  _mt5Meta = {
+    region:           d.region || 'new-york',
+    state:            d.state || null,            // CREATED / DEPLOYING / DEPLOYED / …
+    connectionStatus: d.connectionStatus || null, // CONNECTED / DISCONNECTED / …
+    login:            d.login || null,
+    server:           d.server || null,
+    name:             d.name || null,
+  };
+  _mt5MetaAt = Date.now();
+  return _mt5Meta;
+}
+async function mt5Region() {
+  const k = getApiKeys();
+  if (k.metaapi_region) return k.metaapi_region.trim(); // explicit override
+  try { return (await mt5AccountMeta()).region; }
+  catch { return 'new-york'; }                          // safe fallback
+}
+async function mt5Request(path, { method = 'GET', data = null, timeout = 10000 } = {}) {
+  const k = getApiKeys();
+  if (!k.metaapi_token || !k.metaapi_account) throw new Error('MT5 not configured');
+  const region = await mt5Region();
+  const base   = `https://mt-client-api-v1.${region}.agiliumtrade.ai`;
+  const url    = `${base}/users/current/accounts/${k.metaapi_account}${path}`;
+  const resp = await axios({
+    url, method, data,
+    headers: { 'auth-token': k.metaapi_token, 'Content-Type': 'application/json' },
+    timeout,
+  });
+  return resp.data;
+}
+
+// Short cache so the dashboard polling doesn't hammer MetaApi (and to shield the
+// free instance). account info + positions change slowly enough for ~8s staleness.
+let _mt5Cache = { account: null, accountAt: 0, positions: null, positionsAt: 0 };
+const MT5_TTL = 8000;
+
+app.get('/api/mt5/status', async (req, res) => {
+  const k = getApiKeys();
+  const base = {
+    configured: mt5Configured(),
+    account_id: k.metaapi_account || null,
+    token_set:  !!k.metaapi_token,
+    region:     k.metaapi_region || null,
+  };
+  if (!mt5Configured()) return res.json(base);
+  try {
+    const m = await mt5AccountMeta(req.query.refresh === '1');
+    res.json({
+      ...base,
+      region:           k.metaapi_region || m.region,
+      state:            m.state,            // DEPLOYED when live
+      connectionStatus: m.connectionStatus, // CONNECTED when broker-linked
+      login:            m.login,
+      server:           m.server,
+      name:             m.name,
+      live: m.state === 'DEPLOYED' && m.connectionStatus === 'CONNECTED',
+    });
+  } catch (e) {
+    res.json({ ...base, error: e.response?.data?.message || e.message });
+  }
+});
+
+app.get('/api/mt5/account', async (req, res) => {
+  if (!mt5Configured()) return res.status(400).json({ error: 'MT5 not configured' });
+  try {
+    if (_mt5Cache.account && (Date.now() - _mt5Cache.accountAt) < MT5_TTL) {
+      return res.json({ ...(_mt5Cache.account), cached: true });
+    }
+    const a = await mt5Request('/account-information');
+    const out = {
+      broker:     a.broker || null,
+      server:     a.server || null,
+      login:      a.login  || null,
+      name:       a.name   || null,
+      currency:   a.currency,
+      balance:    a.balance,
+      equity:     a.equity,
+      margin:     a.margin,
+      freeMargin: a.freeMargin,
+      marginLevel:a.marginLevel,
+      leverage:   a.leverage,
+      type:       a.type, // ACCOUNT_TRADE_MODE_DEMO / _REAL
+    };
+    _mt5Cache.account = out; _mt5Cache.accountAt = Date.now();
+    res.json(out);
+  } catch (e) {
+    const status = e.response?.status || 502;
+    res.status(status).json({ error: 'MT5 account fetch failed', detail: e.response?.data?.message || e.message });
+  }
+});
+
+app.get('/api/mt5/positions', async (req, res) => {
+  if (!mt5Configured()) return res.status(400).json({ error: 'MT5 not configured' });
+  try {
+    if (_mt5Cache.positions && (Date.now() - _mt5Cache.positionsAt) < MT5_TTL) {
+      return res.json({ positions: _mt5Cache.positions, cached: true });
+    }
+    const raw = await mt5Request('/positions');
+    const positions = (Array.isArray(raw) ? raw : []).map(p => ({
+      id:        p.id,
+      symbol:    p.symbol,
+      direction: (p.type || '').includes('BUY') ? 'BUY' : 'SELL',
+      volume:    p.volume,
+      openPrice: p.openPrice,
+      currentPrice: p.currentPrice,
+      stopLoss:  p.stopLoss ?? null,
+      takeProfit:p.takeProfit ?? null,
+      profit:    p.profit,
+      swap:      p.swap,
+      openTime:  p.time || p.openTime || null,
+    }));
+    _mt5Cache.positions = positions; _mt5Cache.positionsAt = Date.now();
+    res.json({ positions });
+  } catch (e) {
+    const status = e.response?.status || 502;
+    res.status(status).json({ error: 'MT5 positions fetch failed', detail: e.response?.data?.message || e.message });
+  }
 });
 
 // ── Audit log endpoint ────────────────────────────────────────────────────────

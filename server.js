@@ -8,7 +8,17 @@ dns.setDefaultResultOrder('ipv4first');
 // Prevent Node.js from exiting on unhandled promise rejections (Express 4 doesn't
 // auto-catch async handler rejections — without this, any missing try/catch kills the process)
 process.on('unhandledRejection', (reason) => {
-  console.error('[SAFETY] Unhandled Promise Rejection — crash prevented:', reason?.message || String(reason));
+  console.error('[SAFETY] Unhandled Promise Rejection — crash prevented:', reason?.stack || reason?.message || String(reason));
+});
+
+// Same guard for synchronous throws that escape a setInterval/setTimeout callback or
+// an event emitter — none of the background loops (price poll, trailing stops, auto-scan,
+// reconcile, backups, Telegram polling) are individually wrapped, so a single sync throw
+// would otherwise hard-crash the process. On Render's free tier that triggers a slow
+// restart, during which the instance drops connections — the cause of intermittent outages.
+// We log the full stack (so the real fault is visible in Render logs) and keep serving.
+process.on('uncaughtException', (err) => {
+  console.error('[SAFETY] Uncaught Exception — crash prevented:', err?.stack || err?.message || String(err));
 });
 
 const express = require('express');

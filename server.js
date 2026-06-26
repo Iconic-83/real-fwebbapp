@@ -5979,6 +5979,38 @@ app.get('/api/mt5/positions', async (req, res) => {
   }
 });
 
+// Deploy / undeploy the MetaApi account. RPC reads require the account to be
+// DEPLOYED + CONNECTED; on the free tier accounts can sit UNDEPLOYED. These call
+// the provisioning API (token needs write scope) so the account can be started
+// without visiting the MetaApi dashboard. Deploy then connect takes ~30-90s.
+async function mt5Provision(action) {
+  const k = getApiKeys();
+  if (!k.metaapi_token || !k.metaapi_account) throw new Error('MT5 not configured');
+  await axios.post(
+    `${MT5_PROVISIONING}/users/current/accounts/${k.metaapi_account}/${action}`,
+    {}, { headers: { 'auth-token': k.metaapi_token }, timeout: 15000 }
+  );
+  _mt5Meta = null; // force status refresh on next read
+}
+app.post('/api/mt5/deploy', async (req, res) => {
+  if (!mt5Configured()) return res.status(400).json({ error: 'MT5 not configured' });
+  try {
+    await mt5Provision('deploy');
+    res.json({ ok: true, message: 'Deploy requested — account connects to broker in ~30-90s' });
+  } catch (e) {
+    res.status(e.response?.status || 502).json({ error: 'MT5 deploy failed', detail: e.response?.data?.message || e.message });
+  }
+});
+app.post('/api/mt5/undeploy', async (req, res) => {
+  if (!mt5Configured()) return res.status(400).json({ error: 'MT5 not configured' });
+  try {
+    await mt5Provision('undeploy');
+    res.json({ ok: true, message: 'Undeploy requested' });
+  } catch (e) {
+    res.status(e.response?.status || 502).json({ error: 'MT5 undeploy failed', detail: e.response?.data?.message || e.message });
+  }
+});
+
 // ── Audit log endpoint ────────────────────────────────────────────────────────
 app.get('/api/audit', (req, res) => {
   const limit  = Math.min(parseInt(req.query.limit || 100), 500);

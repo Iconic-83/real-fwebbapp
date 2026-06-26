@@ -6424,7 +6424,7 @@ if (fs.existsSync(clientDist)) {
   });
 }
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ┌──────────────────────────────────────────────┐
   │       PRECISION TRADER PRO — SERVER v2       │
@@ -6434,3 +6434,12 @@ app.listen(PORT, '0.0.0.0', () => {
   └──────────────────────────────────────────────┘
   `);
 });
+
+// Render/Cloudflare front this origin and keep upstream connections alive and reuse
+// them. Node's default keepAliveTimeout is only 5s — shorter than the proxy's idle
+// timeout — so Node closes an idle connection just as the proxy sends a request on it,
+// and the client sees an intermittent "connection reset by peer" (~half of requests).
+// Keep sockets open longer than the proxy, and make headersTimeout strictly larger than
+// keepAliveTimeout so a slow header read can't race the keep-alive close.
+server.keepAliveTimeout = 120000; // 120s — must exceed the proxy's idle timeout
+server.headersTimeout   = 125000; // must be > keepAliveTimeout

@@ -341,6 +341,33 @@ const PIP = {
   XPT_USD:0.01, XPD_USD:0.1,
 };
 
+// ── Correct pip value in the account (USD) currency, per unit ────────────────
+// The old code only handled USD-quoted majors + a couple of hardcoded cases, so
+// JPY crosses, USD-base exotics and non-USD crosses were sized wildly wrong
+// (e.g. EUR/JPY ~157× too small). This derives the true pip value from the
+// currency structure, using the live price cache for cross rates.
+// Assumes the OANDA account is USD-denominated (consistent with the rest of the app).
+function usdPerCurrency(ccy) {
+  if (ccy === 'USD') return 1;
+  const direct = parseFloat(priceCache[`${ccy}/USD`]); // USD per 1 ccy (e.g. GBP/USD)
+  if (direct > 0) return direct;
+  const inv = parseFloat(priceCache[`USD/${ccy}`]);     // ccy per 1 USD (e.g. USD/JPY) → invert
+  if (inv > 0) return 1 / inv;
+  return 0; // unknown — caller falls back
+}
+// price = current mid for the instrument (needed for USD-base pairs like USD_JPY)
+function pipValueUSD(oandaInstr, price) {
+  const pipSize = PIP[oandaInstr] || 0.0001;
+  const us = oandaInstr.indexOf('_');
+  const base = oandaInstr.slice(0, us), quote = oandaInstr.slice(us + 1);
+  if (quote === 'USD') return pipSize;                       // XXX_USD incl XAU/XAG
+  if (base === 'USD' && price > 0) return pipSize / price;   // USD_XXX (JPY, CAD, SEK, ZAR…)
+  const usdPerQuote = usdPerCurrency(quote);                 // cross pair (EUR_JPY, EUR_GBP…)
+  if (usdPerQuote > 0) return pipSize * usdPerQuote;
+  console.warn(`[SIZE] ${oandaInstr}: no USD conversion for quote ${quote}; pip value approximate`);
+  return pipSize;                                            // last resort (old behavior)
+}
+
 // FIX 4 — OANDA latency telemetry
 let oandaLatencyLog = [];
 let oandaFailCount  = 0;
@@ -378,11 +405,17 @@ async function oandaRequest(path, method = 'GET', data = null, timeout = 12000) 
       return r.data;
     } catch (e) {
       oandaFailCount++;
-      if (e.response) return e.response.data;
+      const status = e.response?.status;
+      // 4xx = genuine client/validation error (e.g. order rejected): the body
+      // carries the reason and a failover won't help — return it so callers see it.
+      if (status && status >= 400 && status < 500) return e.response.data;
+      // 5xx / timeout / network: transient. Try the next base, then throw so
+      // resilient callers fall back to cache instead of treating an error body
+      // (which has no .candles/.trades/.account) as real data.
     }
   }
   oandaFailCount++;
-  throw new Error('OANDA unreachable');
+  throw new Error('OANDA unreachable (all bases failed)');
 }
 
 // Merge freshly fetched closed trades into the persistent cache (dedupe by id,
@@ -2262,10 +2295,16 @@ function getConsecutiveLosses() {
   return count;
 }
 
+// Count open trades in the same USD-correlation group. Includes in-flight
+// EXECUTING claims so two correlated signals approved at the same moment can't
+// both slip past the cap before either has an EXECUTED row.
+const _stmtCorrOpenTrades = db.prepare(
+  `SELECT pair, direction FROM signals WHERE status IN ('EXECUTED','EXECUTING') AND closed_at IS NULL`
+);
 function getCorrelatedOpenCount(pair, direction) {
   const myGroup = USD_CORR_GROUP[pair]?.[direction];
   if (!myGroup) return 0;
-  const open = _stmtOpenTrades.all();
+  const open = _stmtCorrOpenTrades.all();
   return open.filter(s => USD_CORR_GROUP[s.pair]?.[s.direction] === myGroup).length;
 }
 
@@ -2495,19 +2534,29 @@ Manually review and close if needed.`;
 // DATABASE BACKUP — daily automatic copy, keep last 7
 // ═════════════════════════════════════════════════════════════════════════════
 function backupDatabase() {
-  const src     = path.join(__dirname, 'data', 'precisiontrader.db');
-  const backDir = path.join(__dirname, 'data', 'backups');
+  // Backups live next to the live DB (honors DB_DIR via db.name), so on a
+  // persistent disk they survive restarts. NOTE: on an ephemeral host these
+  // backups are wiped with everything else — durable storage needs a real disk.
+  const backDir = path.join(path.dirname(db.name), 'backups');
   try {
     if (!fs.existsSync(backDir)) fs.mkdirSync(backDir, { recursive: true });
-    const stamp = new Date().toISOString().slice(0, 10);
+    // Full timestamp so multiple runs in one day don't overwrite each other.
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const dest  = path.join(backDir, `precisiontrader_${stamp}.db`);
-    fs.copyFileSync(src, dest);
-    // Keep newest 7, delete the rest
-    const files = fs.readdirSync(backDir).filter(f => f.endsWith('.db')).sort();
-    files.slice(0, Math.max(0, files.length - 7)).forEach(f =>
-      fs.unlinkSync(path.join(backDir, f))
-    );
-    console.log(`[BACKUP] DB saved → ${dest}`);
+    // better-sqlite3's online backup is WAL-safe — produces a consistent
+    // single-file snapshot including un-checkpointed WAL data (plain copyFileSync
+    // would miss the -wal tail and lose the most recent trades).
+    const p = db.backup(dest);
+    const finish = () => {
+      // Keep newest 7, delete the rest (ISO timestamps sort chronologically).
+      const files = fs.readdirSync(backDir).filter(f => f.endsWith('.db')).sort();
+      files.slice(0, Math.max(0, files.length - 7)).forEach(f =>
+        fs.unlinkSync(path.join(backDir, f))
+      );
+      console.log(`[BACKUP] DB saved → ${dest}`);
+    };
+    if (p && typeof p.then === 'function') p.then(finish).catch(e => console.error('[BACKUP]', e.message));
+    else finish();
   } catch(e) {
     console.error('[BACKUP]', e.message);
   }
@@ -2986,14 +3035,8 @@ app.post('/api/trade/size', async (req, res) => {
     // Risk amount
     const riskAmount = balance * (parseFloat(riskPercent) / 100);
 
-    // Pip value per unit (approximate — accurate for USD quote pairs)
-    // For USD quote pairs: pip value = pipSize per unit
-    // For JPY pairs: pip value = pipSize per unit (different scale)
-    // XAU/USD: pip = 0.1, pip value per oz = $0.1
-    let pipValuePerUnit = pipSize; // USD per unit per pip (approximate)
-    if (oandaInstr === 'USD_JPY') pipValuePerUnit = 0.01 / parseFloat(entryPrice);
-    if (oandaInstr === 'USD_CAD') pipValuePerUnit = 0.0001 / parseFloat(entryPrice);
-    if (oandaInstr === 'XAU_USD') pipValuePerUnit = 0.1;
+    // Pip value per unit in USD — correct for USD-quote, USD-base and cross pairs
+    const pipValuePerUnit = pipValueUSD(oandaInstr, parseFloat(entryPrice));
 
     // Units = Risk Amount / (SL pips × pip value per unit)
     const units = Math.floor(riskAmount / (slPips * pipValuePerUnit));
@@ -3295,7 +3338,14 @@ const _stmtPairConsecLosses = db.prepare(`
 `);
 
 // ── Fix 7: Immutable audit log ────────────────────────────────────────────────
+// Seed the chain head from the last persisted row so the hash chain stays
+// continuous across restarts (otherwise every process boundary re-linked to '',
+// making the chain unverifiable and indistinguishable from tampering).
 let _lastAuditHash = '';
+try {
+  const last = db.prepare('SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1').get();
+  if (last?.row_hash) _lastAuditHash = last.row_hash;
+} catch {}
 function writeAudit(action, data, actor = 'SYSTEM', entityId = null) {
   try {
     const payload  = JSON.stringify({ action, actor, entityId, data, ts: Date.now() });
@@ -3555,10 +3605,7 @@ async function recalcAtExecution(signal, keys) {
 
   const riskPct    = parseFloat(signal.risk_pct || 1);
   const riskAmt    = balance * (riskPct / 100);
-  let   pipVal     = pipSize;
-  if (oandaInstr === 'USD_JPY') pipVal = 0.01 / freshMid;
-  if (oandaInstr === 'USD_CAD') pipVal = 0.0001 / freshMid;
-  if (oandaInstr === 'XAU_USD') pipVal = 0.1;
+  const pipVal     = pipValueUSD(oandaInstr, freshMid); // correct for all pairs
 
   const consecLoss = getConsecutiveLosses();
   const timeFactor = getTimeBasedSizeFactor();
@@ -3607,6 +3654,19 @@ async function executeSignal(signal) {
 async function _doExecuteSignal(signal) {
   const keys       = getApiKeys();
   const oandaInstr = LABEL_TO_OANDA[signal.pair] || signal.pair.replace('/','_');
+
+  // ── Durable atomic claim — prevents double execution across concurrent
+  // approvals (web + Telegram) and process restarts. Only one caller can flip
+  // the row out of PENDING/APPROVED into EXECUTING; if 0 rows change, someone
+  // else already claimed it (or it's no longer pending), so we bail.
+  const claim = db.prepare(
+    `UPDATE signals SET status='EXECUTING', actioned_at=CURRENT_TIMESTAMP
+     WHERE id=? AND status IN ('PENDING','APPROVED')`
+  ).run(signal.id);
+  if (claim.changes !== 1) {
+    console.log(`[EXEC] Signal #${signal.id} not claimable (already executing/closed) — skipped`);
+    return;
+  }
 
   // ── RISK GOVERNOR CHECK — hard block before execution ────────────────────
   const gov = await checkRiskGovernors(signal);
@@ -3953,6 +4013,7 @@ async function runAutoScan() {
   if (!keys.oanda_key || !keys.oanda_account) return; // only OANDA needed now
 
   autoScanning = true;
+  try {
   const session = getSession();
   console.log(`[SCAN] Starting precision scan — session: ${session}`);
 
@@ -3960,7 +4021,7 @@ async function runAutoScan() {
   const ddVelocity = checkDrawdownVelocity();
   if (ddVelocity.velocity === 'RAPID') {
     console.log(`[SCAN] ⛔ Rapid drawdown detected — ${ddVelocity.warning}`);
-    autoScanning = false; return; // halt scan during rapid DD
+    return; // halt scan during rapid DD (finally resets autoScanning)
   }
   const freqCheck = checkSignalFrequencyAnomaly();
   if (freqCheck.anomaly) console.log(`[SCAN] ⚠️ ${freqCheck.warning}`);
@@ -4437,10 +4498,7 @@ Return EXACTLY 6 lines, no other text:
       const acctData = await oandaRequest(`/v3/accounts/${keys.oanda_account}/summary`);
       const balance  = parseFloat(acctData?.account?.balance || 0);
       const riskAmt  = balance * (riskPct / 100);
-      let pipVal     = pipSize;
-      if (instr==='USD_JPY') pipVal = 0.01 / price;
-      if (instr==='USD_CAD') pipVal = 0.0001 / price;
-      if (instr==='XAU_USD') pipVal = 0.1;
+      const pipVal   = pipValueUSD(instr, price); // correct for all pairs
 
       // Dynamic risk reduction: consecutive losses + Friday/weekend
       const consecLoss   = getConsecutiveLosses();
@@ -4630,8 +4688,12 @@ ${failedStr ? `\n❌ CHECKS FAILED\n${failedStr}` : ''}`;
     }
     await new Promise(r => setTimeout(r, 3000));
   }
-  autoScanning = false;
   console.log('[SCAN] Scan complete.');
+  } catch (e) {
+    console.error('[SCAN] Fatal scan error (loop preserved):', e.message);
+  } finally {
+    autoScanning = false; // always release the lock so the scanner can never wedge
+  }
 }
 
 // Scan every 5 minutes
@@ -4652,8 +4714,6 @@ async function sendWeeklyReport() {
   const now = new Date();
   if (now.getUTCDay() !== 0) return;           // only Sunday
   if (now.getUTCHours() < 8 || now.getUTCHours() > 9) return; // 08:00–09:00 window
-
-  setStorageValue('weekly_report_sent', today);
 
   try {
     // Closed trades this week
@@ -4741,6 +4801,7 @@ ${totalPL >= 0 ? '✅ Profitable week.' : '❌ Losing week — review conditions
 Type REPORT for full pattern analysis.`;
 
     await sendTelegramMsg(report);
+    setStorageValue('weekly_report_sent', today); // mark sent only after success
     console.log(`[WEEKLY] Report sent for week of ${monday}`);
   } catch(e) {
     console.error('[WEEKLY]', e.message);
@@ -4758,8 +4819,6 @@ async function sendDailyReport() {
 
   const now = new Date();
   if (now.getUTCHours() < 21 || now.getUTCHours() > 22) return; // 21:00–22:00 UTC (NY session close)
-
-  setStorageValue('daily_report_sent', today);
 
   try {
     // Today's closed trades
@@ -4864,6 +4923,9 @@ ${tradeLines}
 ${verdict}`;
 
     await sendTelegramMsg(report);
+    // Mark sent only AFTER a successful send, so a transient failure retries
+    // on the next 30-min tick instead of silently skipping the whole day.
+    setStorageValue('daily_report_sent', today);
     console.log(`[DAILY] Report sent for ${today}`);
   } catch(e) {
     console.error('[DAILY]', e.message);

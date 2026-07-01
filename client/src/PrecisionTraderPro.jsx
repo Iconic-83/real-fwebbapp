@@ -311,8 +311,8 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
   useEffect(() => {
     const load = async () => {
       const [r, h] = await Promise.all([
-        fetch("/api/risk/status").then(x => x.json()).catch(() => null),
-        fetch("/api/health").then(x => x.json()).catch(() => null),
+        apiFetch("/api/risk/status").then(x => x.json()).catch(() => null),
+        apiFetch("/api/health").then(x => x.json()).catch(() => null),
       ]);
       if (r && !r.error) setRisk(r);
       if (h && h.infrastructure) setInfra(h.infrastructure);
@@ -326,7 +326,7 @@ function Dashboard({ account, trades, prices, prevPrices, oConn, tConn, aiReady,
     if (!window.confirm("EMERGENCY: Close ALL open positions and disable scanner?")) return;
     setFlattening(true);
     try {
-      const r = await fetch("/api/emergency/flatten", { method:"POST" }).then(x => x.json());
+      const r = await apiFetch("/api/emergency/flatten", { method:"POST" }).then(x => x.json());
       alert(`Flatten complete. Closed: ${r.closed} position(s).`);
     } catch { alert("Flatten failed — check Telegram"); }
     setFlattening(false);
@@ -515,9 +515,9 @@ function AutoTradePanel() {
 
   const load = async () => {
     const [s, l, st] = await Promise.all([
-      fetch("/api/autotrade/settings").then(r=>r.json()).catch(()=>null),
-      fetch("/api/autotrade/log").then(r=>r.json()).catch(()=>[]),
-      fetch("/api/autotrade/status").then(r=>r.json()).catch(()=>null),
+      apiFetch("/api/autotrade/settings").then(r=>r.json()).catch(()=>null),
+      apiFetch("/api/autotrade/log").then(r=>r.json()).catch(()=>[]),
+      apiFetch("/api/autotrade/status").then(r=>r.json()).catch(()=>null),
     ]);
     if (s) setAt(s);
     if (Array.isArray(l)) setSignals(l);
@@ -528,24 +528,27 @@ function AutoTradePanel() {
   const save = async (overrides={}) => {
     const updated = { ...at, ...overrides };
     setAt(updated);
-    const r = await fetch("/api/autotrade/settings", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify(updated),
-    }).then(res=>res.json());
-    setStatus(r.ok ? "✅ Saved — Telegram notified" : "❌ " + r.error);
+    let r = {};
+    try {
+      r = await apiFetch("/api/autotrade/settings", {
+        method:"POST",
+        body:JSON.stringify(updated),
+      }).then(res=>res.json());
+    } catch (e) { r = { error: e.message }; }
+    setStatus(r.ok ? "✅ Saved — Telegram notified" : "❌ " + (r.error || "Save failed"));
     setTimeout(()=>setStatus(null), 3000);
     load();
   };
 
   const scanNow = async () => {
     setScanning(true);
-    await fetch("/api/autotrade/scan", { method:"POST" });
+    try { await apiFetch("/api/autotrade/scan", { method:"POST" }); } catch {}
     setTimeout(()=>{ setScanning(false); load(); }, 10000);
   };
 
   const act = async (id, action) => {
     setActing(p=>({...p,[id]:action}));
-    await fetch(`/api/autotrade/${action}/${id}`, { method:"POST" });
+    try { await apiFetch(`/api/autotrade/${action}/${id}`, { method:"POST" }); } catch {}
     setTimeout(()=>{ load(); setActing(p=>({...p,[id]:null})); }, 2000);
   };
 
@@ -771,15 +774,21 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
     const livePrice = prices[pair];
     if (!livePrice) { alert("No live price available"); return; }
     setSizing(true); setSizeResult(null);
-    const res = await getPositionSize(PAIR_LABELS[pair], livePrice.toFixed(5), sl, riskPct);
-    setSizeResult(res);
-    if (res.recommendedUnits) setUnits(String(res.recommendedUnits));
-    setSizing(false);
+    try {
+      const res = await getPositionSize(PAIR_LABELS[pair], livePrice.toFixed(5), sl, riskPct);
+      setSizeResult(res);
+      if (res.recommendedUnits) setUnits(String(res.recommendedUnits));
+    } catch (e) {
+      setSizeResult({ error: e.message || "Sizing failed" });
+    }
+    setSizing(false); // always clear so the button can't hang on "..."
   };
 
   const execute = async () => {
-    // Check daily loss limit first
-    const d = await getDailyStatus();
+    // Check daily loss limit first. If the status can't be fetched (401/504),
+    // don't silently abort the click — default to unknown and proceed.
+    let d = {};
+    try { d = await getDailyStatus() || {}; } catch {}
     if (d.limit_hit) {
       setStatus({ ok:false, msg:`⛔ Daily loss limit reached (${d.used_percent}% used). Stop trading today.` });
       return;
@@ -821,7 +830,11 @@ function LiveTrading({ account, trades, prices, keys, addAlert, refresh }) {
 
   const livePrice = prices[pair];
   const dp = ["XAU_USD","XAG_USD"].includes(pair) ? 2 : pair.includes("JPY") ? 3 : 5;
-  const pipValue = pair === "XAU_USD" ? 0.5 : 0.0010;
+  // Price increment for one pip — matches the server PIP map so a "20-pip" stop is
+  // actually 20 pips on every instrument (was a single 0.0010 constant: 10× too
+  // wide on majors, 10× too narrow on JPY pairs).
+  const pipValue = pair === "XAU_USD" ? 0.1 : pair === "XAG_USD" ? 0.01
+                 : pair.includes("JPY") ? 0.01 : 0.0001;
 
   const autofill = () => {
     if (!livePrice) return;
@@ -1253,7 +1266,7 @@ function TradeChart({ trade }) {
     let alive = true;
     setCandles(null); setErr(null);
     if (!fromISO || !toISO) { setErr("No timestamps for this trade"); return; }
-    fetch(`/api/trade/candles?pair=${encodeURIComponent(trade.pair)}&from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}`)
+    apiFetch(`/api/trade/candles?pair=${encodeURIComponent(trade.pair)}&from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}`)
       .then(r => r.json())
       .then(d => { if (!alive) return; (d.error || !d.candles?.length) ? setErr(d.error || "No candle data") : setCandles(d.candles); })
       .catch(() => { if (alive) setErr("Failed to load chart"); });
@@ -1370,13 +1383,18 @@ function Journal() {
   const [editText, setEditText] = useState("");
   const [editPsych, setEditPsych] = useState(EMPTY_PSYCH);
   const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
 
   const load = async () => {
     setLoading(true);
     try {
       const r = await apiFetch('/api/journal?count=200');
-      if (r.ok) setData(await r.json());
-    } catch {}
+      if (r.ok) { setData(await r.json()); setErr(null); }
+      else setErr(`Journal endpoint returned ${r.status} — showing last loaded data.`);
+    } catch (e) {
+      // Keep prior data on screen; surface the failure instead of silently blanking.
+      setErr((e.message || 'Journal failed to load') + ' — showing last loaded data.');
+    }
     setLoading(false);
   };
 
@@ -1430,6 +1448,13 @@ function Journal() {
           {loading ? "Loading..." : "↻ Refresh"}
         </button>
       </div>
+
+      {/* Transport-level failure (401/504/network) — data is stale, not empty */}
+      {err && (
+        <div style={{ ...S.card, border:"1px solid #ffcc0044", background:"#1a1400", color:"#ffe08a", fontSize:12, marginBottom:12, padding:"11px 14px" }}>
+          ⚠ {err}
+        </div>
+      )}
 
       {/* OANDA history outage banner — trade history endpoint can 504 while
           live prices / trading stay healthy */}
@@ -1508,9 +1533,9 @@ function Journal() {
                 <span style={{ ...S.badge, color:resColor(t.result), background:"#07071a", fontSize:9 }}>{t.result}</span>
                 {t.confidence && <span style={{ ...S.badge, color:"#00ccff", background:"#001a2e", fontSize:9 }}>{t.confidence}%</span>}
                 <span style={{ fontFamily:"monospace", color:plColor(t.pl), fontWeight:700, minWidth:72, fontSize:12 }}>
-                  {t.pl >= 0 ? "+" : ""}${t.pl.toFixed(2)}
+                  {(t.pl ?? 0) >= 0 ? "+" : ""}${(t.pl ?? 0).toFixed(2)}
                 </span>
-                <span style={{ fontFamily:"monospace", fontSize:10, color:"#ffffff", minWidth:48 }}>{t.pips > 0 ? "+" : ""}{t.pips}p</span>
+                <span style={{ fontFamily:"monospace", fontSize:10, color:"#ffffff", minWidth:48 }}>{(t.pips ?? 0) > 0 ? "+" : ""}{t.pips ?? 0}p</span>
                 {t.rr && <span style={{ fontSize:10, color:"#e0e0ea" }}>RR {t.rr}</span>}
                 <span style={{ fontSize:10, color:"#ffffff", flex:1 }}>
                   {t.openTime?.slice(5)} → {t.closeTime?.slice(5)}
@@ -2112,14 +2137,14 @@ function DailyReports() {
                 <div style={{ display:"flex", gap:18, marginTop:13, fontSize:11, color:"#cfcfe0", flexWrap:"wrap" }}>
                   <span>✅ {current.wins} wins</span>
                   <span>❌ {current.losses} losses</span>
-                  <span>Best: <span style={{ color:"#00ff88" }}>+${current.best.toFixed(2)}</span></span>
-                  <span>Worst: <span style={{ color:"#ff4466" }}>${current.worst.toFixed(2)}</span></span>
+                  <span>Best: <span style={{ color:"#00ff88" }}>+${(current.best ?? 0).toFixed(2)}</span></span>
+                  <span>Worst: <span style={{ color:"#ff4466" }}>${(current.worst ?? 0).toFixed(2)}</span></span>
                 </div>
               </div>
 
               <div style={S.card}>
                 <div style={S.title}>Trades ({current.trade_count})</div>
-                {current.trades.slice().reverse().map((t,i) => (
+                {(current.trades || []).slice().reverse().map((t,i) => (
                   <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:"1px solid #0d0d1e", fontSize:11 }}>
                     <div style={{ display:"flex", gap:8, alignItems:"center" }}>
                       <span style={{ color:"#ffffff", fontWeight:700 }}>{t.pair}</span>
@@ -2154,11 +2179,11 @@ function Analytics({ account, trades: openTrades }) {
   const load = async () => {
     setLoading(true);
     const [h, d, a, o, sl] = await Promise.all([
-      fetch("/api/history?count=100").then(r => r.json()).catch(() => null),
-      fetch("/api/trade/daily").then(r => r.json()).catch(() => null),
-      fetch("/api/autotrade/log").then(r => r.json()).catch(() => []),
-      fetch("/api/trade/outcomes").then(r => r.json()).catch(() => null),
-      fetch("/api/execution/slippage").then(r => r.json()).catch(() => null),
+      apiFetch("/api/history?count=100").then(r => r.json()).catch(() => null),
+      apiFetch("/api/trade/daily").then(r => r.json()).catch(() => null),
+      apiFetch("/api/autotrade/log").then(r => r.json()).catch(() => []),
+      apiFetch("/api/trade/outcomes").then(r => r.json()).catch(() => null),
+      apiFetch("/api/execution/slippage").then(r => r.json()).catch(() => null),
     ]);
     if (h && !h.error) setHistory(h);
     if (d) setDaily(d);
@@ -2566,10 +2591,10 @@ function Analytics({ account, trades: openTrades }) {
                 <span style={{ flex:1 }} />
                 <span style={{ fontFamily:"monospace", fontSize:13, fontWeight:800,
                   color:t.pl>0?"#00ff88":t.pl<0?"#ff4466":"#e0e0ea" }}>
-                  {t.pl>0?"+":""}${t.pl.toFixed(2)}
+                  {t.pl>0?"+":""}${(t.pl ?? 0).toFixed(2)}
                 </span>
                 <span style={{ fontSize:10, color:t.pl>0?"#00ff8866":t.pl<0?"#ff446666":"#ffffff", fontFamily:"monospace" }}>
-                  ({t.pips>0?"+":""}{t.pips} pips)
+                  ({(t.pips ?? 0)>0?"+":""}{t.pips ?? 0} pips)
                 </span>
               </div>
               <div style={{ display:"flex", gap:14, fontSize:10, color:"#ffffff" }}>
@@ -2636,9 +2661,8 @@ function Backtest() {
   const run = async () => {
     setLoading(true); setError(null); setResult(null);
     try {
-      const r = await fetch('/api/backtest', {
+      const r = await apiFetch('/api/backtest', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pair, from, to, direction: dir, minScore: minSc, minConf }),
       });
       const d = await r.json();

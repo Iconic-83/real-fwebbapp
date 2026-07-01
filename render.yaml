@@ -2,15 +2,26 @@ services:
   - type: web
     name: precision-trader-pro
     runtime: node
-    plan: free
+    # Persistent disks require a paid instance type (free tier has no durable
+    # storage — the container filesystem, and thus the SQLite DB, is wiped on
+    # every restart/spin-down). Starter is the cheapest tier that supports a disk.
+    plan: starter
     buildCommand: npm install && npm install --prefix client --include=dev && npm --prefix client run build
     startCommand: npm start
     healthCheckPath: /api/health
+    # Persistent disk — survives restarts/deploys. db.js writes to DB_DIR.
+    disk:
+      name: ptp-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 10000
+      # Point the SQLite DB (and its backups/) at the persistent disk
+      - key: DB_DIR
+        value: /var/data
       - key: OANDA_API_KEY
         sync: false
       - key: OANDA_ACCOUNT_ID

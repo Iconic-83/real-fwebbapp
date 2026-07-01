@@ -2,10 +2,18 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
-// Use /data directory on Railway (persistent volume) or local data/ folder
-const dataDir = process.env.RAILWAY_VOLUME_MOUNT_PATH
-  ? process.env.RAILWAY_VOLUME_MOUNT_PATH
-  : path.join(__dirname, 'data');
+// Persistent data directory. Priority:
+//   1. DB_DIR / PERSIST_DIR  — generic; point this at any mounted disk
+//      (e.g. a Render persistent disk mounted at /var/data)
+//   2. RAILWAY_VOLUME_MOUNT_PATH — Railway's persistent volume
+//   3. ./data — local fallback (EPHEMERAL on hosts without a mounted disk:
+//      on Render free tier the container FS is wiped on every restart/spin-down,
+//      so the DB is lost unless one of the env vars above points at a real disk)
+const dataDir =
+  process.env.DB_DIR ||
+  process.env.PERSIST_DIR ||
+  process.env.RAILWAY_VOLUME_MOUNT_PATH ||
+  path.join(__dirname, 'data');
 
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
@@ -191,5 +199,23 @@ db.exec(`
 `);
 
 console.log(`[DB] SQLite ready at: ${dbPath}`);
+
+// Graceful shutdown: checkpoint the WAL into the main db file and close cleanly
+// so the most recent committed transactions aren't stranded in the -wal file if
+// the platform sends SIGTERM (Render/Railway do this on deploy/restart).
+let _closed = false;
+function shutdown(signal) {
+  if (_closed) return;
+  _closed = true;
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+    db.close();
+    console.log(`[DB] Checkpointed + closed cleanly on ${signal}`);
+  } catch (e) {
+    console.error('[DB] Shutdown checkpoint failed:', e.message);
+  }
+}
+process.on('SIGTERM', () => { shutdown('SIGTERM'); process.exit(0); });
+process.on('SIGINT',  () => { shutdown('SIGINT');  process.exit(0); });
 
 module.exports = db;

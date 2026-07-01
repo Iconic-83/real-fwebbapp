@@ -2388,6 +2388,31 @@ Type STATUS to check system state.`
   if (consec >= 3)
     blocks.push(`${consec} consecutive losses — circuit breaker active. Review before resuming.`);
 
+  // 2b — One open position per instrument. Without this the 5-min scanner can
+  // re-open the same setup every cycle (e.g. two EUR/JPY longs minutes apart),
+  // and non-USD crosses aren't covered by the USD-correlation cap below.
+  // Checks OANDA (source of truth) so it holds even after a DB wipe / manual
+  // trade / ghost position; falls back to the local DB if OANDA is unreachable.
+  if (signal) {
+    const oInstr = LABEL_TO_OANDA[signal.pair] || signal.pair.replace('/','_');
+    let alreadyOpen = false;
+    try {
+      if (keys.oanda_key && keys.oanda_account) {
+        const ot = await oandaRequest(`/v3/accounts/${keys.oanda_account}/openTrades`);
+        alreadyOpen = (ot?.trades || []).some(t => t.instrument === oInstr);
+      }
+    } catch { /* OANDA unreachable — fall back to local DB */ }
+    if (!alreadyOpen) {
+      const openSamePair = db.prepare(
+        `SELECT COUNT(*) c FROM signals
+         WHERE pair=? AND status IN ('EXECUTED','EXECUTING') AND closed_at IS NULL`
+      ).get(signal.pair).c;
+      alreadyOpen = openSamePair >= 1;
+    }
+    if (alreadyOpen)
+      blocks.push(`Already have an open position on ${signal.pair} — one position per instrument`);
+  }
+
   // 3 — Correlated exposure (max 2 same-direction USD trades open at once)
   if (signal) {
     const corrOpen = getCorrelatedOpenCount(signal.pair, signal.direction);

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: precision-trader-pro
+    name: real-fwebbapp
     runtime: node
     # Persistent disks require a paid instance type (free tier has no durable
     # storage — the container filesystem, and thus the SQLite DB, is wiped on

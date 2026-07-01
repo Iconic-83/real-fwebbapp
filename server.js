@@ -5018,15 +5018,55 @@ app.post('/api/reports/daily', async (req, res) => {
 
 // Day-by-day report history — aggregates every closed trade by calendar day so
 // the frontend can browse each trading day's P/L, win rate, pips and trade list.
-app.get('/api/reports/history', (req, res) => {
+// Closed trades for the analytics/reports panels — sourced from OANDA (via
+// buildJournalData) so they populate even when the local `signals` table is
+// empty (e.g. after a free-tier restart wipe, or for trades not placed through
+// the app). Enriches each with a best-effort exit reason + duration.
+async function getClosedTradesForAnalytics(count = 500) {
+  const jd = await buildJournalData(count);
+  const trades = (jd?.trades || []).filter(t => t.closeTimeISO);
+  return trades.map(t => {
+    const durMins = (t.openTimeISO && t.closeTimeISO)
+      ? Math.max(0, Math.round((new Date(t.closeTimeISO) - new Date(t.openTimeISO)) / 60000))
+      : null;
+    // OANDA's reconstruction doesn't record WHY a trade closed, and guessing from
+    // SL/TP proximity mislabels (e.g. calling winners "SL_HIT"). Only classify
+    // TP/SL when the close price actually sits at the level; otherwise leave it
+    // MANUAL (honest "closed, reason not recorded"). Trades placed through the app
+    // get a real exit_reason via reconciliation in the local-signals fallback.
+    const c  = parseFloat(t.closePrice);
+    const sl = t.sl != null ? parseFloat(t.sl) : null;
+    const tp = t.tp != null ? parseFloat(t.tp) : null;
+    const pipSz = PIP[LABEL_TO_OANDA[t.pair] || (t.pair || '').replace('/', '_')] || 0.0001;
+    const tol = pipSz * 3; // within ~3 pips of the level counts as a hit
+    let exit = 'MANUAL';
+    if (t.pl > 0.01 && tp != null && Math.abs(c - tp) <= tol) exit = 'TP_HIT';
+    else if (t.pl < -0.01 && sl != null && Math.abs(c - sl) <= tol) exit = 'SL_HIT';
+    return {
+      id: t.id, pair: t.pair, direction: t.direction,
+      realized_pl: t.pl, actual_pips: parseFloat(t.pips) || 0,
+      confidence: t.confidence, exit_reason: exit, duration_mins: durMins,
+      closed_at: t.closeTime, closeTimeISO: t.closeTimeISO,
+      day: (t.closeTimeISO || '').slice(0, 10),
+    };
+  });
+}
+
+app.get('/api/reports/history', async (req, res) => {
   try {
-    const rows = db.prepare(`
-      SELECT pair, direction, realized_pl, actual_pips, confidence, exit_reason,
-             duration_mins, closed_at, date(closed_at) AS day
-      FROM signals
-      WHERE status='CLOSED' AND closed_at IS NOT NULL
-      ORDER BY closed_at ASC
-    `).all();
+    // Prefer OANDA-reconstructed closed trades; fall back to locally-reconciled
+    // signals only if that's empty. (Was reading ONLY local CLOSED signals, so it
+    // showed "no closed trades" whenever the DB had been wiped.)
+    let rows = await getClosedTradesForAnalytics(500);
+    if (!rows.length) {
+      rows = db.prepare(`
+        SELECT pair, direction, realized_pl, actual_pips, confidence, exit_reason,
+               duration_mins, closed_at, date(closed_at) AS day
+        FROM signals
+        WHERE status='CLOSED' AND closed_at IS NOT NULL
+        ORDER BY closed_at ASC
+      `).all().map(t => ({ ...t, realized_pl: t.realized_pl || 0, actual_pips: parseFloat(t.actual_pips || 0) }));
+    }
 
     const byDay = {};
     for (const t of rows) {
@@ -5168,53 +5208,77 @@ app.get('/api/risk/status', async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // TRADE OUTCOMES API — reconciled results with expectancy stats
 // ═════════════════════════════════════════════════════════════════════════════
-app.get('/api/trade/outcomes', (req, res) => {
-  const closed = db.prepare(`SELECT * FROM signals WHERE status='CLOSED' ORDER BY closed_at DESC`).all();
-  const wins   = closed.filter(t => (t.realized_pl || 0) > 0);
-  const losses = closed.filter(t => (t.realized_pl || 0) < 0);
+app.get('/api/trade/outcomes', async (req, res) => {
+  try {
+    // Prefer OANDA-reconstructed closed trades (survives DB wipes); fall back to
+    // locally-reconciled CLOSED signals only if that's empty. (Was reading ONLY
+    // local CLOSED signals → always empty after a wipe / for non-app trades.)
+    let closed = await getClosedTradesForAnalytics(500);
+    if (!closed.length) {
+      closed = db.prepare(`SELECT * FROM signals WHERE status='CLOSED' ORDER BY closed_at DESC`).all()
+        .map(t => ({
+          id: t.id, pair: t.pair, direction: t.direction,
+          realized_pl: t.realized_pl || 0, actual_pips: parseFloat(t.actual_pips || 0),
+          confidence: t.confidence, exit_reason: t.exit_reason || 'MANUAL',
+          duration_mins: t.duration_mins, closed_at: t.closed_at, closeTimeISO: t.closed_at,
+        }));
+    }
 
-  const avgWinPL  = wins.length   ? wins.reduce((s, t)   => s + t.realized_pl, 0) / wins.length   : 0;
-  const avgLossPL = losses.length ? losses.reduce((s, t) => s + t.realized_pl, 0) / losses.length : 0;
-  const winRate   = closed.length ? wins.length / closed.length : 0;
-  const expectancy = closed.length ? (winRate * avgWinPL) + ((1 - winRate) * avgLossPL) : null;
+    const wins   = closed.filter(t => (t.realized_pl || 0) > 0);
+    const losses = closed.filter(t => (t.realized_pl || 0) < 0);
 
-  const avgWinPips  = wins.length   ? wins.reduce((s, t)   => s + parseFloat(t.actual_pips || 0), 0) / wins.length   : 0;
-  const avgLossPips = losses.length ? losses.reduce((s, t) => s + parseFloat(t.actual_pips || 0), 0) / losses.length : 0;
-  const realRR      = avgLossPips < 0 ? Math.abs(avgWinPips / avgLossPips).toFixed(2) : null;
+    const avgWinPL  = wins.length   ? wins.reduce((s, t)   => s + t.realized_pl, 0) / wins.length   : 0;
+    const avgLossPL = losses.length ? losses.reduce((s, t) => s + t.realized_pl, 0) / losses.length : 0;
+    const winRate   = closed.length ? wins.length / closed.length : 0;
+    const expectancy = closed.length ? (winRate * avgWinPL) + ((1 - winRate) * avgLossPL) : null;
 
-  // Max drawdown from equity curve
-  let peak = 0, maxDD = 0, cum = 0;
-  [...closed].reverse().forEach(t => {
-    cum += (t.realized_pl || 0);
-    if (cum > peak) peak = cum;
-    const dd = peak - cum;
-    if (dd > maxDD) maxDD = dd;
-  });
+    const avgWinPips  = wins.length   ? wins.reduce((s, t)   => s + (t.actual_pips || 0), 0) / wins.length   : 0;
+    const avgLossPips = losses.length ? losses.reduce((s, t) => s + (t.actual_pips || 0), 0) / losses.length : 0;
+    const realRR      = avgLossPips < 0 ? Math.abs(avgWinPips / avgLossPips).toFixed(2) : null;
 
-  res.json({
-    trades: closed,
-    stats: {
-      total:        closed.length,
-      wins:         wins.length,
-      losses:       losses.length,
-      win_rate_pct: closed.length ? Math.round(winRate * 100) : null,
-      avg_win_pl:   avgWinPL.toFixed(2),
-      avg_loss_pl:  avgLossPL.toFixed(2),
-      expectancy_per_trade: expectancy !== null ? expectancy.toFixed(2) : null,
-      real_rr:      realRR,
-      total_pl:     closed.reduce((s, t) => s + (t.realized_pl || 0), 0).toFixed(2),
-      max_drawdown: maxDD.toFixed(2),
-      avg_duration_mins: closed.length
-        ? Math.round(closed.reduce((s, t) => s + (t.duration_mins || 0), 0) / closed.length)
-        : null,
-      consecutive_losses_now: getConsecutiveLosses(),
-    },
-    by_exit_reason: {
-      SL_HIT:  closed.filter(t => t.exit_reason === 'SL_HIT').length,
-      TP_HIT:  closed.filter(t => t.exit_reason === 'TP_HIT').length,
-      MANUAL:  closed.filter(t => t.exit_reason === 'MANUAL').length,
-    },
-  });
+    // Max drawdown over the equity curve (oldest → newest)
+    let peak = 0, maxDD = 0, cum = 0;
+    [...closed].sort((a, b) => new Date(a.closeTimeISO || 0) - new Date(b.closeTimeISO || 0)).forEach(t => {
+      cum += (t.realized_pl || 0);
+      if (cum > peak) peak = cum;
+      const dd = peak - cum;
+      if (dd > maxDD) maxDD = dd;
+    });
+
+    const durs = closed.map(t => t.duration_mins).filter(x => x != null && !isNaN(x));
+
+    res.json({
+      trades: closed.slice(0, 200),
+      stats: {
+        total:        closed.length,
+        wins:         wins.length,
+        losses:       losses.length,
+        win_rate_pct: closed.length ? Math.round(winRate * 100) : null,
+        avg_win_pl:   avgWinPL.toFixed(2),
+        avg_loss_pl:  avgLossPL.toFixed(2),
+        expectancy_per_trade: expectancy !== null ? expectancy.toFixed(2) : null,
+        real_rr:      realRR,
+        total_pl:     closed.reduce((s, t) => s + (t.realized_pl || 0), 0).toFixed(2),
+        max_drawdown: maxDD.toFixed(2),
+        avg_duration_mins: durs.length ? Math.round(durs.reduce((s, x) => s + x, 0) / durs.length) : null,
+        consecutive_losses_now: getConsecutiveLosses(),
+      },
+      by_exit_reason: {
+        SL_HIT:  closed.filter(t => t.exit_reason === 'SL_HIT').length,
+        TP_HIT:  closed.filter(t => t.exit_reason === 'TP_HIT').length,
+        MANUAL:  closed.filter(t => t.exit_reason === 'MANUAL').length,
+      },
+    });
+  } catch (e) {
+    res.json({
+      trades: [],
+      stats: { total:0, wins:0, losses:0, win_rate_pct:null, avg_win_pl:"0.00", avg_loss_pl:"0.00",
+        expectancy_per_trade:null, real_rr:null, total_pl:"0.00", max_drawdown:"0.00",
+        avg_duration_mins:null, consecutive_losses_now:0 },
+      by_exit_reason: { SL_HIT:0, TP_HIT:0, MANUAL:0 },
+      error: e.message,
+    });
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
